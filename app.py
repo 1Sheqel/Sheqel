@@ -11,16 +11,17 @@ import threading
 import subprocess
 import requests
 import json
+import urllib.request
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
 SYNC_API_KEY = ""
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".sheqelmotion.json")
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.0.0"
-UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/sheqelmotion/main/version.json"
+APP_VERSION = "1.0.1"
+UPDATE_MANIFEST_URL = f"https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json?t={int(time.time())}"
 
 
 
@@ -110,6 +111,14 @@ def safe_name(name):
 def desktop_dir():
     d = os.path.join(os.path.expanduser("~"), "Desktop")
     return d if os.path.isdir(d) else os.path.expanduser("~")
+
+def open_folder(path):
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    elif sys.platform == "win32":
+        os.startfile(path)
+    else:
+        subprocess.Popen(["xdg-open", path])
 
 def set_adaptive_window(win, width_ratio=0.72, height_ratio=0.82, min_width=900, min_height=720):
     screen_width = win.winfo_screenwidth()
@@ -287,7 +296,7 @@ def prepare_video_for_sync(input_video, audio_wav, output_video):
     audio_duration = get_duration(audio_wav)
     cmd = [
         ffmpeg_bin(), "-y", "-i", input_video, "-t", str(round(audio_duration + END_PADDING, 3)),
-        "-vf", f"scale={SYNC_INPUT_SCALE}", "-r", SYNC_INPUT_FPS,
+        "-vf", f"scale={SYNC_INPUT_SCALE},fps=25",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "96k", output_video,
     ]
@@ -312,7 +321,7 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
                     timeout=300,
                 )
             log(f"Sync create response: {res.status_code}")
-            log(res.text[:1000])
+            log(res.text)
             if res.status_code not in [200, 201]:
                 raise RuntimeError(f"Sync create error: {res.status_code}\n{res.text}")
             job_id = res.json().get("id")
@@ -481,17 +490,18 @@ class LipsyncTwoModeApp(ctk.CTk):
         self.load_config()
         self.update_status()
         self.after(3000, lambda: self.check_for_updates(silent=True))
+        self.after(500, self._check_just_updated)
 
 
-        def _parse_version(self, v):
+    def _parse_version(self, v):
         #Превращает '1.2.10' в (1, 2, 10) для корректного сравнения.
-            try:
-                return tuple(int(x) for x in str(v).split(".") if x.isdigit())
-            except Exception:
-                return (0, 0, 0)
+        try:
+            return tuple(int(x) for x in str(v).split(".") if x.isdigit())
+        except Exception:
+            return (0, 0, 0)
 
     def check_for_updates(self, silent=False):
-        """Проверяет манифест и показывает диалог если есть новая версия."""
+        """Только проверяет манифест. Сам файл не качает."""
         try:
             res = requests.get(UPDATE_MANIFEST_URL, timeout=10)
             res.raise_for_status()
@@ -507,13 +517,6 @@ class LipsyncTwoModeApp(ctk.CTk):
         force = manifest.get("force_update", False)
         min_required = manifest.get("min_required_version", "0.0.0")
 
-        if sys.platform == "darwin":
-            url = manifest.get("download_url_mac", "")
-        elif sys.platform == "win32":
-            url = manifest.get("download_url_windows", "")
-        else:
-            url = manifest.get("download_url_linux", "")
-
         current_v = self._parse_version(APP_VERSION)
         latest_v = self._parse_version(latest)
         min_v = self._parse_version(min_required)
@@ -524,10 +527,13 @@ class LipsyncTwoModeApp(ctk.CTk):
                                     f"У тебя последняя версия: {APP_VERSION}")
             return
 
-        # Новая версия — показываем окно
+        # Показываем диалог обновления — БЕЗ автоскачивания
+        self._show_update_dialog(latest, notes, force or (current_v < min_v))
+
+    def _show_update_dialog(self, latest_version, notes, is_forced):
         win = ctk.CTkToplevel(self)
         win.title("Доступно обновление")
-        win.geometry("560x460")
+        win.geometry("560x500")
         win.configure(fg_color=BG)
         win.transient(self)
         win.grab_set()
@@ -538,41 +544,148 @@ class LipsyncTwoModeApp(ctk.CTk):
         self.label(frame, "🎉 Доступно обновление", size=22, weight="bold").pack(anchor="w", padx=20, pady=(20, 8))
         self.label(frame, f"Текущая версия:  {APP_VERSION}",
                    size=12, color=MUTED).pack(anchor="w", padx=20)
-        self.label(frame, f"Новая версия:  {latest}",
+        self.label(frame, f"Новая версия:  {latest_version}",
                    size=15, weight="bold", color="#86efac").pack(anchor="w", padx=20, pady=(0, 14))
 
         self.label(frame, "Что нового:", size=13, weight="bold").pack(anchor="w", padx=20)
         notes_box = ctk.CTkTextbox(frame, fg_color="#1a1a1a", text_color="#e5e5e5",
-                                   border_width=0, height=160,
+                                   border_width=0, height=140,
                                    font=ctk.CTkFont(size=12), wrap="word")
-        notes_box.pack(fill="both", expand=True, padx=20, pady=(6, 14))
+        notes_box.pack(fill="both", expand=True, padx=20, pady=(6, 10))
         notes_box.insert("1.0", notes or "—")
         notes_box.configure(state="disabled")
 
-        is_forced = force or (current_v < min_v)
+        progress_label = self.label(frame, "", size=12, color=MUTED)
+        progress_label.pack(anchor="w", padx=20, pady=(0, 6))
 
         btn_row = ctk.CTkFrame(frame, fg_color=PANEL)
         btn_row.pack(fill="x", padx=20, pady=(0, 16))
 
-        def open_download():
-            if url:
-                import webbrowser
-                webbrowser.open(url)
-            win.destroy()
-            if is_forced:
-                self.after(500, self.destroy)
+        def do_update():
+            try:
+                self._download_and_replace(latest_version, progress_label, win)
+            except Exception as e:
+                messagebox.showerror("Ошибка обновления", str(e), parent=win)
 
         if not is_forced:
             self.button(btn_row, "Позже", win.destroy,
                         color=BTN, hover=BTN_HOVER, width=120).pack(side="right", padx=(8, 0))
 
-        self.button(btn_row, "Скачать обновление", open_download,
+        self.button(btn_row, "Скачать обновление", do_update,
                     color=BTN_OK, hover=BTN_OK_HOVER, width=220).pack(side="right")
 
         if is_forced:
-            self.label(frame, "⚠ Это обязательное обновление, дальше работать нельзя.",
+            self.label(frame, "⚠ Это обязательное обновление.",
                        size=11, color="#fca5a5").pack(anchor="w", padx=20, pady=(0, 6))
             win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    def _download_and_replace(self, new_version, progress_label, parent_win):
+        """Качает app.py, проверяет, заменяет, перезапускает."""
+        raw_url = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/app.py"
+
+        # 1. Скачиваем во временный файл
+        progress_label.configure(text="Скачиваю обновление...")
+        parent_win.update()
+        app_dir = app_base_dir()
+        temp_path = os.path.join(app_dir, "app.py.new")
+        try:
+            with requests.get(raw_url, timeout=60, stream=True) as r:
+                r.raise_for_status()
+                with open(temp_path, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+        except Exception as e:
+            raise RuntimeError(f"Не удалось скачать: {e}")
+
+        # 2. Проверяем что это валидный Python
+        progress_label.configure(text="Проверяю синтаксис...")
+        parent_win.update()
+        try:
+            with open(temp_path, "r", encoding="utf-8") as f:
+                new_code = f.read()
+            compile(new_code, temp_path, "exec")
+        except SyntaxError as e:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+            raise RuntimeError(f"Скачанный код содержит синтаксическую ошибку:\n{e}")
+
+        # 3. Проверяем версию в самом коде
+        m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', new_code)
+        if m:
+            actual = m.group(1)
+            if self._parse_version(actual) <= self._parse_version(APP_VERSION):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"Скачанный код не новее текущего "
+                    f"(в файле: {actual}, у тебя: {APP_VERSION})."
+                )
+
+        # 4. Заменяем app.py
+        progress_label.configure(text="Применяю обновление...")
+        parent_win.update()
+        app_path = os.path.join(app_dir, "app.py")
+        backup_path = os.path.join(app_dir, "app.py.bak")
+        try:
+            if os.path.exists(app_path):
+                shutil.copy2(app_path, backup_path)
+            os.replace(temp_path, app_path)
+        except Exception as e:
+            raise RuntimeError(f"Не удалось заменить файл: {e}")
+
+        # 5. Записываем флаг «только что обновились»
+        flag_path = os.path.join(app_dir, ".just_updated")
+        try:
+            with open(flag_path, "w", encoding="utf-8") as f:
+                f.write(new_version)
+        except Exception:
+            pass
+
+        # 6. Перезапускаем приложение
+        progress_label.configure(text="Перезапускаюсь...")
+        parent_win.update()
+        time.sleep(1)
+
+        try:
+            # Останавливаем тек. preview
+            self.stop_preview()
+        except Exception:
+            pass
+
+        python_exe = sys.executable
+        try:
+            os.execv(python_exe, [python_exe, app_path])
+        except Exception:
+            # Fallback на случай если execv не сработал
+            subprocess.Popen([python_exe, app_path])
+            self.destroy()
+            sys.exit(0)
+
+    def _check_just_updated(self):
+        """Если на прошлом старте было обновление — показываем toast."""
+        flag_path = os.path.join(app_base_dir(), ".just_updated")
+        if os.path.exists(flag_path):
+            try:
+                with open(flag_path, "r", encoding="utf-8") as f:
+                    updated_to = f.read().strip()
+                os.remove(flag_path)
+                # Удаляем бэкап если всё ок
+                backup = os.path.join(app_base_dir(), "app.py.bak")
+                if os.path.exists(backup):
+                    try:
+                        os.remove(backup)
+                    except Exception:
+                        pass
+                self.after(800, lambda: messagebox.showinfo(
+                    "✓ Обновлено",
+                    f"Приложение успешно обновлено до версии {updated_to}"
+                ))
+            except Exception:
+                pass
 
     def button(self, parent, text, command, color=BTN_PRIMARY, hover=BTN_PRIMARY_HOVER, width=150):
         return ctk.CTkButton(parent, text=text, command=command, fg_color=color, hover_color=hover, text_color="white", corner_radius=10, height=38, width=width, font=ctk.CTkFont(size=14, weight="bold"))
@@ -1427,6 +1540,15 @@ class LipsyncTwoModeApp(ctk.CTk):
             if not roll["text"]:
                 errors.append(f"Ролик {i + 1}: нет текста проверки.")
             if roll["mode"] == "1 видео":
+
+                # если есть ------, но нет обрезки аудио
+                if roll["text"] and "------" in roll["text"]:
+                    if not roll.get("audio_start") and not roll.get("audio_end"):
+                        errors.append(
+                            f"Ролик {i + 1}: в тексте есть ------. "
+                            f"Для режима '1 видео' укажи обрезку аудио (от/до)."
+                        )
+
                 if not roll["video_single"]:
                     errors.append(f"Ролик {i + 1}: не выбрано видео.")
             else:
@@ -1465,19 +1587,24 @@ class LipsyncTwoModeApp(ctk.CTk):
                 "Не задан Sync API key. Нажми кнопку «Sync key» в верхней панели и введи ключ."
             )
             return
+        global SYNC_API_KEY
+        SYNC_API_KEY = self.sync_key
         self.open_log_window()
         self.is_processing = True
         self.start_btn.configure(state="disabled", text="ОБРАБАТЫВАЮ ОЧЕРЕДЬ...")
         thread = threading.Thread(target=self.queue_thread, args=(valid,), daemon=True)
         thread.start()
+        
 
     def queue_thread(self, valid_rolls):
         try:
             failed_videos = []
             base_output = os.path.join(desktop_dir(), "Lipsync_Queue_Output")
             ensure_dir(base_output)
-            
-            batch_dir = base_output
+
+            batch_name = time.strftime("batch_%Y-%m-%d_%H-%M-%S")
+            batch_dir = os.path.join(base_output, batch_name)
+            ensure_dir(batch_dir)
 
             self.log("=" * 70)
             self.log(f"Папка партии: {batch_dir}")
@@ -1567,9 +1694,23 @@ class LipsyncTwoModeApp(ctk.CTk):
                 for item in failed_videos:
                     error_message += f"❌ {item['video_name']}\nПричина: {item['error']}\n\n"
 
-                self.after(0, lambda: messagebox.showwarning("Готово с ошибками", error_message))
+                def done_with_errors():
+                    messagebox.showwarning("Готово с ошибками", error_message)
+                    open_folder(batch_dir)
+
+                self.after(0, done_with_errors)
             else:
-                self.after(0, lambda: messagebox.showinfo("Готово", f"✅ Все ролики обработаны успешно.\n\nПапка:\n{batch_dir}"))
+
+                def done_ok():
+                    messagebox.showinfo(
+                        "Готово",
+                        f"✅ Все ролики обработаны успешно.\n\nПапка:\n{batch_dir}"
+                    )
+
+                    open_folder(batch_dir)
+
+                self.after(0, done_ok)
+
         except Exception as e:
             err = str(e)
             self.log(f"ОБЩАЯ ОШИБКА: {err}")
