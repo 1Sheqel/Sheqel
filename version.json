@@ -1,9 +1,9 @@
 {
-  "latest_version": "1.0.3",
-  "sha256": "7859f328a455c26d84ba221409e9f7a6ebebc61d906ccc3ed3a007c2d2d6b45b",
+  "latest_version": "1.0.4",
+  "sha256": "5c35ae8bf862e38618350809f3ab5114a686510574290e3ff65e7c449cfe5ed5",
   "download_url_mac": "",
   "download_url_windows": "",
-  "release_notes": "- Исправлен ffmpeg: теперь используется системный вместо локального",
+  "release_notes": "- Исправлен ffmpeg: теперь используется системный вместо локального\n- Исправлена проверка обновлений: кеш больше не блокирует новые версии",
   "min_required_version": "1.0.0",
   "force_update": false
 }

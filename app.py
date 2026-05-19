@@ -22,8 +22,8 @@ from tkinter import filedialog, messagebox
 SYNC_API_KEY = ""
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.0.3"
-UPDATE_MANIFEST_URL = f"https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json?t={int(time.time())}"
+APP_VERSION = "1.0.4"
+UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
 
@@ -597,7 +597,8 @@ class LipsyncTwoModeApp(ctk.CTk):
     def check_for_updates(self, silent=False):
         """Только проверяет манифест. Сам файл не качает."""
         try:
-            res = requests.get(UPDATE_MANIFEST_URL, timeout=10)
+            url = f"{UPDATE_MANIFEST_URL}?t={int(time.time())}"
+            res = requests.get(url, timeout=10, headers={"Cache-Control": "no-cache", "Pragma": "no-cache"})
             res.raise_for_status()
             manifest = res.json()
         except Exception as e:
