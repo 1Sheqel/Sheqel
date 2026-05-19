@@ -586,6 +586,12 @@ class LipsyncTwoModeApp(ctk.CTk):
         """Вызывается при клике на иконку Dock — восстанавливает скрытое/свёрнутое окно."""
         self.deiconify()
         self.lift()
+        for child in self.winfo_children():
+            if isinstance(child, ctk.CTkToplevel) and child.winfo_exists():
+                child.deiconify()
+                child.lift()
+                child.focus_force()
+                return
         self.focus_force()
 
     def _parse_version(self, v):
@@ -631,7 +637,8 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.geometry("560x500")
         win.configure(fg_color=BG)
         win.transient(self)
-        win.grab_set()
+        win.after(100, win.grab_set)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
 
         frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=20, pady=20)
@@ -861,7 +868,8 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.geometry("720x420")
         win.configure(fg_color=BG)
         win.transient(self)
-        win.grab_set()
+        win.after(100, win.grab_set)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
 
         frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
@@ -914,7 +922,8 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.geometry("720x420")
         win.configure(fg_color=BG)
         win.transient(self)
-        win.grab_set()
+        win.after(100, win.grab_set)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
 
         frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
@@ -1034,7 +1043,8 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.geometry("620x540")
         win.configure(fg_color=BG)
         win.transient(self)
-        win.grab_set()
+        win.after(100, win.grab_set)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
 
         frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
@@ -1199,7 +1209,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.geometry("620x680")
         win.configure(fg_color=BG)
         win.transient(parent_win)
-        win.grab_set()
+        win.after(100, win.grab_set)
 
         def on_close():
             self.stop_preview()
@@ -1330,7 +1340,8 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.geometry("840x720")
         win.configure(fg_color=BG)
         win.transient(self)
-        win.grab_set()
+        win.after(100, win.grab_set)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
         frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
         self.label(frame, "Сгенерировать full_voice.mp3", size=24, weight="bold").pack(anchor="w", padx=22, pady=(20, 6))
@@ -1631,7 +1642,8 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.geometry("840x620")
         win.configure(fg_color=BG)
         win.transient(self)
-        win.grab_set()
+        win.after(100, win.grab_set)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
         frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
         roll_title = self.get_roll_title(idx, roll)
