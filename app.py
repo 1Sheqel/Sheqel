@@ -22,7 +22,7 @@ from tkinter import filedialog, messagebox
 SYNC_API_KEY = ""
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 UPDATE_MANIFEST_URL = f"https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json?t={int(time.time())}"
 
 
@@ -853,7 +853,7 @@ class LipsyncTwoModeApp(ctk.CTk):
                               lambda: self.check_for_updates(silent=False),
                               color=BTN, hover=BTN_HOVER, width=170)
         self.update_btn.pack(side="left", padx=(10, 0))
-        self.rolls_area = ctk.CTkScrollableFrame(self, fg_color=BG, scrollbar_button_color="#3d3d6a", scrollbar_button_hover_color="#ff7eb6", width=890, height=540)
+        self.rolls_area = ctk.CTkScrollableFrame(self, fg_color=BG, scrollbar_button_color="#3d3d6a", scrollbar_button_hover_color="#ff7eb6", width=890, height=380)
         self.rolls_area.pack(fill="both", expand=True, padx=24, pady=(0, 12))
         bottom = ctk.CTkFrame(self, fg_color=BG)
         bottom.pack(fill="x", padx=24, pady=(0, 22))

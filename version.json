@@ -1,9 +1,9 @@
 {
-  "latest_version": "1.0.1",
-  "sha256": "ff057c4b1a94a4a944dc2b18e3509a2c32c7de0a430a05a76b3b417e1d9c0a4b",
+  "latest_version": "1.0.2",
+  "sha256": "9cb7a1238f5ee35998706ecb1088035d9db29057f7089b083cc01e6b1d3505df",
   "download_url_mac": "",
   "download_url_windows": "",
-  "release_notes": "- Новый дизайн Arc Browser (тёмный стальной)\n- SHA256-проверка при автообновлении\n- Исправлено восстановление окна после скрытия (macOS Dock)\n- Исправлен прыжок скролла при удалении сценария\n- Устранено дублирование API-запроса голосов\n- Обновлены зависимости",
+  "release_notes": "- Исправлено: кнопка «НАЧАТЬ ОЧЕРЕДЬ» не отображалась на маленьких экранах",
   "min_required_version": "1.0.0",
   "force_update": false
 }
