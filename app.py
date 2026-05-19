@@ -1555,9 +1555,16 @@ class LipsyncTwoModeApp(ctk.CTk):
         self.update_status()
 
     def set_roll_mode(self, idx, value):
+        scroll_pos = self.rolls_area._parent_canvas.yview()
         self.rolls[idx]["mode"] = value
         self.rolls[idx]["status"] = "Ожидает"
         self.refresh_rolls()
+        def _restore_mode(sp=scroll_pos):
+            try:
+                self.rolls_area._parent_canvas.yview_moveto(sp[0])
+            except Exception:
+                pass
+        self.after(60, _restore_mode)
 
 
 
@@ -1587,13 +1594,21 @@ class LipsyncTwoModeApp(ctk.CTk):
     def choose_voice_file(self, idx):
         f = filedialog.askopenfilename(parent=self, title="Выбери full_voice.mp3 / wav", filetypes=[("Аудио", "*.mp3 *.wav *.m4a *.aac"), ("Все файлы", "*.*")])
         if f:
+            scroll_pos = self.rolls_area._parent_canvas.yview()
             self.rolls[idx]["voice_file"] = f
             self.rolls[idx]["status"] = "Ожидает"
             self.refresh_rolls()
+            def _restore_voice(sp=scroll_pos):
+                try:
+                    self.rolls_area._parent_canvas.yview_moveto(sp[0])
+                except Exception:
+                    pass
+            self.after(60, _restore_voice)
 
     def choose_video(self, idx, kind):
         f = filedialog.askopenfilename(parent=self, title="Выбери видео", filetypes=[("Видео", "*.mp4 *.mov *.MOV *.avi *.mkv *.webm"), ("Все файлы", "*.*")])
         if f:
+            scroll_pos = self.rolls_area._parent_canvas.yview()
             if kind == "single":
                 self.rolls[idx]["video_single"] = f
             elif kind == "start":
@@ -1602,6 +1617,12 @@ class LipsyncTwoModeApp(ctk.CTk):
                 self.rolls[idx]["video_end"] = f
             self.rolls[idx]["status"] = "Ожидает"
             self.refresh_rolls()
+            def _restore_video(sp=scroll_pos):
+                try:
+                    self.rolls_area._parent_canvas.yview_moveto(sp[0])
+                except Exception:
+                    pass
+            self.after(60, _restore_video)
 
     def open_roll_text_dialog(self, idx):
         roll = self.rolls[idx]
@@ -1631,10 +1652,17 @@ class LipsyncTwoModeApp(ctk.CTk):
                 except Exception as e:
                     messagebox.showerror("Ошибка в тексте", str(e), parent=win)
                     return
+            scroll_pos = self.rolls_area._parent_canvas.yview()
             roll["text"] = text_value
             roll["status"] = "Ожидает"
             win.destroy()
             self.refresh_rolls()
+            def _restore_text(sp=scroll_pos):
+                try:
+                    self.rolls_area._parent_canvas.yview_moveto(sp[0])
+                except Exception:
+                    pass
+            self.after(60, _restore_text)
         self.button(frame, "Сохранить", save, color=BTN_OK, hover=BTN_OK_HOVER, width=180).pack(anchor="e", padx=22, pady=(0, 20))
 
     def validate_rolls(self):
@@ -1857,8 +1885,15 @@ class LipsyncTwoModeApp(ctk.CTk):
     def set_roll_status(self, idx, status):
         def update():
             if 0 <= idx < len(self.rolls):
+                scroll_pos = self.rolls_area._parent_canvas.yview()
                 self.rolls[idx]["status"] = status
                 self.refresh_rolls()
+                def _restore_status(sp=scroll_pos):
+                    try:
+                        self.rolls_area._parent_canvas.yview_moveto(sp[0])
+                    except Exception:
+                        pass
+                self.after(60, _restore_status)
         self.after(0, update)
 
     def update_status(self):
