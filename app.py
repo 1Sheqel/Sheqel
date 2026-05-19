@@ -7,11 +7,13 @@ import sys
 import time
 import queue
 import shutil
+import hashlib
+import tempfile
 import threading
 import subprocess
 import requests
 import json
-import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 import customtkinter as ctk
@@ -27,7 +29,7 @@ UPDATE_MANIFEST_URL = f"https://raw.githubusercontent.com/1Sheqel/Sheqel/main/ve
 
 ELEVEN_BASE_URL = "https://api.elevenlabs.io"
 ELEVEN_TTS_MODEL_ID = "eleven_v3"
-ELEVEN_OUTPUT_FORMAT = "mp3_44100_128"
+ELEVEN_OUTPUT_FORMAT = "mp3_44100_192"
 
 SYNC_GENERATE_URL = "https://api.sync.so/v2/generate"
 SYNC_MODEL = "sync-3"
@@ -42,7 +44,8 @@ SHARPEN_FILTER = "unsharp=3:3:0.6:3:3:0.0"
 END_PADDING = 0.8
 SYNC_INPUT_SCALE = "720:-2"
 SYNC_INPUT_FPS = "25"
-PAUSE_BETWEEN_ROLLS_SEC = 8
+CONCURRENT_ROLLS = 2
+PAUSE_BETWEEN_ROLLS_SEC = 3
 SYNC_RETRIES = 3
 SILENCE_NOISE = "-25dB"
 SILENCE_DURATION = "1.8"
@@ -50,20 +53,21 @@ SILENCE_DURATION = "1.8"
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-BG = "#171717"
-PANEL = "#222222"
-CARD = "#2b2b2b"
-BTN = "#3f3f46"
-BTN_HOVER = "#52525b"
-BTN_OK = "#3f6212"
-BTN_OK_HOVER = "#4d7c0f"
-BTN_PRIMARY = "#334155"
-BTN_PRIMARY_HOVER = "#475569"
-BTN_DANGER = "#7f1d1d"
-BTN_DANGER_HOVER = "#991b1b"
-TEXT = "#f5f5f5"
-MUTED = "#a3a3a3"
-CARD_HOVER_DELETE = "#3a1f1f"
+# Arc Browser — тёмный стальной
+BG = "#12131a"
+PANEL = "#1a1b26"
+CARD = "#20222f"
+BTN = "#252736"
+BTN_HOVER = "#32354a"
+BTN_OK = "#0e7a60"
+BTN_OK_HOVER = "#129970"
+BTN_PRIMARY = "#1c3f6e"
+BTN_PRIMARY_HOVER = "#234d87"
+BTN_DANGER = "#b84800"
+BTN_DANGER_HOVER = "#d45500"
+TEXT = "#dde2f0"
+MUTED = "#606880"
+CARD_HOVER_DELETE = "#2a1210"
 
 
 def app_base_dir():
@@ -175,9 +179,9 @@ def text_to_speech_mp3(text, voice_id, output_mp3, log):
         "text": text,
         "model_id": ELEVEN_TTS_MODEL_ID,
         "voice_settings": {
-            "stability": 0.85,
-            "similarity_boost": 0.90,
-            "style": 0.05,
+            "stability": 0.55,
+            "similarity_boost": 1.0,
+            "style": 0.45,
             "use_speaker_boost": True,
         },
     }
@@ -255,8 +259,25 @@ def detect_silences(audio_path, log):
 def split_start_end_by_silence(full_voice_mp3, output_dir, log, expected_separators=None):
     silences = detect_silences(full_voice_mp3, log)
     if not silences:
-        raise RuntimeError("Не нашёл пауз в full_voice.mp3. "
-                           "Сгенерируй голос с разделителями ------.")
+        raise RuntimeError(
+            "Не нашёл пауз в full_voice.mp3. "
+            "Сгенерируй голос с разделителями ------."
+        )
+
+    # Отбрасываем хвостовую тишину (если она у самого конца файла)
+    total_duration = get_duration(full_voice_mp3)
+    silences = [
+        s for s in silences
+        if s["start"] > 0.5                       # не в начале файла
+        and (total_duration - s["end"]) > 0.5     # не в конце файла
+    ]
+    log(f"После фильтра хвостовой/начальной тишины: {len(silences)} пауз")
+
+    if not silences:
+        raise RuntimeError(
+            "Не нашёл внутренних пауз в full_voice.mp3. "
+            "Возможно ты сгенерил голос без разделителей ------."
+        )
 
     # Сверка с текстом
     if expected_separators is not None and expected_separators > 0:
@@ -269,7 +290,6 @@ def split_start_end_by_silence(full_voice_mp3, output_dir, log, expected_separat
         log(f"Сверка с текстом: ожидалось {expected_separators} пауз, "
             f"в аудио найдено {len(silences)} — ок.")
 
-    # Берём первую паузу как конец «начала», последнюю как начало «конца»
     first = silences[0]
     last = silences[-1]
     start_cut = max(0.0, first["start"])
@@ -293,41 +313,101 @@ def split_start_end_by_silence(full_voice_mp3, output_dir, log, expected_separat
 
 
 def prepare_video_for_sync(input_video, audio_wav, output_video):
+    """Готовит видео для отправки в Sync без потерь качества."""
     audio_duration = get_duration(audio_wav)
+    target_duration = round(audio_duration + END_PADDING, 3)
+    
+    # Просто обрезаем видео по длине аудио, без перекодировки
     cmd = [
-        ffmpeg_bin(), "-y", "-i", input_video, "-t", str(round(audio_duration + END_PADDING, 3)),
-        "-vf", f"scale={SYNC_INPUT_SCALE},fps=25",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k", output_video,
+        ffmpeg_bin(), "-y",
+        "-i", input_video,
+        "-t", str(target_duration),
+        "-c", "copy",                  # ← без перекодировки, оригинальное качество
+        "-movflags", "+faststart",
+        output_video,
     ]
-    run(cmd)
+    
+    try:
+        run(cmd)
+    except subprocess.CalledProcessError:
+        # Если -c copy не сработал (редкий кодек) — fallback на перекодировку
+        cmd = [
+            ffmpeg_bin(), "-y",
+            "-i", input_video,
+            "-t", str(target_duration),
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_video,
+        ]
+        run(cmd)
+    
     if not file_exists_ok(output_video):
         raise RuntimeError(f"Не удалось подготовить видео для Sync: {output_video}")
     return output_video
 
+def upload_to_litterbox(file_path, log, expiry="1h"):
+    """Загружает файл на litterbox.catbox.moe и возвращает публичный URL.
+    expiry: '1h', '12h', '24h', '72h' — через это время файл автоудалится.
+    """
+    url = "https://litterbox.catbox.moe/resources/internals/api.php"
+    log(f"Загружаю {os.path.basename(file_path)} на временный хостинг...")
+    with open(file_path, "rb") as f:
+        files = {
+            "fileToUpload": (os.path.basename(file_path), f),
+        }
+        data = {
+            "reqtype": "fileupload",
+            "time": expiry,
+        }
+        res = requests.post(url, data=data, files=files, timeout=600)
+    if res.status_code != 200:
+        raise RuntimeError(f"Litterbox upload error: {res.status_code}\n{res.text}")
+    public_url = res.text.strip()
+    if not public_url.startswith("http"):
+        raise RuntimeError(f"Litterbox вернул не URL: {public_url}")
+    log(f"  → {public_url}")
+    return public_url
 
 def apply_lipsync_sync(video_in, audio_wav, final_out, log):
-    headers = {"x-api-key": SYNC_API_KEY}
+    """Отправляет видео и аудио в Sync через URL-загрузку (без лимита 20MB)."""
+    headers = {"x-api-key": SYNC_API_KEY, "Content-Type": "application/json"}
     last_error = None
+
     for attempt in range(1, SYNC_RETRIES + 1):
         try:
             log(f"Отправляю в Sync... попытка {attempt}/{SYNC_RETRIES}")
-            with open(video_in, "rb") as v, open(audio_wav, "rb") as a:
-                res = requests.post(
-                    SYNC_GENERATE_URL,
-                    headers=headers,
-                    files={"video": ("video.mp4", v, "video/mp4"), "audio": ("audio.wav", a, "audio/wav")},
-                    data={"model": SYNC_MODEL},
-                    timeout=300,
-                )
+
+            # 1. Заливаем файлы на временный хостинг → получаем URL
+            video_url = upload_to_litterbox(video_in, log, expiry="1h")
+            audio_url = upload_to_litterbox(audio_wav, log, expiry="1h")
+
+            # 2. Отправляем в Sync только URL (никакого multipart)
+            payload = {
+                "model": SYNC_MODEL,
+                "input": [
+                    {"type": "video", "url": video_url},
+                    {"type": "audio", "url": audio_url},
+                ],
+            }
+
+            res = requests.post(
+                SYNC_GENERATE_URL,
+                headers=headers,
+                json=payload,
+                timeout=300,
+            )
             log(f"Sync create response: {res.status_code}")
-            log(res.text)
+            log(res.text[:1500])
             if res.status_code not in [200, 201]:
                 raise RuntimeError(f"Sync create error: {res.status_code}\n{res.text}")
+
             job_id = res.json().get("id")
             if not job_id:
                 raise RuntimeError(f"Sync не вернул job id: {res.text}")
             log(f"Sync job: {job_id}")
+
             status_url = f"{SYNC_GENERATE_URL}/{job_id}"
             started = time.time()
             last_state = None
@@ -343,10 +423,10 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
                     log(f"Sync status: {state}")
                     last_state = state
                 if state == "COMPLETED":
-                    video_url = status.get("outputUrl") or status.get("output_url")
-                    if not video_url:
+                    video_url_out = status.get("outputUrl") or status.get("output_url")
+                    if not video_url_out:
                         raise RuntimeError(f"Sync completed без outputUrl: {status}")
-                    video_data = requests.get(video_url, timeout=300).content
+                    video_data = requests.get(video_url_out, timeout=300).content
                     with open(final_out, "wb") as f:
                         f.write(video_data)
                     if not file_exists_ok(final_out):
@@ -362,6 +442,7 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
             if attempt < SYNC_RETRIES:
                 log("Пауза 60 секунд перед повтором...")
                 time.sleep(60)
+
     raise RuntimeError(f"Sync не сработал после {SYNC_RETRIES} попыток: {last_error}")
 
 
@@ -434,25 +515,30 @@ def make_neon_logo(text="SheqelMotion", width=720, height=140):
     x = (width - text_w) // 2
     y = (height - text_h) // 2
 
-    # 🔵 ВНЕШНЕЕ МЯГКОЕ СВЕЧЕНИЕ
-    for blur, alpha in [(30, 80), (20, 120), (12, 160)]:
+    # Electric neon: deep blue outer → cyan mid → white-blue core
+    for blur, alpha in [(32, 70), (22, 110), (14, 150)]:
         glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         gd = ImageDraw.Draw(glow)
-        gd.text((x, y), text, font=font, fill=(0, 60, 180, alpha))
+        gd.text((x, y), text, font=font, fill=(0, 60, 200, alpha))
         glow = glow.filter(ImageFilter.GaussianBlur(blur))
         img.alpha_composite(glow)
 
-    # 🔵 ВНУТРЕННЕЕ ЯДРО (яркий неон)
-    for blur, alpha in [(6, 220), (3, 255)]:
+    for blur, alpha in [(9, 180), (5, 210)]:
         glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         gd = ImageDraw.Draw(glow)
-        gd.text((x, y), text, font=font, fill=(0, 110, 255, alpha))
+        gd.text((x, y), text, font=font, fill=(0, 160, 255, alpha))
         glow = glow.filter(ImageFilter.GaussianBlur(blur))
         img.alpha_composite(glow)
 
-    # ⚡ САМ ТЕКСТ (яркий центр трубки)
+    for blur, alpha in [(3, 235), (1, 255)]:
+        glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        gd.text((x, y), text, font=font, fill=(80, 210, 255, alpha))
+        glow = glow.filter(ImageFilter.GaussianBlur(blur))
+        img.alpha_composite(glow)
+
     draw = ImageDraw.Draw(img)
-    draw.text((x, y), text, font=font, fill=(120, 180, 255, 255))
+    draw.text((x, y), text, font=font, fill=(200, 235, 255, 255))
 
     return img
 
@@ -464,14 +550,17 @@ class LipsyncTwoModeApp(ctk.CTk):
         set_adaptive_window(self)   
         self.resizable(True, True)
         self.configure(fg_color=BG)
-            # ← ДОБАВИТЬ ЭТОТ БЛОК
         # Принудительно поднимаем окно на передний план (фикс для macOS)
         self.update_idletasks()
         self.lift()
         self.attributes('-topmost', True)
         self.after(200, lambda: self.attributes('-topmost', False))
         self.focus_force()
-        # ← КОНЕЦ БЛОКА
+        # Фикс: клик по иконке в Dock восстанавливает свёрнутое/скрытое окно
+        try:
+            self.createcommand('tk::mac::ReopenApplication', self._reopen_window)
+        except Exception:
+            pass
         self.api_key = ""
         self.main_voice_id = ""
         self.main_voice_name = ""
@@ -492,6 +581,12 @@ class LipsyncTwoModeApp(ctk.CTk):
         self.after(3000, lambda: self.check_for_updates(silent=True))
         self.after(500, self._check_just_updated)
 
+
+    def _reopen_window(self):
+        """Вызывается при клике на иконку Dock — восстанавливает скрытое/свёрнутое окно."""
+        self.deiconify()
+        self.lift()
+        self.focus_force()
 
     def _parse_version(self, v):
         #Превращает '1.2.10' в (1, 2, 10) для корректного сравнения.
@@ -516,6 +611,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         notes = manifest.get("release_notes", "")
         force = manifest.get("force_update", False)
         min_required = manifest.get("min_required_version", "0.0.0")
+        expected_sha256 = manifest.get("sha256", "")
 
         current_v = self._parse_version(APP_VERSION)
         latest_v = self._parse_version(latest)
@@ -527,10 +623,9 @@ class LipsyncTwoModeApp(ctk.CTk):
                                     f"У тебя последняя версия: {APP_VERSION}")
             return
 
-        # Показываем диалог обновления — БЕЗ автоскачивания
-        self._show_update_dialog(latest, notes, force or (current_v < min_v))
+        self._show_update_dialog(latest, notes, force or (current_v < min_v), expected_sha256)
 
-    def _show_update_dialog(self, latest_version, notes, is_forced):
+    def _show_update_dialog(self, latest_version, notes, is_forced, expected_sha256=""):
         win = ctk.CTkToplevel(self)
         win.title("Доступно обновление")
         win.geometry("560x500")
@@ -538,7 +633,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.transient(self)
         win.grab_set()
 
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=16)
+        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=20, pady=20)
 
         self.label(frame, "🎉 Доступно обновление", size=22, weight="bold").pack(anchor="w", padx=20, pady=(20, 8))
@@ -563,7 +658,7 @@ class LipsyncTwoModeApp(ctk.CTk):
 
         def do_update():
             try:
-                self._download_and_replace(latest_version, progress_label, win)
+                self._download_and_replace(latest_version, expected_sha256, progress_label, win)
             except Exception as e:
                 messagebox.showerror("Ошибка обновления", str(e), parent=win)
 
@@ -579,8 +674,8 @@ class LipsyncTwoModeApp(ctk.CTk):
                        size=11, color="#fca5a5").pack(anchor="w", padx=20, pady=(0, 6))
             win.protocol("WM_DELETE_WINDOW", lambda: None)
 
-    def _download_and_replace(self, new_version, progress_label, parent_win):
-        """Качает app.py, проверяет, заменяет, перезапускает."""
+    def _download_and_replace(self, new_version, expected_sha256, progress_label, parent_win):
+        """Качает app.py, проверяет целостность и подпись, заменяет, перезапускает."""
         raw_url = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/app.py"
 
         # 1. Скачиваем во временный файл
@@ -597,7 +692,24 @@ class LipsyncTwoModeApp(ctk.CTk):
         except Exception as e:
             raise RuntimeError(f"Не удалось скачать: {e}")
 
-        # 2. Проверяем что это валидный Python
+        # 2. Проверяем SHA256 (защита от подмены/повреждения файла)
+        if expected_sha256:
+            progress_label.configure(text="Проверяю целостность файла...")
+            parent_win.update()
+            with open(temp_path, "rb") as f:
+                actual_sha256 = hashlib.sha256(f.read()).hexdigest()
+            if actual_sha256 != expected_sha256:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"SHA256 не совпадает — файл мог быть повреждён или подменён.\n"
+                    f"Ожидалось: {expected_sha256[:24]}…\n"
+                    f"Получено:  {actual_sha256[:24]}…"
+                )
+
+        # 3. Проверяем что это валидный Python
         progress_label.configure(text="Проверяю синтаксис...")
         parent_win.update()
         try:
@@ -611,7 +723,7 @@ class LipsyncTwoModeApp(ctk.CTk):
                 pass
             raise RuntimeError(f"Скачанный код содержит синтаксическую ошибку:\n{e}")
 
-        # 3. Проверяем версию в самом коде
+        # 4. Проверяем версию в самом коде
         m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', new_code)
         if m:
             actual = m.group(1)
@@ -625,7 +737,7 @@ class LipsyncTwoModeApp(ctk.CTk):
                     f"(в файле: {actual}, у тебя: {APP_VERSION})."
                 )
 
-        # 4. Заменяем app.py
+        # 5. Заменяем app.py
         progress_label.configure(text="Применяю обновление...")
         parent_win.update()
         app_path = os.path.join(app_dir, "app.py")
@@ -637,7 +749,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         except Exception as e:
             raise RuntimeError(f"Не удалось заменить файл: {e}")
 
-        # 5. Записываем флаг «только что обновились»
+        # 6. Записываем флаг «только что обновились»
         flag_path = os.path.join(app_dir, ".just_updated")
         try:
             with open(flag_path, "w", encoding="utf-8") as f:
@@ -645,7 +757,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         except Exception:
             pass
 
-        # 6. Перезапускаем приложение
+        # 7. Перезапускаем приложение
         progress_label.configure(text="Перезапускаюсь...")
         parent_win.update()
         time.sleep(1)
@@ -688,12 +800,17 @@ class LipsyncTwoModeApp(ctk.CTk):
                 pass
 
     def button(self, parent, text, command, color=BTN_PRIMARY, hover=BTN_PRIMARY_HOVER, width=150):
-        return ctk.CTkButton(parent, text=text, command=command, fg_color=color, hover_color=hover, text_color="white", corner_radius=10, height=38, width=width, font=ctk.CTkFont(size=14, weight="bold"))
+        return ctk.CTkButton(parent, text=text, command=command, fg_color=color, hover_color=hover, text_color="white", corner_radius=20, height=38, width=width, font=ctk.CTkFont(size=14, weight="bold"))
 
     def label(self, parent, text, size=14, weight="normal", color=TEXT):
         return ctk.CTkLabel(parent, text=text, text_color=color, font=ctk.CTkFont(size=size, weight=weight), anchor="w", justify="left")
 
     def build_ui(self):
+        # Arc-style top gradient accent strip (pink → orange → cyan simulated via 3 frames)
+        strip = ctk.CTkFrame(self, height=4, fg_color="#0095ff", corner_radius=0)
+        strip.pack(fill="x")
+        strip.pack_propagate(False)
+
         header = ctk.CTkFrame(self, fg_color=BG)
         header.pack(fill="x", padx=24, pady=(8, 8))
 
@@ -729,13 +846,13 @@ class LipsyncTwoModeApp(ctk.CTk):
                               lambda: self.check_for_updates(silent=False),
                               color=BTN, hover=BTN_HOVER, width=170)
         self.update_btn.pack(side="left", padx=(10, 0))
-        self.rolls_area = ctk.CTkScrollableFrame(self, fg_color=BG, scrollbar_button_color="#404040", scrollbar_button_hover_color="#525252", width=890, height=540)
+        self.rolls_area = ctk.CTkScrollableFrame(self, fg_color=BG, scrollbar_button_color="#3d3d6a", scrollbar_button_hover_color="#ff7eb6", width=890, height=540)
         self.rolls_area.pack(fill="both", expand=True, padx=24, pady=(0, 12))
         bottom = ctk.CTkFrame(self, fg_color=BG)
         bottom.pack(fill="x", padx=24, pady=(0, 22))
         self.status_label = self.label(bottom, "", size=13, color=MUTED)
         self.status_label.pack(anchor="w", pady=(0, 10))
-        self.start_btn = ctk.CTkButton(bottom, text="НАЧАТЬ ОЧЕРЕДЬ", command=self.start_queue, fg_color=BTN_DANGER, hover_color=BTN_DANGER_HOVER, text_color="white", corner_radius=12, height=50, font=ctk.CTkFont(size=17, weight="bold"))
+        self.start_btn = ctk.CTkButton(bottom, text="НАЧАТЬ ОЧЕРЕДЬ", command=self.start_queue, fg_color=BTN_DANGER, hover_color=BTN_DANGER_HOVER, text_color="white", corner_radius=24, height=50, font=ctk.CTkFont(size=17, weight="bold"))
         self.start_btn.pack(fill="x")
 
     def open_main_api_voice_dialog(self):
@@ -746,7 +863,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.transient(self)
         win.grab_set()
 
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=16)
+        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
 
         self.label(frame, "ElevenLabs API key", size=24, weight="bold").pack(anchor="w", padx=24, pady=(22, 6))
@@ -799,7 +916,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.transient(self)
         win.grab_set()
 
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=16)
+        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
 
         self.label(frame, "Sync.so API key", size=24, weight="bold").pack(anchor="w", padx=24, pady=(22, 6))
@@ -838,16 +955,9 @@ class LipsyncTwoModeApp(ctk.CTk):
                     color=BTN_OK, hover=BTN_OK_HOVER, width=190).pack(anchor="e", padx=24, pady=(10, 0))
 
     def fetch_voice_id_by_name(self, name):
-        if not self.api_key:
-            raise RuntimeError("Сначала укажи ElevenLabs API key.")
-        url = f"{ELEVEN_BASE_URL}/v1/voices"
-        headers = {"xi-api-key": self.api_key}
-        res = requests.get(url, headers=headers, timeout=60)
-        if res.status_code != 200:
-            raise RuntimeError(f"{res.status_code}: {res.text[:300]}")
-        for v in res.json().get("voices", []):
-            if v.get("name", "").strip().lower() == name.lower():
-                return v.get("voice_id")
+        for v in self.fetch_all_voices():
+            if v["name"].lower() == name.lower():
+                return v["voice_id"]
         return None
     
     def fetch_all_voices(self):
@@ -885,7 +995,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         data = {
             "name": voice_name,
             "description": description or "Клонирован через SheqelMotion Studio",
-            "remove_background_noise": "false",
+            "remove_background_noise": "true",
         }
 
         with open(audio_path, "rb") as f:
@@ -926,7 +1036,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.transient(self)
         win.grab_set()
 
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=16)
+        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
 
         self.label(frame, "🎙 Клонировать голос", size=22, weight="bold").pack(anchor="w", padx=22, pady=(20, 6))
@@ -1034,9 +1144,7 @@ class LipsyncTwoModeApp(ctk.CTk):
     def play_voice_preview(self, voice_id, url):
         """Скачивает (если надо) и играет preview через ffplay/afplay."""
         self.stop_preview()
-        
 
-        import tempfile
         cache_dir = os.path.join(tempfile.gettempdir(), "sheqelmotion_previews")
         ensure_dir(cache_dir)
         cache_path = os.path.join(cache_dir, f"{voice_id}.mp3")
@@ -1098,7 +1206,7 @@ class LipsyncTwoModeApp(ctk.CTk):
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", on_close)
 
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=16)
+        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=16, pady=16)
 
         self.label(frame, "Мои голоса", size=18, weight="bold").pack(anchor="w", padx=16, pady=(14, 6))
@@ -1155,7 +1263,7 @@ class LipsyncTwoModeApp(ctk.CTk):
                              ).pack(side="left", padx=4)
 
                 for v in section_voices:
-                    row = ctk.CTkFrame(list_frame, fg_color=CARD, corner_radius=8)
+                    row = ctk.CTkFrame(list_frame, fg_color=CARD, corner_radius=14)
                     row.pack(fill="x", padx=2, pady=3)
 
                     ctk.CTkLabel(row, text=v["name"],
@@ -1223,7 +1331,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.configure(fg_color=BG)
         win.transient(self)
         win.grab_set()
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=16)
+        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
         self.label(frame, "Сгенерировать full_voice.mp3", size=24, weight="bold").pack(anchor="w", padx=22, pady=(20, 6))
         self.label(frame, "Пиши текст с ------. Приложение заменит ------ на паузу, ElevenLabs не будет читать тире.", size=13, color=MUTED).pack(anchor="w", padx=22, pady=(0, 16))
@@ -1313,7 +1421,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         self._enable_mousewheel(self.rolls_area)
 
     def render_roll_card(self, idx, roll):
-        card = ctk.CTkFrame(self.rolls_area, fg_color=CARD, corner_radius=16)
+        card = ctk.CTkFrame(self.rolls_area, fg_color=CARD, corner_radius=22)
         card.pack(fill="x", padx=4, pady=(0, 14))
         top = ctk.CTkFrame(card, fg_color=CARD)
         top.pack(fill="x", padx=16, pady=(14, 8))
@@ -1458,7 +1566,6 @@ class LipsyncTwoModeApp(ctk.CTk):
             messagebox.showwarning("Очередь", "Нельзя удалять во время обработки.")
             return
 
-        # запоминаем позицию скролла
         scroll_pos = self.rolls_area._parent_canvas.yview()
 
         self.rolls = [roll for roll in self.rolls if roll["id"] != roll_id]
@@ -1467,12 +1574,13 @@ class LipsyncTwoModeApp(ctk.CTk):
             self.add_roll()
         else:
             self.refresh_rolls()
-
-            # возвращаем скролл туда же
-            try:
-                self.rolls_area._parent_canvas.yview_moveto(scroll_pos[0])
-            except Exception:
-                pass
+            # Возвращаем скролл ПОСЛЕ того как UI перерисуется
+            def _restore():
+                try:
+                    self.rolls_area._parent_canvas.yview_moveto(scroll_pos[0])
+                except Exception:
+                    pass
+            self.after(60, _restore)
 
 
 
@@ -1503,7 +1611,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.configure(fg_color=BG)
         win.transient(self)
         win.grab_set()
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=16)
+        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=24, pady=24)
         roll_title = self.get_roll_title(idx, roll)
         self.label(frame,f"Текст — {roll_title}",size=24,weight="bold").pack(anchor="w", padx=22, pady=(20, 6))
@@ -1594,11 +1702,72 @@ class LipsyncTwoModeApp(ctk.CTk):
         self.start_btn.configure(state="disabled", text="ОБРАБАТЫВАЮ ОЧЕРЕДЬ...")
         thread = threading.Thread(target=self.queue_thread, args=(valid,), daemon=True)
         thread.start()
-        
+
+
+    def _process_single_roll(self, order_num, idx, roll, batch_dir, log):
+        """Обрабатывает один ролик (используется и в последовательном, и в параллельном режиме)."""
+        if roll["mode"] == "1 видео":
+            roll_video_name = os.path.splitext(os.path.basename(roll["video_single"]))[0]
+        else:
+            roll_video_name = os.path.splitext(os.path.basename(roll["video_start"]))[0]
+
+        roll_dir = os.path.join(batch_dir, f"{order_num:02d}_{safe_name(roll_video_name)}")
+        ensure_dir(roll_dir)
+        temp_dir = os.path.join(roll_dir, ".tmp")
+        ensure_dir(temp_dir)
+
+        full_voice_copy = copy_file(roll["voice_file"], os.path.join(roll_dir, "full_voice.mp3"))
+        with open(os.path.join(roll_dir, "full_text.txt"), "w", encoding="utf-8") as f:
+            f.write(roll["text"])
+
+        log("=" * 60)
+        log(f"Ролик {idx + 1} / очередь {order_num}")
+        log(f"Режим: {roll['mode']}")
+        log(f"Папка: {roll_dir}")
+        log("=" * 60)
+
+        if roll["mode"] == "1 видео":
+            audio_wav = os.path.join(temp_dir, "full_voice.wav")
+            convert_audio_to_wav_trimmed(
+                full_voice_copy,
+                audio_wav,
+                start_sec=roll.get("audio_start", ""),
+                end_sec=roll.get("audio_end", ""),
+            )
+            if roll.get("audio_start") or roll.get("audio_end"):
+                log(f"Обрезка: {roll.get('audio_start') or '0'} → {roll.get('audio_end') or 'конец'} сек")
+
+            video_name = safe_name(os.path.splitext(os.path.basename(roll["video_single"]))[0])
+            out = os.path.join(roll_dir, f"{video_name}.mp4")
+            process_lipsync(roll["video_single"], audio_wav, out, temp_dir, log)
+            log(f"ГОТОВО: {out}")
+        else:
+            start_text, end_text, sep_count = parse_start_end_text(roll["text"])
+            part_start, part_end = split_start_end_by_silence(
+                full_voice_copy, roll_dir, log,
+                expected_separators=sep_count,
+            )
+            video_name_start = safe_name(os.path.splitext(os.path.basename(roll["video_start"]))[0])
+            video_name_end = safe_name(os.path.splitext(os.path.basename(roll["video_end"]))[0])
+
+            out_start = os.path.join(roll_dir, f"{video_name_start}_start.mp4")
+            out_end = os.path.join(roll_dir, f"{video_name_end}_end.mp4")
+            log("Lipsync start...")
+            process_lipsync(roll["video_start"], part_start, out_start, temp_dir, log)
+            log("Lipsync end...")
+            process_lipsync(roll["video_end"], part_end, out_end, temp_dir, log)
+            log(f"ГОТОВО: {out_start}")
+            log(f"ГОТОВО: {out_end}")
+
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass    
 
     def queue_thread(self, valid_rolls):
         try:
             failed_videos = []
+            failed_lock = threading.Lock()
             base_output = os.path.join(desktop_dir(), "Lipsync_Queue_Output")
             ensure_dir(base_output)
 
@@ -1606,91 +1775,59 @@ class LipsyncTwoModeApp(ctk.CTk):
             batch_dir = os.path.join(base_output, batch_name)
             ensure_dir(batch_dir)
 
+            total = len(valid_rolls)
             self.log("=" * 70)
             self.log(f"Папка партии: {batch_dir}")
-            self.log(f"Роликов в очереди: {len(valid_rolls)}")
+            self.log(f"Роликов в очереди: {total}")
+            self.log(f"Параллельность: {CONCURRENT_ROLLS} ролика одновременно")
+            self.log(f"Стартовая задержка между запусками: {PAUSE_BETWEEN_ROLLS_SEC} сек")
             self.log("=" * 70)
-            for order_num, (idx, roll) in enumerate(valid_rolls, start=1):
+
+            def process_one(order_num, idx, roll):
+                prefix = f"[#{order_num:02d}]"
+
+                def prefixed_log(msg):
+                    self.log(f"{prefix} {msg}")
+
+                # Стагер старта: тред N стартует через N*PAUSE сек — предотвращает
+                # одновременный удар по Sync API несколькими потоками
+                stagger = (order_num - 1) * PAUSE_BETWEEN_ROLLS_SEC
+                if stagger > 0:
+                    prefixed_log(f"Жду {stagger} сек перед стартом...")
+                    time.sleep(stagger)
+
                 try:
-                    self.set_roll_status(idx, f"Обработка {order_num}/{len(valid_rolls)}")
-                    if roll["mode"] == "1 видео":
-                        roll_video_name = os.path.splitext(os.path.basename(roll["video_single"]))[0]
-                    else:
-                        roll_video_name = os.path.splitext(os.path.basename(roll["video_start"]))[0]
-                    roll_dir = os.path.join(batch_dir, f"{order_num:02d}_{safe_name(roll_video_name)}")
-                    ensure_dir(roll_dir)
-                    temp_dir = os.path.join(roll_dir, ".tmp")
-                    ensure_dir(temp_dir)
-                    full_voice_copy = copy_file(roll["voice_file"], os.path.join(roll_dir, "full_voice.mp3"))
-                    with open(os.path.join(roll_dir, "full_text.txt"), "w", encoding="utf-8") as f:
-                        f.write(roll["text"])
-                    self.log("")
-                    self.log("=" * 70)
-                    self.log(f"Ролик {idx + 1} / очередь {order_num}")
-                    self.log(f"Режим: {roll['mode']}")
-                    self.log(f"Папка: {roll_dir}")
-                    self.log("=" * 70)
-                    if roll["mode"] == "1 видео":
-                        audio_wav = os.path.join(temp_dir, "full_voice.wav")
-                        convert_audio_to_wav_trimmed(
-                            full_voice_copy,
-                            audio_wav,
-                            start_sec=roll.get("audio_start", ""),
-                            end_sec=roll.get("audio_end", ""),
-                        )
-                        if roll.get("audio_start") or roll.get("audio_end"):
-                            self.log(f"Обрезка: {roll.get('audio_start') or '0'} → {roll.get('audio_end') or 'конец'} сек")
-
-                        video_name = safe_name(os.path.splitext(os.path.basename(roll["video_single"]))[0])
-                        out = os.path.join(roll_dir, f"{video_name}.mp4")
-                        process_lipsync(roll["video_single"], audio_wav, out, temp_dir, self.log)
-                        self.log(f"ГОТОВО: {out}")
-                    else:
-                        start_text, end_text, sep_count = parse_start_end_text(roll["text"])
-                        part_start, part_end = split_start_end_by_silence(
-                            full_voice_copy, roll_dir, self.log,
-                            expected_separators=sep_count,
-                        )
-                        video_name_start = safe_name(os.path.splitext(os.path.basename(roll["video_start"]))[0])
-                        video_name_end = safe_name(os.path.splitext(os.path.basename(roll["video_end"]))[0])
-
-                        out_start = os.path.join(roll_dir, f"{video_name_start}_start.mp4")
-                        out_end = os.path.join(roll_dir, f"{video_name_end}_end.mp4")
-                        self.log("Lipsync start...")
-                        process_lipsync(roll["video_start"], part_start, out_start, temp_dir, self.log)
-                        self.log("Lipsync end...")
-                        process_lipsync(roll["video_end"], part_end, out_end, temp_dir, self.log)
-                        self.log(f"ГОТОВО: {out_start}")
-                        self.log(f"ГОТОВО: {out_end}")
-                    try:
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-                    except Exception:
-                        pass
+                    self.set_roll_status(idx, f"Обработка {order_num}/{total}")
+                    self._process_single_roll(order_num, idx, roll, batch_dir, prefixed_log)
                     self.set_roll_status(idx, "Готово")
-                    if order_num < len(valid_rolls):
-                        self.log(f"Пауза {PAUSE_BETWEEN_ROLLS_SEC} сек перед следующим роликом...")
-                        time.sleep(PAUSE_BETWEEN_ROLLS_SEC)
                 except Exception as e:
                     if roll["mode"] == "1 видео":
                         video_name = os.path.basename(roll.get("video_single", "")) or f"ролик {idx + 1}"
                     else:
                         s = os.path.basename(roll.get("video_start", ""))
-                        e = os.path.basename(roll.get("video_end", ""))
-                        video_name = f"{s} + {e}" if (s and e) else f"ролик {idx + 1}"
-                    error_text = str(e)
+                        en = os.path.basename(roll.get("video_end", ""))
+                        video_name = f"{s} + {en}" if (s and en) else f"ролик {idx + 1}"
 
-                    self.log(f"❌ ОШИБКА в ролике '{video_name}': {error_text}")
+                    error_text = str(e)
+                    prefixed_log(f"❌ ОШИБКА в '{video_name}': {error_text}")
                     self.set_roll_status(idx, "Ошибка")
 
-                    failed_videos.append({
-                        "video_name": video_name,
-                        "error": error_text
-                    })
+                    with failed_lock:
+                        failed_videos.append({
+                            "video_name": video_name,
+                            "error": error_text
+                        })
 
-                    continue
+            with ThreadPoolExecutor(max_workers=CONCURRENT_ROLLS) as executor:
+                futures = [
+                    executor.submit(process_one, order_num, idx, roll)
+                    for order_num, (idx, roll) in enumerate(valid_rolls, start=1)
+                ]
+                for f in futures:
+                    f.result()
+
             if failed_videos:
                 error_message = "Очередь завершена, но были ошибки:\n\n"
-
                 for item in failed_videos:
                     error_message += f"❌ {item['video_name']}\nПричина: {item['error']}\n\n"
 
@@ -1700,13 +1837,11 @@ class LipsyncTwoModeApp(ctk.CTk):
 
                 self.after(0, done_with_errors)
             else:
-
                 def done_ok():
                     messagebox.showinfo(
                         "Готово",
                         f"✅ Все ролики обработаны успешно.\n\nПапка:\n{batch_dir}"
                     )
-
                     open_folder(batch_dir)
 
                 self.after(0, done_ok)
@@ -1795,7 +1930,7 @@ class LipsyncTwoModeApp(ctk.CTk):
             self.log(f"Не удалось сохранить конфиг: {e}")
 
     def _enable_mousewheel(self, scrollable):
-    #Включает скролл колесом мыши на всех виджетах внутри scrollable frame."""
+    #Включает скролл колесом мыши на всех виджетах внутри scrollable frame.
         canvas = scrollable._parent_canvas
 
         def on_wheel(event):

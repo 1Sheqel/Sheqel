@@ -1,8 +1,9 @@
 {
   "latest_version": "1.0.1",
+  "sha256": "ff057c4b1a94a4a944dc2b18e3509a2c32c7de0a430a05a76b3b417e1d9c0a4b",
   "download_url_mac": "",
   "download_url_windows": "",
-  "release_notes": "- Исправлено открытие batch-папок\n- Исправлен Sync API key\n- Улучшен lipsync\n- Добавлена проверка пауз в режиме 1 видео",
+  "release_notes": "- Новый дизайн Arc Browser (тёмный стальной)\n- SHA256-проверка при автообновлении\n- Исправлено восстановление окна после скрытия (macOS Dock)\n- Исправлен прыжок скролла при удалении сценария\n- Устранено дублирование API-запроса голосов\n- Обновлены зависимости",
   "min_required_version": "1.0.0",
   "force_update": false
 }
