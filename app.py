@@ -77,14 +77,7 @@ def app_base_dir():
 
 
 def find_binary(name):
-    exe = name + (".exe" if sys.platform == "win32" else "")
-    local = os.path.join(app_base_dir(), exe)
-    if os.path.exists(local):
-        return local
-    found = shutil.which(name)
-    if found:
-        return found
-    raise RuntimeError(f"Не найден {exe}. Положи его рядом с приложением или добавь в PATH.")
+    return shutil.which(name) or name
 
 
 def ffmpeg_bin():
