@@ -1,6 +1,6 @@
 {
   "latest_version": "1.0.2",
-  "sha256": "9cb7a1238f5ee35998706ecb1088035d9db29057f7089b083cc01e6b1d3505df",
+  "sha256": "f9e59cb931f63332a1b19baabfa34583b81e03328c95e552d176dbce449715f4",
   "download_url_mac": "",
   "download_url_windows": "",
   "release_notes": "- Исправлено: кнопка «НАЧАТЬ ОЧЕРЕДЬ» не отображалась на маленьких экранах",
