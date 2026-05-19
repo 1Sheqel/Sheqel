@@ -1,9 +1,9 @@
 {
-  "latest_version": "1.0.2",
-  "sha256": "f9e59cb931f63332a1b19baabfa34583b81e03328c95e552d176dbce449715f4",
+  "latest_version": "1.0.3",
+  "sha256": "7859f328a455c26d84ba221409e9f7a6ebebc61d906ccc3ed3a007c2d2d6b45b",
   "download_url_mac": "",
   "download_url_windows": "",
-  "release_notes": "- Исправлено: кнопка «НАЧАТЬ ОЧЕРЕДЬ» не отображалась на маленьких экранах",
+  "release_notes": "- Исправлен ffmpeg: теперь используется системный вместо локального",
   "min_required_version": "1.0.0",
   "force_update": false
 }

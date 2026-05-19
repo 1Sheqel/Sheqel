@@ -22,7 +22,7 @@ from tkinter import filedialog, messagebox
 SYNC_API_KEY = ""
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 UPDATE_MANIFEST_URL = f"https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json?t={int(time.time())}"
 
 
