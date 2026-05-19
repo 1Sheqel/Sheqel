@@ -1,26 +1,50 @@
 #!/bin/bash
 # SheqelMotion Studio launcher — runs without Terminal
 
-# Go to the folder containing app.py (3 levels up from this script)
 APP_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$APP_DIR"
 
+# Expand PATH to include Homebrew and common Python locations
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+# Load user shell profile so pyenv/conda/nix paths also work
+[ -f "$HOME/.zprofile" ]      && source "$HOME/.zprofile"      2>/dev/null
+[ -f "$HOME/.bash_profile" ]  && source "$HOME/.bash_profile"  2>/dev/null
+[ -f "$HOME/.profile" ]       && source "$HOME/.profile"       2>/dev/null
+
 # Find Python 3.10+
 PYTHON=""
-for candidate in python3.12 python3.11 python3.10 python3; do
+for candidate in \
+    /opt/homebrew/bin/python3.12 \
+    /opt/homebrew/bin/python3.11 \
+    /opt/homebrew/bin/python3.10 \
+    /usr/local/bin/python3.12 \
+    /usr/local/bin/python3.11 \
+    /usr/local/bin/python3.10 \
+    python3.12 python3.11 python3.10 python3; do
     if command -v "$candidate" &>/dev/null; then
-        PYTHON="$candidate"
-        break
+        VER=$("$candidate" -c "import sys; print(sys.version_info >= (3,10))" 2>/dev/null)
+        if [ "$VER" = "True" ]; then
+            PYTHON=$(command -v "$candidate")
+            break
+        fi
     fi
 done
 
 if [ -z "$PYTHON" ]; then
-    osascript -e 'display alert "Python не найден" message "Установи Python 3.10 или новее с сайта python.org" as critical'
+    osascript -e 'display alert "Python не найден" message "Установи Python 3.10 или новее с python.org" as critical'
     exit 1
 fi
 
-# Install dependencies silently
+# Install/update dependencies silently
 "$PYTHON" -m pip install -r "$APP_DIR/requirements.txt" --quiet 2>/dev/null
 
-# Launch the app
-exec "$PYTHON" "$APP_DIR/app.py"
+# Launch — errors go to log, show dialog on crash
+LOG="$HOME/Library/Logs/SheqelMotion.log"
+"$PYTHON" "$APP_DIR/app.py" 2>"$LOG"
+STATUS=$?
+
+if [ $STATUS -ne 0 ]; then
+    ERROR=$(tail -5 "$LOG" 2>/dev/null | tr '\n' ' ')
+    osascript -e "display alert \"SheqelMotion завершился с ошибкой\" message \"$ERROR\nЛог: $LOG\" as critical"
+fi
