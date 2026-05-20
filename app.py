@@ -22,7 +22,7 @@ from tkinter import filedialog, messagebox
 SYNC_API_KEY = ""
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -340,26 +340,24 @@ def prepare_video_for_sync(input_video, audio_wav, output_video):
         raise RuntimeError(f"Не удалось подготовить видео для Sync: {output_video}")
     return output_video
 
-def upload_to_litterbox(file_path, log, expiry="1h"):
-    """Загружает файл на litterbox.catbox.moe и возвращает публичный URL.
-    expiry: '1h', '12h', '24h', '72h' — через это время файл автоудалится.
-    """
-    url = "https://litterbox.catbox.moe/resources/internals/api.php"
-    log(f"Загружаю {os.path.basename(file_path)} на временный хостинг...")
+def upload_to_fileio(file_path, log):
+    """Загружает файл на file.io и возвращает публичный URL (ссылка живёт 1 день)."""
+    log(f"Загружаю {os.path.basename(file_path)} на file.io...")
     with open(file_path, "rb") as f:
-        files = {
-            "fileToUpload": (os.path.basename(file_path), f),
-        }
-        data = {
-            "reqtype": "fileupload",
-            "time": expiry,
-        }
-        res = requests.post(url, data=data, files=files, timeout=600)
-    if res.status_code != 200:
-        raise RuntimeError(f"Litterbox upload error: {res.status_code}\n{res.text}")
-    public_url = res.text.strip()
+        res = requests.post(
+            "https://file.io",
+            files={"file": f},
+            data={"expires": "1d"},
+            timeout=600,
+        )
+    if res.status_code not in (200, 201):
+        raise RuntimeError(f"file.io upload error: {res.status_code}\n{res.text}")
+    data = res.json()
+    if not data.get("success"):
+        raise RuntimeError(f"file.io вернул ошибку: {data}")
+    public_url = data.get("link") or data.get("url", "")
     if not public_url.startswith("http"):
-        raise RuntimeError(f"Litterbox вернул не URL: {public_url}")
+        raise RuntimeError(f"file.io вернул не URL: {data}")
     log(f"  → {public_url}")
     return public_url
 
@@ -373,8 +371,8 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
             log(f"Отправляю в Sync... попытка {attempt}/{SYNC_RETRIES}")
 
             # 1. Заливаем файлы на временный хостинг → получаем URL
-            video_url = upload_to_litterbox(video_in, log, expiry="1h")
-            audio_url = upload_to_litterbox(audio_wav, log, expiry="1h")
+            video_url = upload_to_fileio(video_in, log)
+            audio_url = upload_to_fileio(audio_wav, log)
 
             # 2. Отправляем в Sync только URL (никакого multipart)
             payload = {
@@ -460,6 +458,229 @@ def process_lipsync(video_path, audio_wav, output_mp4, temp_dir, log):
     apply_lipsync_sync(sync_video, audio_wav, raw_video, log)
     enhance_video(raw_video, output_mp4)
     return output_mp4
+
+
+def _ensure_ytdlp():
+    try:
+        import yt_dlp
+        return yt_dlp
+    except ImportError:
+        import subprocess
+        import sys
+        subprocess.run([sys.executable, "-m", "pip", "install", "yt-dlp"], check=True)
+        import yt_dlp
+        return yt_dlp
+
+
+def _ytdlp_ffmpeg_opts():
+    """Возвращает путь к директории с ffmpeg для передачи yt-dlp."""
+    bin_path = ffmpeg_bin()
+    if os.path.isabs(bin_path):
+        return os.path.dirname(bin_path)
+    return None
+
+
+def download_from_url(url, output_dir, mode, denoise, log):
+    """
+    Скачивает видео или аудио через yt-dlp в максимальном качестве.
+    mode: 'video' | 'audio'
+    denoise: bool — применить голосовой денойз к аудио
+    """
+    yt_dlp = _ensure_ytdlp()
+    ensure_dir(output_dir)
+
+    # Добавляем директорию с бандленным ffmpeg в PATH для yt-dlp
+    base = app_base_dir()
+    env_path = os.environ.get("PATH", "")
+    if base not in env_path.split(os.pathsep):
+        os.environ["PATH"] = base + os.pathsep + env_path
+
+    timestamp = time.strftime("%d-%m-%Y_%H-%M-%S")
+    ffmpeg_dir = _ytdlp_ffmpeg_opts()
+
+    last_pct = {"v": ""}
+
+    def progress_hook(d):
+        if d["status"] == "downloading":
+            pct = d.get("_percent_str", "").strip()
+            speed = d.get("_speed_str", "").strip()
+            eta = d.get("_eta_str", "").strip()
+            line = f"  {pct}  {speed}  ETA {eta}"
+            if pct != last_pct["v"]:
+                last_pct["v"] = pct
+                log(line)
+        elif d["status"] == "finished":
+            log(f"  Скачано: {os.path.basename(d.get('filename', ''))}")
+
+    common = {
+        "quiet": True,
+        "no_warnings": True,
+        "progress_hooks": [progress_hook],
+    }
+    if ffmpeg_dir:
+        common["ffmpeg_location"] = ffmpeg_dir
+
+    if mode == "video":
+        outtmpl = os.path.join(output_dir, f"{timestamp}_%(title).80s.%(ext)s")
+        opts = {
+            **common,
+            "format": (
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[ext=mp4]+bestaudio/"
+                "bestvideo+bestaudio/best"
+            ),
+            "merge_output_format": "mp4",
+            "outtmpl": outtmpl,
+        }
+        log("Получаю информацию о видео...")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            if not os.path.exists(filename):
+                filename = os.path.splitext(filename)[0] + ".mp4"
+        log(f"Сохранено: {filename}")
+        return filename, None
+
+    elif mode == "audio":
+        outtmpl = os.path.join(output_dir, f"{timestamp}_%(title).80s.%(ext)s")
+        opts = {
+            **common,
+            "format": "bestaudio/best",
+            "outtmpl": outtmpl,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "0",
+            }],
+        }
+        log("Получаю информацию об аудио...")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            base_name = ydl.prepare_filename(info)
+        filename = os.path.splitext(base_name)[0] + ".mp3"
+
+        if denoise and os.path.exists(filename):
+            log(f"Передаю в audio-separator: {os.path.basename(filename)}")
+            vocals_out = os.path.splitext(filename)[0] + "_vocals.mp3"
+            _separate_vocals(filename, vocals_out, log)
+            os.remove(filename)
+            filename = vocals_out
+
+        log(f"Сохранено: {filename}")
+        return filename, None
+
+    else:  # split — видео как есть + аудио отдельно
+        outtmpl = os.path.join(output_dir, f"{timestamp}_%(title).80s.%(ext)s")
+        opts = {
+            **common,
+            "format": (
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[ext=mp4]+bestaudio/"
+                "bestvideo+bestaudio/best"
+            ),
+            "merge_output_format": "mp4",
+            "outtmpl": outtmpl,
+        }
+        log("Скачиваю видео в максимальном качестве...")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            if not os.path.exists(filename):
+                filename = os.path.splitext(filename)[0] + ".mp4"
+
+        video_out, audio_out = _split_video_audio(filename, output_dir, denoise, log)
+        try:
+            os.remove(filename)
+        except Exception:
+            pass
+        return video_out, audio_out
+
+
+def _separate_vocals(input_path, output_path, log):
+    """Выделяет голос через audio-separator. Сохраняет mp3 в output_path."""
+    import sys as _sys
+    try:
+        from audio_separator.separator import Separator
+    except ImportError:
+        log("Устанавливаю audio-separator...")
+        subprocess.run(
+            [_sys.executable, "-m", "pip", "install", "audio-separator[cpu]"],
+            check=True,
+        )
+        from audio_separator.separator import Separator
+
+    log(f"[audio-separator] Входной файл: {os.path.basename(input_path)}"
+        f" ({os.path.splitext(input_path)[1].upper() or 'нет расширения'})")
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        # ШАГ 1: конвертируем в WAV — audio-separator работает лучше с WAV
+        wav_path = os.path.join(tmp_dir, "input.wav")
+        log("[audio-separator] ШАГ 1: конвертирую в WAV 44100 Hz...")
+        run([ffmpeg_bin(), "-y", "-i", input_path, "-ar", "44100", "-ac", "2", wav_path])
+        if not os.path.exists(wav_path):
+            raise RuntimeError(f"ffmpeg не создал WAV: {wav_path}")
+        log(f"[audio-separator] WAV готов: {os.path.basename(wav_path)}")
+
+        # ШАГ 2: разделяем голос и музыку
+        log("[audio-separator] ШАГ 2: запускаю разделение...")
+        sep = Separator(output_dir=tmp_dir)
+        sep.load_model()
+        files = sep.separate(wav_path)
+
+        log(f"[audio-separator] Сгенерированные файлы: {[os.path.basename(f) for f in files]}")
+
+        # ШАГ 3: ищем файл с голосом (Vocals в имени)
+        vocals = None
+        for f in files:
+            full = f if os.path.isabs(f) else os.path.join(tmp_dir, os.path.basename(f))
+            if "vocal" in os.path.basename(full).lower() and os.path.exists(full):
+                vocals = full
+                break
+
+        if not vocals:
+            raise RuntimeError(
+                f"audio-separator: файл с голосом не найден. "
+                f"Файлы: {[os.path.basename(f) for f in files]}"
+            )
+        log(f"[audio-separator] ШАГ 3: голос найден: {os.path.basename(vocals)}")
+
+        # ШАГ 4: конвертируем результат в mp3
+        run([ffmpeg_bin(), "-y", "-i", vocals, "-q:a", "0", output_path])
+        log(f"Голос готов: {os.path.basename(output_path)}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _split_video_audio(video_path, output_dir, denoise, log):
+    """
+    Разделяет видео на:
+      - VIDEO.mp4  — оригинальное видео со всем оригинальным звуком
+      - AUDIO.mp3  — только аудиодорожка, с денойзом если выбрано
+    """
+    ensure_dir(output_dir)
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    video_out = os.path.join(output_dir, base + "_VIDEO.mp4")
+    audio_out = os.path.join(output_dir, base + "_AUDIO.mp3")
+
+    log("Копирую оригинальное видео (с голосом)...")
+    shutil.copy2(video_path, video_out)
+
+    log("Извлекаю аудио в максимальном качестве...")
+    run([ffmpeg_bin(), "-y", "-i", video_path, "-vn", "-q:a", "0", audio_out])
+
+    if denoise:
+        log(f"Передаю в audio-separator: {os.path.basename(audio_out)}")
+        vocals_out = os.path.join(output_dir, base + "_vocals.mp3")
+        _separate_vocals(audio_out, vocals_out, log)
+        os.remove(audio_out)
+        audio_out = vocals_out
+
+    if not file_exists_ok(video_out):
+        raise RuntimeError(f"Не удалось сохранить видео: {video_out}")
+    if not file_exists_ok(audio_out):
+        raise RuntimeError(f"Не удалось создать аудиодорожку: {audio_out}")
+    return video_out, audio_out
 
 
 def make_neon_logo(text="SheqelMotion", width=720, height=140):
@@ -559,6 +780,9 @@ class LipsyncTwoModeApp(ctk.CTk):
         self.main_voice_name = ""
         self.rolls = []
         self.next_roll_id = 1
+        self.selected_roll_id = None
+        self._active_panel = None
+        self._stop_download = False
         self.log_queue = queue.Queue()
         self.log_window = None
         self.log_box = None
@@ -677,6 +901,17 @@ class LipsyncTwoModeApp(ctk.CTk):
 
     def _download_and_replace(self, new_version, expected_sha256, progress_label, parent_win):
         """Качает app.py, проверяет целостность и подпись, заменяет, перезапускает."""
+        if getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Обновление",
+                f"Доступна версия {new_version}.\n\n"
+                "Автообновление недоступно в .exe/.app сборке.\n"
+                "Скачай новый файл вручную с GitHub и замени текущий.",
+                parent=parent_win,
+            )
+            parent_win.destroy()
+            return
+
         raw_url = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/app.py"
 
         # 1. Скачиваем во временный файл
@@ -770,10 +1005,13 @@ class LipsyncTwoModeApp(ctk.CTk):
             pass
 
         python_exe = sys.executable
+        if sys.platform == "win32":
+            subprocess.Popen([python_exe, app_path])
+            self.destroy()
+            sys.exit(0)
         try:
             os.execv(python_exe, [python_exe, app_path])
         except Exception:
-            # Fallback на случай если execv не сработал
             subprocess.Popen([python_exe, app_path])
             self.destroy()
             sys.exit(0)
@@ -807,155 +1045,215 @@ class LipsyncTwoModeApp(ctk.CTk):
         return ctk.CTkLabel(parent, text=text, text_color=color, font=ctk.CTkFont(size=size, weight=weight), anchor="w", justify="left")
 
     def build_ui(self):
-        # Arc-style top gradient accent strip (pink → orange → cyan simulated via 3 frames)
+        # Top accent strip
         strip = ctk.CTkFrame(self, height=4, fg_color="#0095ff", corner_radius=0)
         strip.pack(fill="x")
         strip.pack_propagate(False)
 
-        header = ctk.CTkFrame(self, fg_color=BG)
-        header.pack(fill="x", padx=24, pady=(8, 8))
+        # Main body: sidebar (left) + content (right)
+        body = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        body.pack(fill="both", expand=True)
 
+        # ── Sidebar ──────────────────────────────────────────────────────────
+        sidebar = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=0, width=200)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+
+        # Logo — render full-size, scale down via CTkImage to fit sidebar
         logo_img = make_neon_logo("SheqelMotion", 720, 120)
-        logo = ctk.CTkImage(light_image=logo_img, dark_image=logo_img, size=(520, 86))
+        logo = ctk.CTkImage(light_image=logo_img, dark_image=logo_img, size=(176, 34))
+        ctk.CTkLabel(sidebar, image=logo, text="").pack(anchor="center", padx=10, pady=(20, 8))
 
-        logo_label = ctk.CTkLabel(header, image=logo, text="")
-        logo_label.pack(anchor="center", pady=(0, 2))
+        # Separator
+        ctk.CTkFrame(sidebar, height=1, fg_color="#2a2d3e", corner_radius=0).pack(
+            fill="x", padx=12, pady=(0, 4))
 
-        self.label(
-            header,
-            "2 режима: один lipsync или начало+конец. Видео выбирается внутри карточки.",
-            size=13,
-            color=MUTED
-        ).pack(anchor="center", pady=(0, 8))
-        top = ctk.CTkFrame(self, fg_color=BG)
-        top.pack(fill="x", padx=24, pady=(4, 12))
-        self.api_btn = self.button(top, "API key", self.open_main_api_voice_dialog, color=BTN, hover=BTN_HOVER, width=150)
-        self.api_btn.pack(side="left")
-        self.sync_btn = self.button(top, "Sync key", self.open_sync_key_dialog, color=BTN, hover=BTN_HOVER, width=130)
-        self.sync_btn.pack(side="left", padx=(10, 0))
-        self.voice_btn = self.button(top, "Сгенерировать голос", self.open_voice_generator_dialog, color=BTN, hover=BTN_HOVER, width=190)
-        self.voice_btn.pack(side="left", padx=(10, 0))
-        self.clone_btn = self.button(top, "🎙 Клонировать голос",
-                             self.open_voice_clone_dialog,
-                             color=BTN, hover=BTN_HOVER, width=200)
-        self.clone_btn.pack(side="left", padx=(10, 0))
-        self.add_btn = self.button(top, "+ Новая задача", self.add_roll, color=BTN_PRIMARY, hover=BTN_PRIMARY_HOVER, width=170)
-        self.add_btn.pack(side="left", padx=(10, 0))
-        self.clear_btn = self.button(top, "Очистить всё", self.clear_rolls, color=BTN, hover=BTN_HOVER, width=150)
-        self.clear_btn.pack(side="left", padx=(10, 0))
-        self.update_btn = self.button(top, "🔄 Обновления",
-                              lambda: self.check_for_updates(silent=False),
-                              color=BTN, hover=BTN_HOVER, width=170)
-        self.update_btn.pack(side="left", padx=(10, 0))
-        self.rolls_area = ctk.CTkScrollableFrame(self, fg_color=BG, scrollbar_button_color="#3d3d6a", scrollbar_button_hover_color="#ff7eb6", width=890, height=380)
-        self.rolls_area.pack(fill="both", expand=True, padx=24, pady=(0, 12))
-        bottom = ctk.CTkFrame(self, fg_color=BG)
-        bottom.pack(fill="x", padx=24, pady=(0, 22))
-        self.status_label = self.label(bottom, "", size=13, color=MUTED)
-        self.status_label.pack(anchor="w", pady=(0, 10))
-        self.start_btn = ctk.CTkButton(bottom, text="НАЧАТЬ ОЧЕРЕДЬ", command=self.start_queue, fg_color=BTN_DANGER, hover_color=BTN_DANGER_HOVER, text_color="white", corner_radius=24, height=50, font=ctk.CTkFont(size=17, weight="bold"))
-        self.start_btn.pack(fill="x")
+        def sb_header(text):
+            ctk.CTkLabel(
+                sidebar, text=text, text_color=MUTED,
+                font=ctk.CTkFont(size=10, weight="bold"), anchor="w",
+            ).pack(fill="x", padx=14, pady=(10, 2))
 
-    def open_main_api_voice_dialog(self):
-        win = ctk.CTkToplevel(self)
-        win.title("ElevenLabs API key")
-        win.geometry("720x420")
-        win.configure(fg_color=BG)
-        win.transient(self)
-        win.after(100, win.grab_set)
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        def sb_btn(text, command, color="transparent", hover=BTN_HOVER):
+            btn = ctk.CTkButton(
+                sidebar, text=f"  {text}", command=command,
+                fg_color=color, hover_color=hover,
+                text_color=TEXT, anchor="w",
+                corner_radius=8, height=36,
+                font=ctk.CTkFont(size=13),
+            )
+            btn.pack(fill="x", padx=8, pady=2)
+            return btn
 
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
-        frame.pack(fill="both", expand=True, padx=24, pady=24)
+        # ⚙️ НАСТРОЙКИ
+        sb_header("⚙️  НАСТРОЙКИ")
+        self.api_btn = sb_btn("API key", self.show_api_key_panel)
+        self.sync_btn = sb_btn("Sync key", self.show_sync_key_panel)
 
-        self.label(frame, "ElevenLabs API key", size=24, weight="bold").pack(anchor="w", padx=24, pady=(22, 6))
-        self.label(
-            frame,
-            "Ключ нужен только для кнопки «Сгенерировать голос». Для обработки готового full_voice.mp3 ключ не используется.",
-            size=13,
-            color=MUTED,
-        ).pack(anchor="w", padx=24, pady=(0, 18))
+        # 🎙 ГОЛОС
+        sb_header("🎙  ГОЛОС")
+        self.voice_btn = sb_btn("Сгенерировать голос", self.show_voice_gen_panel)
+        self.clone_btn = sb_btn("Клонировать голос", self.show_voice_clone_panel)
 
-        self.label(frame, "API key", size=14, weight="bold").pack(anchor="w", padx=24)
+        # 📥 МЕДИА
+        sb_header("📥  МЕДИА")
+        self.dl_btn = sb_btn("⬇  Скачать видео", self.show_downloader_panel)
 
-        api_box = ctk.CTkTextbox(
-            frame,
-            height=86,
-            fg_color="#ffffff",
-            text_color="#111111",
-            border_width=1,
-            border_color="#737373",
-            corner_radius=10,
+        # ➕ ЗАДАЧИ
+        sb_header("➕  ЗАДАЧИ")
+        self.add_btn = sb_btn("Новая задача", self.add_roll,
+                              color=BTN_PRIMARY, hover=BTN_PRIMARY_HOVER)
+        self.clear_btn = sb_btn("Очистить всё", self.clear_rolls)
+        self.update_btn = sb_btn("🔄  Обновить",
+                                 lambda: self.check_for_updates(silent=False))
+
+        # Thin vertical divider
+        ctk.CTkFrame(body, width=1, fg_color="#2a2d3e", corner_radius=0).pack(
+            side="left", fill="y")
+
+        # ── Right section: scene list + detail + bottom bar ───────────────────
+        right_section = ctk.CTkFrame(body, fg_color=BG, corner_radius=0)
+        right_section.pack(side="left", fill="both", expand=True)
+
+        # Columns row (scene list + detail)
+        columns_row = ctk.CTkFrame(right_section, fg_color=BG, corner_radius=0)
+        columns_row.pack(fill="both", expand=True)
+
+        # ── Scene list (middle panel, 300px) ─────────────────────────────────
+        scene_list_frame = ctk.CTkFrame(columns_row, fg_color=PANEL, corner_radius=0, width=300)
+        scene_list_frame.pack(side="left", fill="y")
+        scene_list_frame.pack_propagate(False)
+
+        self.label(scene_list_frame, "Сцены", size=13, weight="bold", color=MUTED).pack(
+            anchor="w", padx=14, pady=(14, 6))
+
+        self.scene_list_scroll = ctk.CTkScrollableFrame(
+            scene_list_frame, fg_color=PANEL,
+            scrollbar_button_color="#3d3d6a",
+            scrollbar_button_hover_color="#ff7eb6",
+        )
+        self.scene_list_scroll.pack(fill="both", expand=True, padx=0, pady=0)
+
+        # "Новая задача" button pinned at bottom of scene list
+        add_scene_btn = ctk.CTkButton(
+            scene_list_frame, text="＋  Новая задача", command=self.add_roll,
+            fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER,
+            text_color=TEXT, corner_radius=10, height=38,
             font=ctk.CTkFont(size=13),
         )
-        api_box.pack(fill="x", padx=24, pady=(6, 18))
+        add_scene_btn.pack(fill="x", padx=10, pady=10)
 
-        if self.api_key:
-            api_box.insert("1.0", self.api_key)
+        # Divider between scene list and detail
+        ctk.CTkFrame(columns_row, width=1, fg_color="#2a2d3e", corner_radius=0).pack(
+            side="left", fill="y")
 
-        result_label = self.label(frame, "", size=13, color=MUTED)
-        result_label.pack(anchor="w", padx=24, pady=(0, 10))
+        # ── Detail panel (right panel, fills rest) ────────────────────────────
+        self.detail_panel = ctk.CTkFrame(columns_row, fg_color=BG, corner_radius=0)
+        self.detail_panel.pack(side="left", fill="both", expand=True)
 
-        def save():
-            api = api_box.get("1.0", "end").strip()
+        # ── Bottom bar (spans scene list + detail, NOT sidebar) ───────────────
+        bottom = ctk.CTkFrame(right_section, fg_color=BG)
+        bottom.pack(fill="x", padx=20, pady=(6, 20))
+        self.status_label = self.label(bottom, "", size=13, color=MUTED)
+        self.status_label.pack(anchor="w", pady=(0, 8))
+        self.start_btn = ctk.CTkButton(
+            bottom, text="НАЧАТЬ ОЧЕРЕДЬ", command=self.start_queue,
+            fg_color=BTN_DANGER, hover_color=BTN_DANGER_HOVER,
+            text_color="white", corner_radius=24, height=50,
+            font=ctk.CTkFont(size=17, weight="bold"),
+        )
+        self.start_btn.pack(fill="x")
 
-            if not api:
-                messagebox.showerror("Ошибка", "Введите ElevenLabs API key.", parent=win)
-                return
+    def _start_panel(self, name):
+        self._active_panel = name
+        for w in self.detail_panel.winfo_children():
+            w.destroy()
+        self.update_status()
+        scroll = ctk.CTkScrollableFrame(
+            self.detail_panel, fg_color=BG,
+            scrollbar_button_color="#3d3d6a",
+            scrollbar_button_hover_color="#ff7eb6",
+        )
+        scroll.pack(fill="both", expand=True)
+        return scroll
 
-            self.api_key = api
-            self.save_config()
-            self.update_status()
-            win.destroy()
+    def show_api_key_panel(self):
+        scroll = self._start_panel("api")
+        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="x", padx=20, pady=20)
 
-        self.button(frame, "Сохранить ключ", save, color=BTN_OK, hover=BTN_OK_HOVER, width=190).pack(anchor="e", padx=24, pady=(10, 0))
-
-    def open_sync_key_dialog(self):
-        win = ctk.CTkToplevel(self)
-        win.title("Sync.so API key")
-        win.geometry("720x420")
-        win.configure(fg_color=BG)
-        win.transient(self)
-        win.after(100, win.grab_set)
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
-
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
-        frame.pack(fill="both", expand=True, padx=24, pady=24)
-
-        self.label(frame, "Sync.so API key", size=24, weight="bold").pack(anchor="w", padx=24, pady=(22, 6))
+        self.label(frame, "ElevenLabs API key", size=22, weight="bold").pack(
+            anchor="w", padx=24, pady=(22, 6))
         self.label(
             frame,
-            "Ключ нужен для lipsync. Берётся в личном кабинете sync.so.",
+            "Нужен только для «Сгенерировать голос». Для готового full_voice.mp3 — не используется.",
             size=13, color=MUTED,
         ).pack(anchor="w", padx=24, pady=(0, 18))
-
         self.label(frame, "API key", size=14, weight="bold").pack(anchor="w", padx=24)
-
-        sync_box = ctk.CTkTextbox(
-            frame, height=86,
-            fg_color="#ffffff", text_color="#111111",
+        api_box = ctk.CTkTextbox(
+            frame, height=80, fg_color="#ffffff", text_color="#111111",
             border_width=1, border_color="#737373",
             corner_radius=10, font=ctk.CTkFont(size=13),
         )
-        sync_box.pack(fill="x", padx=24, pady=(6, 18))
+        api_box.pack(fill="x", padx=24, pady=(6, 14))
+        if self.api_key:
+            api_box.insert("1.0", self.api_key)
+        result_label = self.label(frame, "", size=13, color=MUTED)
+        result_label.pack(anchor="w", padx=24, pady=(0, 6))
 
+        def save():
+            api = api_box.get("1.0", "end").strip()
+            if not api:
+                messagebox.showerror("Ошибка", "Введите ElevenLabs API key.", parent=self)
+                return
+            self.api_key = api
+            self.save_config()
+            self.update_status()
+            result_label.configure(text="✓ Ключ сохранён", text_color="#86efac")
+
+        self.button(frame, "Сохранить ключ", save,
+                    color=BTN_OK, hover=BTN_OK_HOVER, width=190).pack(
+            anchor="e", padx=24, pady=(0, 20))
+
+    def show_sync_key_panel(self):
+        scroll = self._start_panel("sync")
+        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="x", padx=20, pady=20)
+
+        self.label(frame, "Sync.so API key", size=22, weight="bold").pack(
+            anchor="w", padx=24, pady=(22, 6))
+        self.label(
+            frame,
+            "Нужен для lipsync. Берётся в личном кабинете sync.so.",
+            size=13, color=MUTED,
+        ).pack(anchor="w", padx=24, pady=(0, 18))
+        self.label(frame, "API key", size=14, weight="bold").pack(anchor="w", padx=24)
+        sync_box = ctk.CTkTextbox(
+            frame, height=80, fg_color="#ffffff", text_color="#111111",
+            border_width=1, border_color="#737373",
+            corner_radius=10, font=ctk.CTkFont(size=13),
+        )
+        sync_box.pack(fill="x", padx=24, pady=(6, 14))
         if self.sync_key and "ВСТАВЬ" not in self.sync_key:
             sync_box.insert("1.0", self.sync_key)
+        result_label = self.label(frame, "", size=13, color=MUTED)
+        result_label.pack(anchor="w", padx=24, pady=(0, 6))
 
         def save():
             key = sync_box.get("1.0", "end").strip()
             if not key:
-                messagebox.showerror("Ошибка", "Введите Sync API key.", parent=win)
+                messagebox.showerror("Ошибка", "Введите Sync API key.", parent=self)
                 return
             self.sync_key = key
             global SYNC_API_KEY
             SYNC_API_KEY = key
             self.save_config()
             self.update_status()
-            win.destroy()
+            result_label.configure(text="✓ Ключ сохранён", text_color="#86efac")
 
         self.button(frame, "Сохранить ключ", save,
-                    color=BTN_OK, hover=BTN_OK_HOVER, width=190).pack(anchor="e", padx=24, pady=(10, 0))
+                    color=BTN_OK, hover=BTN_OK_HOVER, width=190).pack(
+            anchor="e", padx=24, pady=(0, 20))
 
     def fetch_voice_id_by_name(self, name):
         for v in self.fetch_all_voices():
@@ -1026,36 +1324,29 @@ class LipsyncTwoModeApp(ctk.CTk):
             raise RuntimeError(f"ElevenLabs не вернул voice_id: {payload}")
         return voice_id
     
-    def open_voice_clone_dialog(self):
-        """Окошко: имя + описание + файл → создаёт клон в ElevenLabs."""
+    def show_voice_clone_panel(self):
         if not self.api_key:
-            messagebox.showerror("Ошибка", "Сначала добавь ElevenLabs API key.")
+            messagebox.showerror("Ошибка", "Сначала добавь ElevenLabs API key (⚙️ Настройки → API key).", parent=self)
+            self.show_api_key_panel()
             return
+        scroll = self._start_panel("voice_clone")
+        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="x", padx=20, pady=20)
 
-        win = ctk.CTkToplevel(self)
-        win.title("Клонировать голос")
-        win.geometry("620x540")
-        win.configure(fg_color=BG)
-        win.transient(self)
-        win.after(100, win.grab_set)
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
-
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
-        frame.pack(fill="both", expand=True, padx=24, pady=24)
-
-        self.label(frame, "🎙 Клонировать голос", size=22, weight="bold").pack(anchor="w", padx=22, pady=(20, 6))
+        self.label(frame, "🎙 Клонировать голос", size=22, weight="bold").pack(
+            anchor="w", padx=22, pady=(20, 6))
         self.label(
             frame,
             "Загрузи 1-3 минуты чистой речи без шума и музыки. "
             "Поддерживаются mp3, wav, m4a, flac.",
-            size=13, color=MUTED
+            size=13, color=MUTED,
         ).pack(anchor="w", padx=22, pady=(0, 16))
 
         self.label(frame, "Имя голоса", size=14, weight="bold").pack(anchor="w", padx=22)
         name_entry = ctk.CTkEntry(
             frame, placeholder_text="например: Иван — диктор",
             fg_color="white", text_color="#111", border_color="#737373",
-            font=ctk.CTkFont(size=13)
+            font=ctk.CTkFont(size=13),
         )
         name_entry.pack(fill="x", padx=22, pady=(6, 14))
 
@@ -1063,7 +1354,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         desc_entry = ctk.CTkEntry(
             frame, placeholder_text="например: тёплый низкий мужской голос",
             fg_color="white", text_color="#111", border_color="#737373",
-            font=ctk.CTkFont(size=13)
+            font=ctk.CTkFont(size=13),
         )
         desc_entry.pack(fill="x", padx=22, pady=(6, 14))
 
@@ -1075,7 +1366,7 @@ class LipsyncTwoModeApp(ctk.CTk):
             file_row, text="  не выбран",
             fg_color="#f5f5f5", text_color="#888",
             anchor="w", corner_radius=6,
-            font=ctk.CTkFont(size=12), height=32
+            font=ctk.CTkFont(size=12), height=32,
         )
         file_label.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
 
@@ -1083,15 +1374,15 @@ class LipsyncTwoModeApp(ctk.CTk):
 
         def choose_file():
             f = filedialog.askopenfilename(
-                parent=win, title="Выбери аудио-сэмпл",
-                filetypes=[("Аудио", "*.mp3 *.wav *.m4a *.flac *.ogg"), ("Все файлы", "*.*")]
+                parent=self, title="Выбери аудио-сэмпл",
+                filetypes=[("Аудио", "*.mp3 *.wav *.m4a *.flac *.ogg"), ("Все файлы", "*.*")],
             )
             if f:
                 selected["path"] = f
                 try:
                     size_mb = os.path.getsize(f) / (1024 * 1024)
-                    file_label.configure(text=f"  {os.path.basename(f)}  ({size_mb:.1f} МБ)",
-                                         text_color="#111")
+                    file_label.configure(
+                        text=f"  {os.path.basename(f)}  ({size_mb:.1f} МБ)", text_color="#111")
                 except Exception:
                     file_label.configure(text=f"  {os.path.basename(f)}", text_color="#111")
 
@@ -1105,17 +1396,15 @@ class LipsyncTwoModeApp(ctk.CTk):
             name = name_entry.get().strip()
             description = desc_entry.get().strip()
             path = selected["path"]
-
             if not name:
-                messagebox.showerror("Ошибка", "Введи имя голоса.", parent=win)
+                messagebox.showerror("Ошибка", "Введи имя голоса.", parent=self)
                 return
             if not path:
-                messagebox.showerror("Ошибка", "Выбери аудио-сэмпл.", parent=win)
+                messagebox.showerror("Ошибка", "Выбери аудио-сэмпл.", parent=self)
                 return
-
             try:
                 result_label.configure(text="Загружаю в ElevenLabs...", text_color=MUTED)
-                win.update()
+                self.update_idletasks()
                 voice_id = self.create_voice_from_sample(path, name, description)
                 result_label.configure(text=f"✓ Готово! voice_id: {voice_id}",
                                        text_color="#86efac")
@@ -1123,18 +1412,242 @@ class LipsyncTwoModeApp(ctk.CTk):
                 self.main_voice_id = voice_id
                 messagebox.showinfo(
                     "Готово",
-                    f"Голос «{name}» клонирован.\n\nvoice_id: {voice_id}\n\n"
-                    f"Голос уже в твоём аккаунте — нажми «🔄 Обновить» в окне «Мои голоса», "
-                    f"чтобы он там появился.",
-                    parent=win
+                    f"Голос «{name}» клонирован.\n\nvoice_id: {voice_id}",
+                    parent=self,
                 )
             except Exception as e:
                 result_label.configure(text=f"Ошибка: {e}", text_color="#fca5a5")
-                messagebox.showerror("Ошибка", str(e), parent=win)
+                messagebox.showerror("Ошибка", str(e), parent=self)
 
         self.button(frame, "🎙 Клонировать", clone,
-                    color=BTN_OK, hover=BTN_OK_HOVER, width=200).pack(anchor="e", padx=22, pady=(0, 20))
-    
+                    color=BTN_OK, hover=BTN_OK_HOVER, width=200).pack(
+            anchor="e", padx=22, pady=(0, 20))
+
+    def show_downloader_panel(self):
+        try:
+            _ensure_ytdlp()
+        except RuntimeError as e:
+            messagebox.showerror("yt-dlp не найден", str(e), parent=self)
+            return
+
+        outer = self._start_panel("downloader")
+
+        # ── Заголовок ──────────────────────────────────────────────────────
+        self.label(outer, "⬇ Скачать видео / аудио", size=20, weight="bold").pack(
+            anchor="w", padx=20, pady=(16, 2))
+        self.label(
+            outer,
+            "TikTok · YouTube · Instagram · Twitter · почем и тысячи других сайтов.",
+            size=12, color=MUTED,
+        ).pack(anchor="w", padx=20, pady=(0, 10))
+
+        # ── Поле для ссылок ────────────────────────────────────────────────
+        self.label(outer, "Ссылки (по одной на строке):", size=13, weight="bold").pack(
+            anchor="w", padx=20)
+        url_box = ctk.CTkTextbox(
+            outer, height=80,
+            fg_color="white", text_color="#111",
+            border_color="#737373", border_width=1,
+            font=ctk.CTkFont(size=12),
+        )
+        url_box.pack(fill="x", padx=20, pady=(4, 10))
+
+        # ── Режим ─────────────────────────────────────────────────────────
+        mode_var = ctk.StringVar(value="video")
+        mode_row = ctk.CTkFrame(outer, fg_color="transparent")
+        mode_row.pack(fill="x", padx=20, pady=(0, 6))
+        self.label(mode_row, "Режим:", size=13, weight="bold").pack(side="left", padx=(0, 10))
+        for txt, val in [
+            ("Видео (mp4)", "video"),
+            ("Аудио (mp3)", "audio"),
+            ("Видео + Аудио отдельно", "split"),
+        ]:
+            ctk.CTkRadioButton(
+                mode_row, text=txt, variable=mode_var, value=val,
+                text_color=TEXT, fg_color=BTN_PRIMARY,
+                font=ctk.CTkFont(size=12),
+            ).pack(side="left", padx=8)
+
+        # ── Опции ─────────────────────────────────────────────────────────
+        opts_row = ctk.CTkFrame(outer, fg_color="transparent")
+        opts_row.pack(fill="x", padx=20, pady=(0, 8))
+        denoise_var = ctk.BooleanVar(value=False)
+        denoise_cb = ctk.CTkCheckBox(
+            opts_row, text="Убрать музыку (audio-separator)",
+            variable=denoise_var, text_color=TEXT, fg_color=BTN_PRIMARY,
+            font=ctk.CTkFont(size=12),
+        )
+
+        def _update_denoise_vis(*_):
+            if mode_var.get() == "video":
+                denoise_cb.pack_forget()
+            else:
+                denoise_cb.pack(side="left", padx=(0, 24))
+
+        mode_var.trace_add("write", _update_denoise_vis)
+        _update_denoise_vis()
+
+        # ── Папка ─────────────────────────────────────────────────────────
+        folder_row = ctk.CTkFrame(outer, fg_color="transparent")
+        folder_row.pack(fill="x", padx=20, pady=(0, 10))
+        self.label(folder_row, "Папка:", size=12, weight="bold").pack(side="left", padx=(0, 6))
+        folder_var = ctk.StringVar(value=os.path.join(desktop_dir(), "SheqelMotion_Downloads"))
+        ctk.CTkEntry(
+            folder_row, textvariable=folder_var,
+            fg_color="white", text_color="#111",
+            border_color="#737373", font=ctk.CTkFont(size=11),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        def choose_folder():
+            d = filedialog.askdirectory(title="Выбери папку для сохранения", parent=self)
+            if d:
+                folder_var.set(d)
+
+        self.button(folder_row, "Выбрать...", choose_folder,
+                    color=BTN, hover=BTN_HOVER, width=90).pack(side="left")
+
+        # ── Кнопки ────────────────────────────────────────────────────────
+        btn_row = ctk.CTkFrame(outer, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 8))
+
+        def do_download():
+            raw = url_box.get("1.0", "end")
+            urls = [u.strip() for u in raw.splitlines() if u.strip().startswith("http")]
+            if not urls:
+                messagebox.showerror(
+                    "Ошибка", "Вставь хотя бы одну ссылку (начинается с http).", parent=self)
+                return
+
+            self._stop_download = False
+            mode = mode_var.get()
+            denoise = denoise_var.get()
+            output_dir = folder_var.get()
+
+            dl_btn.configure(state="disabled", text="Скачиваю...")
+            stop_btn.configure(state="normal")
+            status_lbl.configure(text="")
+
+            items = [(url, _add_history_row(url)) for url in urls]
+
+            def process_one(url, item):
+                def log(msg):
+                    if self._active_panel != "downloader":
+                        return
+                    m = re.search(r'(\d+(?:\.\d+)?)\s*%', msg)
+                    if m:
+                        pct = min(float(m.group(1)) / 100.0, 1.0)
+                        self.after(0, lambda p=pct: item["pbar"].set(p))
+                    short = msg.strip()[:70]
+                    if short:
+                        self.after(0, lambda s=short: item["name"].configure(text=s))
+
+                try:
+                    main_file, extra_file = download_from_url(
+                        url, output_dir, mode, denoise, log)
+                    show_name = os.path.basename(main_file)
+                    if extra_file:
+                        show_name += " + " + os.path.basename(extra_file)
+
+                    def mark_done(f=main_file, n=show_name):
+                        if self._active_panel != "downloader":
+                            return
+                        item["status"].configure(text="✓", text_color="#86efac")
+                        item["name"].configure(
+                            text=(n[:70] + "…") if len(n) > 70 else n,
+                            text_color=TEXT,
+                        )
+                        item["pbar"].set(1.0)
+                        item["pbar"].configure(progress_color="#86efac")
+                        item["open"].configure(
+                            state="normal",
+                            command=lambda path=f: open_folder(os.path.dirname(path)),
+                        )
+                    self.after(0, mark_done)
+                except Exception as e:
+                    err = str(e)[:80]
+                    def mark_err(e=err):
+                        if self._active_panel != "downloader":
+                            return
+                        item["status"].configure(text="✗", text_color="#fca5a5")
+                        item["name"].configure(text=f"Ошибка: {e}", text_color="#fca5a5")
+                        item["pbar"].configure(progress_color="#fca5a5")
+                    self.after(0, mark_err)
+
+            def run_queue():
+                total = len(items)
+                downloaded = 0
+                for i, (url, item) in enumerate(items):
+                    if self._stop_download:
+                        for _, it in items[i:]:
+                            self.after(0, lambda it=it: it["status"].configure(
+                                text="✕", text_color="#fca5a5"))
+                        break
+                    self.after(0, lambda n=i + 1, t=total: status_lbl.configure(
+                        text=f"Скачивается {n} из {t}..."))
+                    process_one(url, item)
+                    downloaded += 1
+
+                if self._stop_download:
+                    msg = f"Остановлено. Скачано {downloaded} из {total}"
+                else:
+                    msg = f"Готово! Скачано {total} из {total}"
+
+                self._stop_download = False
+
+                if self._active_panel == "downloader":
+                    self.after(0, lambda m=msg: status_lbl.configure(text=m))
+                    self.after(0, lambda: dl_btn.configure(state="normal", text="⬇ Скачать"))
+                    self.after(0, lambda: stop_btn.configure(state="disabled"))
+
+            threading.Thread(target=run_queue, daemon=True).start()
+
+        dl_btn = self.button(btn_row, "⬇ Скачать", do_download,
+                             color=BTN_OK, hover=BTN_OK_HOVER, width=140)
+        dl_btn.pack(side="left")
+
+        stop_btn = self.button(btn_row, "✕ Стоп",
+                               lambda: setattr(self, "_stop_download", True),
+                               color=BTN_DANGER, hover=BTN_DANGER_HOVER, width=100)
+        stop_btn.pack(side="left", padx=8)
+        stop_btn.configure(state="disabled")
+
+        status_lbl = self.label(btn_row, "", size=12, color=MUTED)
+        status_lbl.pack(side="left", padx=12)
+
+        self.button(btn_row, "Открыть папку",
+                    lambda: open_folder(folder_var.get()),
+                    color=BTN, hover=BTN_HOVER, width=130).pack(side="right")
+
+        # ── История загрузок ───────────────────────────────────────────────
+        self.label(outer, "История загрузок", size=13, weight="bold", color=MUTED).pack(
+            anchor="w", padx=20, pady=(4, 4))
+
+        history_scroll = ctk.CTkScrollableFrame(outer, fg_color=BG, corner_radius=10)
+        history_scroll.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        def _add_history_row(url_text):
+            row = ctk.CTkFrame(history_scroll, fg_color=PANEL, corner_radius=8)
+            row.pack(fill="x", padx=4, pady=3)
+            row.columnconfigure(1, weight=1)
+
+            status_lbl = self.label(row, "⏳", size=14)
+            status_lbl.grid(row=0, column=0, padx=(10, 6), pady=8, sticky="w")
+
+            short = (url_text[:66] + "…") if len(url_text) > 66 else url_text
+            name_lbl = self.label(row, short, size=11, color=MUTED)
+            name_lbl.grid(row=0, column=1, padx=4, pady=8, sticky="w")
+
+            pbar = ctk.CTkProgressBar(row, width=130, height=6)
+            pbar.set(0)
+            pbar.grid(row=0, column=2, padx=8, pady=8, sticky="ew")
+
+            open_btn_h = self.button(row, "Открыть", lambda: None,
+                                     color=BTN, hover=BTN_HOVER, width=80)
+            open_btn_h.grid(row=0, column=3, padx=(4, 10), pady=6)
+            open_btn_h.configure(state="disabled")
+
+            return {"status": status_lbl, "name": name_lbl, "pbar": pbar, "open": open_btn_h}
+
     def stop_preview(self):
         """Останавливает текущий preview если играет."""
         if self.preview_process and self.preview_process.poll() is None:
@@ -1328,20 +1841,26 @@ class LipsyncTwoModeApp(ctk.CTk):
         win.after(100, load)
    
 
-    def open_voice_generator_dialog(self):
-        win = ctk.CTkToplevel(self)
-        win.title("Сгенерировать full_voice.mp3")
-        win.geometry("840x720")
-        win.configure(fg_color=BG)
-        win.transient(self)
-        win.after(100, win.grab_set)
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
-        frame.pack(fill="both", expand=True, padx=24, pady=24)
-        self.label(frame, "Сгенерировать full_voice.mp3", size=24, weight="bold").pack(anchor="w", padx=22, pady=(20, 6))
-        self.label(frame, "Пиши текст с ------. Приложение заменит ------ на паузу, ElevenLabs не будет читать тире.", size=13, color=MUTED).pack(anchor="w", padx=22, pady=(0, 16))
-        self.label(frame, "voice_id или имя голоса", size=14, weight="bold").pack(anchor="w", padx=22)
-        voice_box = ctk.CTkTextbox(frame, height=70, fg_color="#ffffff", text_color="#111111", border_width=1, border_color="#737373", corner_radius=10, font=ctk.CTkFont(size=14))
+    def show_voice_gen_panel(self):
+        scroll = self._start_panel("voice_gen")
+        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self.label(frame, "Сгенерировать full_voice.mp3", size=22, weight="bold").pack(
+            anchor="w", padx=22, pady=(20, 6))
+        self.label(
+            frame,
+            "Пиши текст с ------. Приложение заменит ------ на паузу, ElevenLabs не будет читать тире.",
+            size=13, color=MUTED,
+        ).pack(anchor="w", padx=22, pady=(0, 16))
+
+        self.label(frame, "voice_id или имя голоса", size=14, weight="bold").pack(
+            anchor="w", padx=22)
+        voice_box = ctk.CTkTextbox(
+            frame, height=60, fg_color="#ffffff", text_color="#111111",
+            border_width=1, border_color="#737373",
+            corner_radius=10, font=ctk.CTkFont(size=14),
+        )
         voice_box.pack(fill="x", padx=22, pady=(6, 8))
         if self.main_voice_name:
             voice_box.insert("1.0", self.main_voice_name)
@@ -1351,28 +1870,37 @@ class LipsyncTwoModeApp(ctk.CTk):
             voice_box.insert("1.0", name)
 
         self.button(frame, "📋 Выбрать из списка моих голосов",
-                    lambda: self.open_voice_picker(win, on_voice_picked),
-                    color=BTN, hover=BTN_HOVER, width=320).pack(anchor="w", padx=22, pady=(0, 16))
+                    lambda: self.open_voice_picker(self, on_voice_picked),
+                    color=BTN, hover=BTN_HOVER, width=320).pack(
+            anchor="w", padx=22, pady=(0, 16))
+
         self.label(frame, "Полный текст", size=14, weight="bold").pack(anchor="w", padx=22)
-        text_box = ctk.CTkTextbox(frame, fg_color="#ffffff", text_color="#111111", border_width=1, border_color="#737373", corner_radius=10, font=ctk.CTkFont(size=14), wrap="word")
-        text_box.pack(fill="both", expand=True, padx=22, pady=(6, 16))
+        text_box = ctk.CTkTextbox(
+            frame, height=220,
+            fg_color="#ffffff", text_color="#111111",
+            border_width=1, border_color="#737373",
+            corner_radius=10, font=ctk.CTkFont(size=14), wrap="word",
+        )
+        text_box.pack(fill="x", padx=22, pady=(6, 16))
+
         result_label = self.label(frame, "", size=13, color=MUTED)
         result_label.pack(anchor="w", padx=22, pady=(0, 12))
+
         def generate_audio():
             if not self.api_key:
-                messagebox.showerror("Ошибка", "Сначала добавь ElevenLabs API key.", parent=win)
+                messagebox.showerror("Ошибка", "Сначала добавь ElevenLabs API key.", parent=self)
                 return
             voice_value = voice_box.get("1.0", "end").strip()
             full_text = text_box.get("1.0", "end").strip()
             if not voice_value:
-                messagebox.showerror("Ошибка", "Введите voice_id или имя голоса.", parent=win)
+                messagebox.showerror("Ошибка", "Введите voice_id или имя голоса.", parent=self)
                 return
             if not full_text:
-                messagebox.showerror("Ошибка", "Введите текст.", parent=win)
+                messagebox.showerror("Ошибка", "Введите текст.", parent=self)
                 return
             try:
                 result_label.configure(text="Ищу голос...", text_color=MUTED)
-                win.update()
+                self.update_idletasks()
                 if re.fullmatch(r"[A-Za-z0-9]{20}", voice_value):
                     voice_id = voice_value
                     voice_name = voice_value
@@ -1380,17 +1908,22 @@ class LipsyncTwoModeApp(ctk.CTk):
                     voice_id = self.fetch_voice_id_by_name(voice_value)
                     voice_name = voice_value
                 if not voice_id:
-                    result_label.configure(text="Голос с таким именем не найден.", text_color="#fca5a5")
+                    result_label.configure(text="Голос с таким именем не найден.",
+                                           text_color="#fca5a5")
                     return
                 result_label.configure(text="Генерирую full_voice.mp3...", text_color=MUTED)
-                win.update()
-                path = generate_full_voice_to_desktop(self.api_key, voice_id, full_text, voice_name, self.log)
-                result_label.configure(text=f"Готово: {path}", text_color="#86efac")
-                messagebox.showinfo("Готово", f"Голос сохранён:\n{path}", parent=win)
+                self.update_idletasks()
+                path = generate_full_voice_to_desktop(
+                    self.api_key, voice_id, full_text, voice_name, self.log)
+                result_label.configure(text=f"✓ Готово: {path}", text_color="#86efac")
+                messagebox.showinfo("Готово", f"Голос сохранён:\n{path}", parent=self)
             except Exception as e:
                 result_label.configure(text=f"Ошибка: {e}", text_color="#fca5a5")
-                messagebox.showerror("Ошибка", str(e), parent=win)
-        self.button(frame, "Сгенерировать mp3", generate_audio, color=BTN_OK, hover=BTN_OK_HOVER, width=220).pack(anchor="e", padx=22, pady=(0, 20))
+                messagebox.showerror("Ошибка", str(e), parent=self)
+
+        self.button(frame, "Сгенерировать mp3", generate_audio,
+                    color=BTN_OK, hover=BTN_OK_HOVER, width=220).pack(
+            anchor="e", padx=22, pady=(0, 20))
 
     def add_roll(self):
         roll = {
@@ -1401,14 +1934,15 @@ class LipsyncTwoModeApp(ctk.CTk):
             "video_single": "",
             "video_start": "",
             "video_end": "",
-            "audio_start": "",  
-            "audio_end": "", 
+            "audio_start": "",
+            "audio_end": "",
             "status": "Ожидает",
-    }
-
+        }
         self.next_roll_id += 1
         self.rolls.append(roll)
-        self.render_rolls()
+        self.selected_roll_id = roll["id"]
+        self.render_scene_list()
+        self.render_scene_detail()
         self.update_status()
 
     def clear_rolls(self):
@@ -1419,112 +1953,218 @@ class LipsyncTwoModeApp(ctk.CTk):
         self.add_roll()
 
     def render_rolls(self):
-        for w in self.rolls_area.winfo_children():
+        self.render_scene_list()
+        self.render_scene_detail()
+
+    def render_scene_list(self):
+        for w in self.scene_list_scroll.winfo_children():
             w.destroy()
         for idx, roll in enumerate(self.rolls):
-            self.render_roll_card(idx, roll)
-        self._enable_mousewheel(self.rolls_area)
+            self._render_scene_item(idx, roll)
+        self._enable_mousewheel(self.scene_list_scroll)
 
-    def render_roll_card(self, idx, roll):
-        card = ctk.CTkFrame(self.rolls_area, fg_color=CARD, corner_radius=22)
-        card.pack(fill="x", padx=4, pady=(0, 14))
-        top = ctk.CTkFrame(card, fg_color=CARD)
-        top.pack(fill="x", padx=16, pady=(14, 8))
-        if roll["mode"] == "1 видео":
-            title_video = roll["video_single"]
-        else:
-              title_video = roll["video_start"] or roll["video_end"]
+    def _render_scene_item(self, idx, roll):
+        is_active = (roll["id"] == self.selected_roll_id)
+        bg = BTN_PRIMARY if is_active else CARD
 
-        if title_video:
-                scene_title = os.path.splitext(os.path.basename(title_video))[0]
-        else:
-                scene_title = f"Сцена {idx + 1}"
+        item = ctk.CTkFrame(
+            self.scene_list_scroll, fg_color=bg, corner_radius=10, cursor="hand2")
+        item.pack(fill="x", padx=8, pady=(0, 5))
 
-        self.label(top, scene_title, size=18, weight="bold").pack(side="left")
+        top_row = ctk.CTkFrame(item, fg_color="transparent")
+        top_row.pack(fill="x", padx=10, pady=(8, 2))
+
+        title = self.get_roll_title(idx, roll)
+        title_lbl = ctk.CTkLabel(
+            top_row, text=title,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT, anchor="w",
+        )
+        title_lbl.pack(side="left", fill="x", expand=True)
 
         status_color = MUTED
         if roll["status"] == "Готово":
             status_color = "#86efac"
         elif roll["status"] == "Ошибка":
             status_color = "#fca5a5"
-        self.label(top, roll["status"], size=13, color=status_color).pack(side="right")
-        mode_row = ctk.CTkFrame(card, fg_color=CARD)
-        mode_row.pack(fill="x", padx=16, pady=(0, 10))
+        elif roll["status"] == "В очереди" or roll["status"] == "Обработка":
+            status_color = "#fcd34d"
+
+        ctk.CTkLabel(
+            top_row, text=roll["status"],
+            font=ctk.CTkFont(size=10),
+            text_color=status_color, anchor="e",
+        ).pack(side="right")
+
+        mode_lbl = ctk.CTkLabel(
+            item, text=roll["mode"],
+            font=ctk.CTkFont(size=11),
+            text_color=MUTED, anchor="w",
+        )
+        mode_lbl.pack(anchor="w", padx=10, pady=(0, 8))
+
+        def select(event=None, rid=roll["id"]):
+            self.selected_roll_id = rid
+            self.render_scene_list()
+            self.render_scene_detail()
+
+        def on_enter(event, w=item, rid=roll["id"]):
+            if rid != self.selected_roll_id:
+                w.configure(fg_color=BTN_HOVER)
+
+        def on_leave(event, w=item, rid=roll["id"]):
+            if rid != self.selected_roll_id:
+                w.configure(fg_color=CARD)
+
+        for widget in (item, top_row, title_lbl, mode_lbl):
+            widget.bind("<Button-1>", select)
+            widget.bind("<Enter>", on_enter)
+            widget.bind("<Leave>", on_leave)
+
+    def render_scene_detail(self):
+        self._active_panel = "scene"
+        for w in self.detail_panel.winfo_children():
+            w.destroy()
+
+        roll = next((r for r in self.rolls if r["id"] == self.selected_roll_id), None)
+        if roll is None:
+            self.label(self.detail_panel, "Выбери сцену из списка слева",
+                       size=15, color=MUTED).pack(expand=True, anchor="center", pady=60)
+            return
+
+        idx = self.rolls.index(roll)
+
+        # Scrollable container for detail content
+        detail_scroll = ctk.CTkScrollableFrame(
+            self.detail_panel, fg_color=BG,
+            scrollbar_button_color="#3d3d6a",
+            scrollbar_button_hover_color="#ff7eb6",
+        )
+        detail_scroll.pack(fill="both", expand=True)
+        self._enable_mousewheel(detail_scroll)
+
+        # ── Header ────────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(detail_scroll, fg_color=CARD, corner_radius=16)
+        hdr.pack(fill="x", padx=16, pady=(16, 10))
+
+        title_row = ctk.CTkFrame(hdr, fg_color="transparent")
+        title_row.pack(fill="x", padx=16, pady=(14, 6))
+
+        scene_title = self.get_roll_title(idx, roll)
+        self.label(title_row, scene_title, size=20, weight="bold").pack(side="left")
+
+        status_color = MUTED
+        if roll["status"] == "Готово":
+            status_color = "#86efac"
+        elif roll["status"] == "Ошибка":
+            status_color = "#fca5a5"
+        elif roll["status"] in ("В очереди", "Обработка"):
+            status_color = "#fcd34d"
+
+        self.label(title_row, roll["status"], size=13, color=status_color).pack(
+            side="right", padx=(0, 8))
+
+        self.button(title_row, "Удалить",
+                    lambda rid=roll["id"]: self.remove_roll_by_id(rid),
+                    color=BTN_DANGER, hover=BTN_DANGER_HOVER, width=100).pack(
+            side="right", padx=(0, 10))
+
+        # ── Mode ──────────────────────────────────────────────────────────
+        mode_row = ctk.CTkFrame(hdr, fg_color="transparent")
+        mode_row.pack(fill="x", padx=16, pady=(0, 14))
         self.label(mode_row, "Режим:", size=13, color=MUTED).pack(side="left", padx=(0, 10))
-        mode_menu = ctk.CTkOptionMenu(mode_row, values=["1 видео", "Начало + Конец"], command=lambda value, i=idx: self.set_roll_mode(i, value), fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER, dropdown_fg_color=PANEL, dropdown_hover_color=BTN_HOVER, width=170)
+        mode_menu = ctk.CTkOptionMenu(
+            mode_row, values=["1 видео", "Начало + Конец"],
+            command=lambda value, i=idx: self.set_roll_mode(i, value),
+            fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER,
+            dropdown_fg_color=PANEL, dropdown_hover_color=BTN_HOVER, width=170,
+        )
         mode_menu.set(roll["mode"])
         mode_menu.pack(side="left")
-        self.label(card, self.roll_details(roll), size=12, color=MUTED).pack(anchor="w", padx=16, pady=(0, 10))
-        row1 = ctk.CTkFrame(card, fg_color=CARD)
-        row1.pack(fill="x", padx=16, pady=(0, 10))
+
+        # ── Summary ───────────────────────────────────────────────────────
+        self.label(detail_scroll, self.roll_details(roll),
+                   size=12, color=MUTED).pack(anchor="w", padx=20, pady=(0, 10))
+
+        # ── Actions ───────────────────────────────────────────────────────
+        actions = ctk.CTkFrame(detail_scroll, fg_color=CARD, corner_radius=16)
+        actions.pack(fill="x", padx=16, pady=(0, 10))
+
+        row1 = ctk.CTkFrame(actions, fg_color="transparent")
+        row1.pack(fill="x", padx=16, pady=(14, 10))
+
         voice_text = "✅ full_voice.mp3" if roll["voice_file"] else "Выбрать full_voice"
-        self.button(row1, voice_text, lambda i=idx: self.choose_voice_file(i), color=BTN_OK if roll["voice_file"] else BTN_PRIMARY, hover=BTN_OK_HOVER if roll["voice_file"] else BTN_PRIMARY_HOVER, width=190).pack(side="left")
-        text_btn = "✅ Текст проверки" if roll["text"] else "Текст проверки"
-        self.button(row1, text_btn, lambda i=idx: self.open_roll_text_dialog(i), color=BTN_OK if roll["text"] else BTN_PRIMARY, hover=BTN_OK_HOVER if roll["text"] else BTN_PRIMARY_HOVER, width=180).pack(side="left", padx=(10, 0))
-        delete_btn = self.button(
-            row1,
-            "Удалить",
-            lambda roll_id=roll["id"]: self.remove_roll_by_id(roll_id),
-            color=BTN_DANGER,
-            hover=BTN_DANGER_HOVER,
-            width=110
-        )
-        delete_btn.pack(side="right")
+        self.button(row1, voice_text, lambda i=idx: self.choose_voice_file(i),
+                    color=BTN_OK if roll["voice_file"] else BTN_PRIMARY,
+                    hover=BTN_OK_HOVER if roll["voice_file"] else BTN_PRIMARY_HOVER,
+                    width=190).pack(side="left")
 
-        hover_rows = [card, top, mode_row, row1]
+        if roll["mode"] == "Начало + Конец":
+            text_btn = "✅ Текст проверки" if roll["text"] else "Текст проверки"
+            self.button(row1, text_btn, lambda i=idx: self.open_roll_text_dialog(i),
+                        color=BTN_OK if roll["text"] else BTN_PRIMARY,
+                        hover=BTN_OK_HOVER if roll["text"] else BTN_PRIMARY_HOVER,
+                        width=180).pack(side="left", padx=(10, 0))
 
-        def on_delete_enter(event):
-            for w in hover_rows:
-                try:
-                    w.configure(fg_color=CARD_HOVER_DELETE)
-                except Exception:
-                    pass
+        # ── Video / audio trim ────────────────────────────────────────────
+        row2 = ctk.CTkFrame(actions, fg_color="transparent")
+        row2.pack(fill="x", padx=16, pady=(0, 14))
 
-        def on_delete_leave(event):
-            for w in hover_rows:
-                try:
-                    w.configure(fg_color=CARD)
-                except Exception:
-                    pass
-
-        delete_btn.bind("<Enter>", on_delete_enter)
-        delete_btn.bind("<Leave>", on_delete_leave)
-        row2 = ctk.CTkFrame(card, fg_color=CARD)
-        row2.pack(fill="x", padx=16, pady=(0, 16))
-        hover_rows.append(row2)
         if roll["mode"] == "1 видео":
-            video_text = "✅ Видео" if roll["video_single"] else "Выбрать видео"
-            time_row = ctk.CTkFrame(card, fg_color=CARD)
-            time_row.pack(fill="x", padx=16, pady=(0, 12))
-            hover_rows.append(time_row)
+            time_row = ctk.CTkFrame(actions, fg_color="transparent")
+            time_row.pack(fill="x", padx=16, pady=(0, 10))
 
-            self.label(time_row, "Обрезать аудио (сек):", size=12, color=MUTED).pack(side="left", padx=(0, 8))
+            self.label(time_row, "Обрезать аудио (сек):",
+                       size=12, color=MUTED).pack(side="left", padx=(0, 8))
 
-            start_entry = ctk.CTkEntry(time_row, width=90, placeholder_text="от", fg_color="white", text_color="#111", border_color="#737373")
+            start_entry = ctk.CTkEntry(
+                time_row, width=90, placeholder_text="от",
+                fg_color="white", text_color="#111", border_color="#737373")
             start_entry.pack(side="left", padx=(0, 6))
             if roll["audio_start"]:
                 start_entry.insert(0, roll["audio_start"])
 
-            end_entry = ctk.CTkEntry(time_row, width=90, placeholder_text="до", fg_color="white", text_color="#111", border_color="#737373")
+            end_entry = ctk.CTkEntry(
+                time_row, width=90, placeholder_text="до",
+                fg_color="white", text_color="#111", border_color="#737373")
             end_entry.pack(side="left")
             if roll["audio_end"]:
                 end_entry.insert(0, roll["audio_end"])
 
-            def save_times(*_):
-                roll["audio_start"] = start_entry.get().strip()
-                roll["audio_end"] = end_entry.get().strip()
+            def save_times(*_, r=roll):
+                for entry, key in [(start_entry, "audio_start"), (end_entry, "audio_end")]:
+                    val = entry.get().strip()
+                    if val:
+                        try:
+                            float(val)
+                            r[key] = val
+                        except ValueError:
+                            entry.delete(0, "end")
+                            r[key] = ""
+                    else:
+                        r[key] = ""
 
-            start_entry.bind("<FocusOut>", save_times)
-            end_entry.bind("<FocusOut>", save_times)
-            start_entry.bind("<Return>", save_times)
-            end_entry.bind("<Return>", save_times)
+            for e in (start_entry, end_entry):
+                e.bind("<FocusOut>", save_times)
+                e.bind("<Return>", save_times)
 
-            self.button(row2, video_text, lambda i=idx: self.choose_video(i, "single"), color=BTN_OK if roll["video_single"] else BTN_PRIMARY, hover=BTN_OK_HOVER if roll["video_single"] else BTN_PRIMARY_HOVER, width=170).pack(side="left")
+            video_text = "✅ Видео" if roll["video_single"] else "Выбрать видео"
+            self.button(row2, video_text, lambda i=idx: self.choose_video(i, "single"),
+                        color=BTN_OK if roll["video_single"] else BTN_PRIMARY,
+                        hover=BTN_OK_HOVER if roll["video_single"] else BTN_PRIMARY_HOVER,
+                        width=170).pack(side="left")
         else:
             start_text = "✅ Видео начало" if roll["video_start"] else "Видео начало"
             end_text = "✅ Видео конец" if roll["video_end"] else "Видео конец"
-            self.button(row2, start_text, lambda i=idx: self.choose_video(i, "start"), color=BTN_OK if roll["video_start"] else BTN_PRIMARY, hover=BTN_OK_HOVER if roll["video_start"] else BTN_PRIMARY_HOVER, width=170).pack(side="left")
-            self.button(row2, end_text, lambda i=idx: self.choose_video(i, "end"), color=BTN_OK if roll["video_end"] else BTN_PRIMARY, hover=BTN_OK_HOVER if roll["video_end"] else BTN_PRIMARY_HOVER, width=170).pack(side="left", padx=(10, 0))
+            self.button(row2, start_text, lambda i=idx: self.choose_video(i, "start"),
+                        color=BTN_OK if roll["video_start"] else BTN_PRIMARY,
+                        hover=BTN_OK_HOVER if roll["video_start"] else BTN_PRIMARY_HOVER,
+                        width=170).pack(side="left")
+            self.button(row2, end_text, lambda i=idx: self.choose_video(i, "end"),
+                        color=BTN_OK if roll["video_end"] else BTN_PRIMARY,
+                        hover=BTN_OK_HOVER if roll["video_end"] else BTN_PRIMARY_HOVER,
+                        width=170).pack(side="left", padx=(10, 0))
+
 
     def roll_details(self, roll):
         parts = []
@@ -1556,20 +2196,14 @@ class LipsyncTwoModeApp(ctk.CTk):
         return f"Сцена {idx + 1}"
 
     def refresh_rolls(self):
-        self.render_rolls()
+        self.render_scene_list()
+        self.render_scene_detail()
         self.update_status()
 
     def set_roll_mode(self, idx, value):
-        scroll_pos = self.rolls_area._parent_canvas.yview()
         self.rolls[idx]["mode"] = value
         self.rolls[idx]["status"] = "Ожидает"
         self.refresh_rolls()
-        def _restore_mode(sp=scroll_pos):
-            try:
-                self.rolls_area._parent_canvas.yview_moveto(sp[0])
-            except Exception:
-                pass
-        self.after(60, _restore_mode)
 
 
 
@@ -1578,42 +2212,40 @@ class LipsyncTwoModeApp(ctk.CTk):
             messagebox.showwarning("Очередь", "Нельзя удалять во время обработки.")
             return
 
-        scroll_pos = self.rolls_area._parent_canvas.yview()
-
-        self.rolls = [roll for roll in self.rolls if roll["id"] != roll_id]
+        removed_idx = next(
+            (i for i, r in enumerate(self.rolls) if r["id"] == roll_id), None)
+        self.rolls = [r for r in self.rolls if r["id"] != roll_id]
 
         if not self.rolls:
             self.add_roll()
-        else:
-            self.refresh_rolls()
-            # Возвращаем скролл ПОСЛЕ того как UI перерисуется
-            def _restore():
-                try:
-                    self.rolls_area._parent_canvas.yview_moveto(scroll_pos[0])
-                except Exception:
-                    pass
-            self.after(60, _restore)
+            return
+
+        if self.selected_roll_id == roll_id:
+            new_idx = min(removed_idx, len(self.rolls) - 1)
+            self.selected_roll_id = self.rolls[new_idx]["id"]
+
+        self.render_scene_list()
+        self.render_scene_detail()
+        self.update_status()
 
 
 
     def choose_voice_file(self, idx):
-        f = filedialog.askopenfilename(parent=self, title="Выбери full_voice.mp3 / wav", filetypes=[("Аудио", "*.mp3 *.wav *.m4a *.aac"), ("Все файлы", "*.*")])
+        f = filedialog.askopenfilename(
+            parent=self, title="Выбери full_voice.mp3 / wav",
+            filetypes=[("Аудио", "*.mp3 *.wav *.m4a *.aac"), ("Все файлы", "*.*")])
         if f:
-            scroll_pos = self.rolls_area._parent_canvas.yview()
             self.rolls[idx]["voice_file"] = f
             self.rolls[idx]["status"] = "Ожидает"
-            self.refresh_rolls()
-            def _restore_voice(sp=scroll_pos):
-                try:
-                    self.rolls_area._parent_canvas.yview_moveto(sp[0])
-                except Exception:
-                    pass
-            self.after(60, _restore_voice)
+            self.render_scene_list()
+            self.render_scene_detail()
+            self.update_status()
 
     def choose_video(self, idx, kind):
-        f = filedialog.askopenfilename(parent=self, title="Выбери видео", filetypes=[("Видео", "*.mp4 *.mov *.MOV *.avi *.mkv *.webm"), ("Все файлы", "*.*")])
+        f = filedialog.askopenfilename(
+            parent=self, title="Выбери видео",
+            filetypes=[("Видео", "*.mp4 *.mov *.MOV *.avi *.mkv *.webm"), ("Все файлы", "*.*")])
         if f:
-            scroll_pos = self.rolls_area._parent_canvas.yview()
             if kind == "single":
                 self.rolls[idx]["video_single"] = f
             elif kind == "start":
@@ -1621,13 +2253,9 @@ class LipsyncTwoModeApp(ctk.CTk):
             elif kind == "end":
                 self.rolls[idx]["video_end"] = f
             self.rolls[idx]["status"] = "Ожидает"
-            self.refresh_rolls()
-            def _restore_video(sp=scroll_pos):
-                try:
-                    self.rolls_area._parent_canvas.yview_moveto(sp[0])
-                except Exception:
-                    pass
-            self.after(60, _restore_video)
+            self.render_scene_list()
+            self.render_scene_detail()
+            self.update_status()
 
     def open_roll_text_dialog(self, idx):
         roll = self.rolls[idx]
@@ -1658,17 +2286,12 @@ class LipsyncTwoModeApp(ctk.CTk):
                 except Exception as e:
                     messagebox.showerror("Ошибка в тексте", str(e), parent=win)
                     return
-            scroll_pos = self.rolls_area._parent_canvas.yview()
             roll["text"] = text_value
             roll["status"] = "Ожидает"
             win.destroy()
-            self.refresh_rolls()
-            def _restore_text(sp=scroll_pos):
-                try:
-                    self.rolls_area._parent_canvas.yview_moveto(sp[0])
-                except Exception:
-                    pass
-            self.after(60, _restore_text)
+            self.render_scene_list()
+            self.render_scene_detail()
+            self.update_status()
         self.button(frame, "Сохранить", save, color=BTN_OK, hover=BTN_OK_HOVER, width=180).pack(anchor="e", padx=22, pady=(0, 20))
 
     def validate_rolls(self):
@@ -1679,21 +2302,12 @@ class LipsyncTwoModeApp(ctk.CTk):
                 continue
             if not roll["voice_file"]:
                 errors.append(f"Ролик {i + 1}: не выбран full_voice.mp3.")
-            if not roll["text"]:
-                errors.append(f"Ролик {i + 1}: нет текста проверки.")
             if roll["mode"] == "1 видео":
-
-                # если есть ------, но нет обрезки аудио
-                if roll["text"] and "------" in roll["text"]:
-                    if not roll.get("audio_start") and not roll.get("audio_end"):
-                        errors.append(
-                            f"Ролик {i + 1}: в тексте есть ------. "
-                            f"Для режима '1 видео' укажи обрезку аудио (от/до)."
-                        )
-
                 if not roll["video_single"]:
                     errors.append(f"Ролик {i + 1}: не выбрано видео.")
             else:
+                if not roll["text"]:
+                    errors.append(f"Ролик {i + 1}: нет текста проверки.")
                 if not roll["video_start"]:
                     errors.append(f"Ролик {i + 1}: не выбрано видео начала.")
                 if not roll["video_end"]:
@@ -1705,7 +2319,7 @@ class LipsyncTwoModeApp(ctk.CTk):
                         errors.append(f"Ролик {i + 1}: {e}")
             complete = False
             if roll["mode"] == "1 видео":
-                complete = bool(roll["voice_file"] and roll["text"] and roll["video_single"])
+                complete = bool(roll["voice_file"] and roll["video_single"])
             else:
                 complete = bool(roll["voice_file"] and roll["text"] and roll["video_start"] and roll["video_end"])
             if complete:
@@ -1751,8 +2365,9 @@ class LipsyncTwoModeApp(ctk.CTk):
         ensure_dir(temp_dir)
 
         full_voice_copy = copy_file(roll["voice_file"], os.path.join(roll_dir, "full_voice.mp3"))
-        with open(os.path.join(roll_dir, "full_text.txt"), "w", encoding="utf-8") as f:
-            f.write(roll["text"])
+        if roll["text"]:
+            with open(os.path.join(roll_dir, "full_text.txt"), "w", encoding="utf-8") as f:
+                f.write(roll["text"])
 
         log("=" * 60)
         log(f"Ролик {idx + 1} / очередь {order_num}")
@@ -1805,7 +2420,7 @@ class LipsyncTwoModeApp(ctk.CTk):
             base_output = os.path.join(desktop_dir(), "Lipsync_Queue_Output")
             ensure_dir(base_output)
 
-            batch_name = time.strftime("batch_%Y-%m-%d_%H-%M-%S")
+            batch_name = time.strftime("%d-%m-%Y_%H-%M")
             batch_dir = os.path.join(base_output, batch_name)
             ensure_dir(batch_dir)
 
@@ -1891,28 +2506,40 @@ class LipsyncTwoModeApp(ctk.CTk):
     def set_roll_status(self, idx, status):
         def update():
             if 0 <= idx < len(self.rolls):
-                scroll_pos = self.rolls_area._parent_canvas.yview()
                 self.rolls[idx]["status"] = status
-                self.refresh_rolls()
-                def _restore_status(sp=scroll_pos):
-                    try:
-                        self.rolls_area._parent_canvas.yview_moveto(sp[0])
-                    except Exception:
-                        pass
-                self.after(60, _restore_status)
+                self.render_scene_list()
+                if self.rolls[idx]["id"] == self.selected_roll_id:
+                    self.render_scene_detail()
+                self.update_status()
         self.after(0, update)
 
     def update_status(self):
         valid, _ = self.validate_rolls()
         self.status_label.configure(text=f"готовых роликов: {len(valid)} | всего роликов: {len(self.rolls)}")
+        # API key button: green if key set, primary if panel active, transparent otherwise
         if self.api_key:
             self.api_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
+        elif self._active_panel == "api":
+            self.api_btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
         else:
-            self.api_btn.configure(fg_color=BTN, hover_color=BTN_HOVER)
+            self.api_btn.configure(fg_color="transparent", hover_color=BTN_HOVER)
+
         if self.sync_key and "ВСТАВЬ" not in self.sync_key:
             self.sync_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
+        elif self._active_panel == "sync":
+            self.sync_btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
         else:
-            self.sync_btn.configure(fg_color=BTN, hover_color=BTN_HOVER)
+            self.sync_btn.configure(fg_color="transparent", hover_color=BTN_HOVER)
+
+        for btn, panel in [
+            (self.voice_btn, "voice_gen"),
+            (self.clone_btn, "voice_clone"),
+            (self.dl_btn, "downloader"),
+        ]:
+            if self._active_panel == panel:
+                btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
+            else:
+                btn.configure(fg_color="transparent", hover_color=BTN_HOVER)
 
 
     def open_log_window(self):
