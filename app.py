@@ -1,16 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import subprocess
+import sys
+
+def _ensure_deps():
+    packages = [
+        ("requests",       "requests==2.34.2"),
+        ("customtkinter",  "customtkinter==5.2.2"),
+        ("PIL",            "pillow==12.2.0"),
+        ("yt_dlp",         "yt-dlp"),
+        ("audio_separator","audio-separator[cpu]"),
+    ]
+    for module, pkg in packages:
+        try:
+            __import__(module)
+        except ImportError:
+            print(f"Устанавливаю {pkg}...", flush=True)
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", pkg],
+                check=True,
+            )
+
+_ensure_deps()
+
 import os
 import re
-import sys
 import time
 import queue
 import shutil
 import hashlib
 import tempfile
 import threading
-import subprocess
 import requests
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -341,23 +362,20 @@ def prepare_video_for_sync(input_video, audio_wav, output_video):
     return output_video
 
 def upload_to_fileio(file_path, log):
-    """Загружает файл на file.io и возвращает публичный URL (ссылка живёт 1 день)."""
-    log(f"Загружаю {os.path.basename(file_path)} на file.io...")
+    """Загружает файл на tmpfiles.org и возвращает прямой URL."""
+    log(f"Загружаю {os.path.basename(file_path)} на tmpfiles.org...")
     with open(file_path, "rb") as f:
         res = requests.post(
-            "https://file.io",
+            "https://tmpfiles.org/api/v1/upload",
             files={"file": f},
-            data={"expires": "1d"},
             timeout=600,
         )
-    if res.status_code not in (200, 201):
-        raise RuntimeError(f"file.io upload error: {res.status_code}\n{res.text}")
+    if res.status_code != 200:
+        raise RuntimeError(f"tmpfiles.org upload error: {res.status_code}\n{res.text}")
     data = res.json()
-    if not data.get("success"):
-        raise RuntimeError(f"file.io вернул ошибку: {data}")
-    public_url = data.get("link") or data.get("url", "")
+    public_url = data["data"]["url"].replace("tmpfiles.org/", "tmpfiles.org/dl/")
     if not public_url.startswith("http"):
-        raise RuntimeError(f"file.io вернул не URL: {data}")
+        raise RuntimeError(f"tmpfiles.org вернул не URL: {data}")
     log(f"  → {public_url}")
     return public_url
 
