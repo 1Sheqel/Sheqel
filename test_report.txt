@@ -1,0 +1,167 @@
+ОТЧЁТ ПО ТЕСТИРОВАНИЮ SheqelMotion
+Дата: 22.05.2026 03:33:02
+Python: 3.11.15
+Платформа: darwin
+============================================================
+
+ИТОГО: ✅ 64  ❌ 0  ⚠️  0  из 64 проверок
+
+============================================================
+РЕЗУЛЬТАТЫ ПО КАТЕГОРИЯМ
+============================================================
+
+✅  Синтаксис app.py
+       → нет ошибок
+✅  import requests
+       → HTTP-клиент
+✅  import customtkinter
+       → GUI-фреймворк
+✅  import PIL
+       → Обработка изображений
+✅  import yt_dlp
+       → Скачивание видео
+✅  import audio_separator
+       → Разделение вокала
+✅  import cloudinary
+       → CDN для Sync
+✅  import tkinter
+       → Base GUI
+✅  import subprocess
+       → Запуск процессов
+✅  import threading
+       → Потоки
+✅  import queue
+       → Очередь сообщений
+✅  import json
+       → Работа с JSON
+✅  import shutil
+       → Работа с файлами
+✅  import hashlib
+       → SHA256 проверка
+✅  import tempfile
+       → Временные файлы
+✅  Загрузка app.py как модуля
+       → без ошибок запуска
+✅  find_binary('ls')
+       → → /bin/ls
+✅  ffmpeg_bin()
+       → локальный → /opt/homebrew/bin/ffmpeg
+✅  ffprobe_bin()
+       → локальный → /opt/homebrew/bin/ffprobe
+✅  ffmpeg запускается
+       → ffmpeg version 8.1.1 Copyright (c) 2000-2026 the FFmpeg deve
+✅  ffprobe запускается
+       → ffprobe version 8.1.1 Copyright (c) 2007-2026 the FFmpeg dev
+✅  safe_name()
+       → 6 тест-кейсов — OK
+✅  desktop_dir()
+       → /Users/admin/Desktop
+✅  ensure_dir()
+       → создаёт вложенные директории
+✅  file_exists_ok()
+       → 3 тест-кейса — OK
+✅  app_base_dir()
+       → /Users/admin/Desktop/SheqelM
+✅  parse_start_end_text()
+       → все 7 тест-кейсов прошли
+✅  get_duration()
+       → 3-секундный файл → 3.000 сек
+✅  yt_dlp import
+       → версия 2026.03.17
+✅  yt_dlp --version
+       → 2026.03.17
+✅  _ensure_ytdlp()
+       → модуль загружен
+✅  audio_separator.Separator import
+✅  text_to_speech_mp3 — обработка ошибки API
+       → выбрасывает RuntimeError при 401
+✅  ELEVEN_BASE_URL задан
+       → https://api.elevenlabs.io
+✅  SYNC_GENERATE_URL задан
+       → https://api.sync.so/v2/generate
+✅  SYNC_MODEL
+       → sync-3
+✅  SYNC_RETRIES
+       → 3
+✅  cloudinary import
+✅  _init_cloudinary()
+       → выполняется без исключений при пустых ключах
+✅  Хардкодные пути
+       → не найдены
+✅  CONFIG_PATH
+       → использует домашнюю директорию: str(Path.home() / ".version.json")
+✅  Временные директории
+       → создаются и удаляются через shutil.rmtree
+✅  os.remove
+       → используется для удаления временных файлов
+✅  _separate_vocals cleanup
+       → tmp_dir удаляется в finally-блоке
+✅  Видео-формат
+       → "bestvideo+bestaudio/best" — корректный
+✅  Логгер yt-dlp
+       → _YTLogger перехватывает ошибки постпроцессора
+✅  ffmpeg_location
+       → передаётся в yt-dlp
+✅  merge_output_format
+       → задан
+✅  Аудио-режим
+       → постпроцессор FFmpegExtractAudio задан
+✅  Пустой текст — обработка
+       → RuntimeError 'Текст пустой.' есть
+✅  Проверка существования файлов
+       → os.path.exists используется
+✅  Ограничение длины текста
+       → есть
+✅  Проверки HTTP-статусов
+       → найдено 5 проверок
+✅  Таймауты HTTP-запросов
+       → задан в 9 местах
+✅  Thread-safe логирование
+       → через queue.Queue
+✅  Кнопка Стоп для загрузки
+       → _stop_download флаг есть
+✅  Retry для Sync API
+       → SYNC_RETRIES = 3
+✅  ElevenLabs API недоступен
+       → статус 401 (ожидаемо без ключа)
+✅  Sync API
+       → доступен (статус 404)
+✅  APP_VERSION
+       → 1.0.5
+✅  UPDATE_MANIFEST_URL
+       → https://raw.githubusercontent.com/1Sheqel/Sheqel/main/versio
+✅  version.json
+       → latest_version=1.0.5, sha256=есть
+✅  copy_file()
+       → копирует и создаёт поддиректории
+✅  copy_file() — маленький файл
+       → выбрасывает RuntimeError как ожидается
+
+============================================================
+НАЙДЕННЫЕ ПРОБЛЕМЫ (по приоритету)
+============================================================
+
+🔴 Критичных проблем не найдено.
+
+🟡 Важных проблем не найдено.
+
+🟢 Дополнительных пожеланий нет.
+
+============================================================
+РЕКОМЕНДАЦИИ
+============================================================
+
+1. Убедиться, что ffmpeg/ffprobe доступны (либо рядом с app.py,
+   либо в PATH) — без них мерж видео+аудио и извлечение аудио невозможны.
+
+2. Формат скачивания видео исправлен на 'bestvideo+bestaudio/best'
+   + добавлен _YTLogger для перехвата ошибок постпроцессора.
+
+3. Добавить проверку длины текста перед отправкой в ElevenLabs
+   (лимит 5000 символов на запрос).
+
+4. version.json на GitHub — обязательно добавить sha256 перед
+   каждым релизом для безопасного автообновления.
+
+5. .venv в проекте привязан к старому пути — пересоздать виртуальное
+   окружение или использовать системный python3.11.

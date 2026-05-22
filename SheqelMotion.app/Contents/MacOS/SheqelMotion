@@ -1,50 +1,61 @@
 #!/bin/bash
-# SheqelMotion Studio launcher — runs without Terminal
+# SheqelMotion launcher — подвійний клік у Finder
 
+# Визначаємо кореневу директорію проекту (на три рівні вгору від MacOS/)
 APP_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$APP_DIR"
 
-# Expand PATH to include Homebrew and common Python locations
+# Розширюємо PATH щоб знайти Homebrew та системний Python
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:$PATH"
+[ -f "$HOME/.zprofile" ]     && source "$HOME/.zprofile"     2>/dev/null
+[ -f "$HOME/.bash_profile" ] && source "$HOME/.bash_profile" 2>/dev/null
+[ -f "$HOME/.profile" ]      && source "$HOME/.profile"      2>/dev/null
 
-# Load user shell profile so pyenv/conda/nix paths also work
-[ -f "$HOME/.zprofile" ]      && source "$HOME/.zprofile"      2>/dev/null
-[ -f "$HOME/.bash_profile" ]  && source "$HOME/.bash_profile"  2>/dev/null
-[ -f "$HOME/.profile" ]       && source "$HOME/.profile"       2>/dev/null
-
-# Find Python 3.10+
+# Шукаємо Python — пріоритет 3.11, потім 3.12, 3.10, загальний python3
 PYTHON=""
 for candidate in \
-    /opt/homebrew/bin/python3.12 \
     /opt/homebrew/bin/python3.11 \
-    /opt/homebrew/bin/python3.10 \
-    /usr/local/bin/python3.12 \
     /usr/local/bin/python3.11 \
+    /opt/homebrew/bin/python3.12 \
+    /usr/local/bin/python3.12 \
+    /opt/homebrew/bin/python3.10 \
     /usr/local/bin/python3.10 \
-    python3.12 python3.11 python3.10 python3; do
-    if command -v "$candidate" &>/dev/null; then
-        VER=$("$candidate" -c "import sys; print(sys.version_info >= (3,10))" 2>/dev/null)
-        if [ "$VER" = "True" ]; then
-            PYTHON=$(command -v "$candidate")
+    python3.11 python3.12 python3.10 python3; do
+    # Перевіряємо чи команда існує
+    if FOUND=$(command -v "$candidate" 2>/dev/null); then
+        OK=$("$FOUND" -c "import sys; print(sys.version_info >= (3,10))" 2>/dev/null)
+        if [ "$OK" = "True" ]; then
+            PYTHON="$FOUND"
             break
         fi
     fi
 done
 
+# Python не знайдено — показуємо діалог і виходимо
 if [ -z "$PYTHON" ]; then
-    osascript -e 'display alert "Python не найден" message "Установи Python 3.10 или новее с python.org" as critical'
+    osascript -e 'display alert "Python не знайдено" message "Встановіть Python 3.11 або новіший з сайту python.org\n\nПісля встановлення запустіть SheqelMotion знову." as critical buttons {"Відкрити python.org", "Закрити"} default button 1' 2>/dev/null
+    osascript -e 'open location "https://www.python.org/downloads/"' 2>/dev/null
     exit 1
 fi
 
-# Install/update dependencies silently
-"$PYTHON" -m pip install -r "$APP_DIR/requirements.txt" --quiet 2>/dev/null
+# Встановлюємо залежності якщо потрібно (тихо у фоні)
+LOG_DIR="$HOME/Library/Logs"
+LOG="$LOG_DIR/SheqelMotion.log"
+mkdir -p "$LOG_DIR"
 
-# Launch — errors go to log, show dialog on crash
-LOG="$HOME/Library/Logs/SheqelMotion.log"
-"$PYTHON" "$APP_DIR/app.py" 2>"$LOG"
+"$PYTHON" -m pip install -r "$APP_DIR/requirements.txt" --quiet 2>>"$LOG"
+
+# Запускаємо додаток
+"$PYTHON" "$APP_DIR/app.py" 2>>"$LOG"
 STATUS=$?
 
+# Якщо завершився з помилкою — показуємо інформативне повідомлення
 if [ $STATUS -ne 0 ]; then
-    ERROR=$(tail -5 "$LOG" 2>/dev/null | tr '\n' ' ')
-    osascript -e "display alert \"SheqelMotion завершился с ошибкой\" message \"$ERROR\nЛог: $LOG\" as critical"
+    if grep -q "Operation not permitted\|Permission denied" "$LOG" 2>/dev/null; then
+        osascript -e 'display alert "Немає доступу до файлів" message "Python не може читати файли.\n\nВиконайте один раз:\n1. Системні налаштування → Конфіденційність та безпека\n2. Повний доступ до диска\n3. Натисніть «+» і додайте Python\n\nЛог: '"$LOG"'" as critical'
+    else
+        ERROR=$(tail -5 "$LOG" 2>/dev/null | tr '\n' ' ' | sed "s/'/\`/g")
+        osascript -e "display alert \"SheqelMotion завершився з помилкою\" message \"${ERROR}\\nЛог: ${LOG}\" as critical"
+    fi
+    exit $STATUS
 fi

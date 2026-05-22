@@ -5,17 +5,19 @@
     <key>CFBundleName</key>
     <string>SheqelMotion</string>
     <key>CFBundleDisplayName</key>
-    <string>SheqelMotion Studio</string>
+    <string>SheqelMotion</string>
     <key>CFBundleIdentifier</key>
     <string>com.sheqel.motion</string>
     <key>CFBundleVersion</key>
-    <string>1.0.1</string>
+    <string>1.0.5</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.1</string>
+    <string>1.0.5</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
     <string>SheqelMotion</string>
+    <key>CFBundleIconFile</key>
+    <string>icon</string>
     <key>LSMinimumSystemVersion</key>
     <string>10.15</string>
     <key>NSHighResolutionCapable</key>
@@ -24,5 +26,13 @@
     <string>NSApplication</string>
     <key>NSAppleScriptEnabled</key>
     <false/>
+    <key>LSUIElement</key>
+    <false/>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>SheqelMotion потребує доступу до файлів для обробки медіа.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>SheqelMotion потребує доступу до завантажень для обробки медіа.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>SheqelMotion потребує доступу до Робочого столу для роботи з файлами.</string>
 </dict>
 </plist>

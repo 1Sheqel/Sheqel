@@ -11,6 +11,7 @@ def _ensure_deps():
         ("PIL",            "pillow==12.2.0"),
         ("yt_dlp",         "yt-dlp"),
         ("audio_separator","audio-separator[cpu]"),
+        ("cloudinary",     "cloudinary"),
     ]
     for module, pkg in packages:
         try:
@@ -34,6 +35,7 @@ import tempfile
 import threading
 import requests
 import json
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -41,7 +43,10 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
 SYNC_API_KEY = ""
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".version.json")
+CLOUDINARY_CLOUD_NAME = ""
+CLOUDINARY_API_KEY = ""
+CLOUDINARY_API_SECRET = ""
+CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
 APP_VERSION = "1.0.5"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
@@ -93,8 +98,8 @@ CARD_HOVER_DELETE = "#2a1210"
 
 def app_base_dir():
     if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+        return str(Path(sys.executable).parent)
+    return str(Path(__file__).resolve().parent)
 
 
 def find_binary(name):
@@ -114,7 +119,7 @@ def run(cmd):
 
 
 def ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
+    Path(path).mkdir(parents=True, exist_ok=True)
 
 
 def file_exists_ok(path, min_size=1024):
@@ -127,8 +132,8 @@ def safe_name(name):
 
 
 def desktop_dir():
-    d = os.path.join(os.path.expanduser("~"), "Desktop")
-    return d if os.path.isdir(d) else os.path.expanduser("~")
+    d = Path.home() / "Desktop"
+    return str(d) if d.is_dir() else str(Path.home())
 
 def open_folder(path):
     if sys.platform == "darwin":
@@ -155,13 +160,13 @@ def set_adaptive_window(win, width_ratio=0.72, height_ratio=0.82, min_width=900,
 def get_duration(path):
     result = subprocess.check_output([
         ffprobe_bin(), "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", path,
-    ])
-    return float(result.decode().strip())
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+    ], encoding="utf-8", stderr=subprocess.DEVNULL)
+    return float(result.strip())
 
 
 def copy_file(src, dst):
-    ensure_dir(os.path.dirname(dst))
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
     if not file_exists_ok(dst, min_size=100):
         raise RuntimeError(f"Не удалось скопировать файл: {dst}")
@@ -215,11 +220,11 @@ def generate_full_voice_to_desktop(api_key, voice_id, full_text, voice_name, log
     global ELEVENLABS_API_KEY
     ELEVENLABS_API_KEY = api_key
     eleven_text = full_text.replace("------", '[пауза 3 сек]')
-    save_dir = os.path.join(desktop_dir(), "ElevenLabs_Generated_Voices")
+    save_dir = Path(desktop_dir()) / "ElevenLabs_Generated_Voices"
     ensure_dir(save_dir)
     safe_voice = safe_name(voice_name or voice_id)
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    output_mp3 = os.path.join(save_dir, f"{safe_voice}_{timestamp}_full_voice.mp3")
+    output_mp3 = str(save_dir / f"{safe_voice}_{timestamp}_full_voice.mp3")
     text_to_speech_mp3(eleven_text, voice_id, output_mp3, log)
     return output_mp3
 
@@ -250,7 +255,8 @@ def detect_silences(audio_path, log):
         "-af", f"silencedetect=noise={SILENCE_NOISE}:d={SILENCE_DURATION}",
         "-f", "null", "-"
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          encoding="utf-8", errors="replace")
     output = proc.stderr or ""
     starts, ends = [], []
     for line in output.splitlines():
@@ -309,8 +315,8 @@ def split_start_end_by_silence(full_voice_mp3, output_dir, log, expected_separat
     start_cut = max(0.0, first["start"])
     end_cut = last["end"]
 
-    part_start = os.path.join(output_dir, "part_start.wav")
-    part_end = os.path.join(output_dir, "part_end.wav")
+    part_start = str(Path(output_dir) / "part_start.wav")
+    part_end = str(Path(output_dir) / "part_end.wav")
     run([ffmpeg_bin(), "-y", "-i", full_voice_mp3,
          "-ss", "0", "-to", str(round(start_cut, 3)),
          "-ar", "44100", "-ac", "1", "-c:a", "pcm_s16le", part_start])
@@ -361,23 +367,40 @@ def prepare_video_for_sync(input_video, audio_wav, output_video):
         raise RuntimeError(f"Не удалось подготовить видео для Sync: {output_video}")
     return output_video
 
-def upload_to_fileio(file_path, log):
-    """Загружает файл на tmpfiles.org и возвращает прямой URL."""
-    log(f"Загружаю {os.path.basename(file_path)} на tmpfiles.org...")
-    with open(file_path, "rb") as f:
-        res = requests.post(
-            "https://tmpfiles.org/api/v1/upload",
-            files={"file": f},
-            timeout=600,
-        )
-    if res.status_code != 200:
-        raise RuntimeError(f"tmpfiles.org upload error: {res.status_code}\n{res.text}")
-    data = res.json()
-    public_url = data["data"]["url"].replace("tmpfiles.org/", "tmpfiles.org/dl/")
-    if not public_url.startswith("http"):
-        raise RuntimeError(f"tmpfiles.org вернул не URL: {data}")
-    log(f"  → {public_url}")
-    return public_url
+def _init_cloudinary():
+    import cloudinary
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+    )
+
+def upload_to_cloudinary(file_path, log):
+    """Загружает файл на Cloudinary. Возвращает (url, public_id).
+    Файлы > 100MB грузятся чанками через upload_large."""
+    import cloudinary.uploader
+    _init_cloudinary()
+    size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    log(f"Загружаю {Path(file_path).name} ({size_mb:.1f} MB) на Cloudinary...")
+    opts = dict(resource_type="video", invalidate=True)
+    if size_mb > 90:
+        result = cloudinary.uploader.upload_large(file_path, **opts, chunk_size=50 * 1024 * 1024)
+    else:
+        result = cloudinary.uploader.upload(file_path, **opts)
+    url = result["secure_url"]
+    public_id = result["public_id"]
+    log(f"  → {url}")
+    return url, public_id
+
+def delete_from_cloudinary(public_id, log):
+    """Удаляет файл с Cloudinary по public_id."""
+    import cloudinary.uploader
+    _init_cloudinary()
+    try:
+        cloudinary.uploader.destroy(public_id, resource_type="video", invalidate=True)
+        log(f"Cloudinary: удалён {public_id}")
+    except Exception as e:
+        log(f"Cloudinary delete error ({public_id}): {e}")
 
 def apply_lipsync_sync(video_in, audio_wav, final_out, log):
     """Отправляет видео и аудио в Sync через URL-загрузку (без лимита 20MB)."""
@@ -385,14 +408,16 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
     last_error = None
 
     for attempt in range(1, SYNC_RETRIES + 1):
+        video_pub_id = None
+        audio_pub_id = None
         try:
             log(f"Отправляю в Sync... попытка {attempt}/{SYNC_RETRIES}")
 
-            # 1. Заливаем файлы на временный хостинг → получаем URL
-            video_url = upload_to_fileio(video_in, log)
-            audio_url = upload_to_fileio(audio_wav, log)
+            # 1. Загружаем на Cloudinary → получаем URL + public_id для удаления
+            video_url, video_pub_id = upload_to_cloudinary(video_in, log)
+            audio_url, audio_pub_id = upload_to_cloudinary(audio_wav, log)
 
-            # 2. Отправляем в Sync только URL (никакого multipart)
+            # 2. Отправляем в Sync только URL
             payload = {
                 "model": SYNC_MODEL,
                 "input": [
@@ -451,6 +476,11 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
             if attempt < SYNC_RETRIES:
                 log("Пауза 60 секунд перед повтором...")
                 time.sleep(60)
+        finally:
+            # Удаляем файлы с Cloudinary всегда — и при успехе и при ошибке
+            for pub_id in (video_pub_id, audio_pub_id):
+                if pub_id:
+                    delete_from_cloudinary(pub_id, log)
 
     raise RuntimeError(f"Sync не сработал после {SYNC_RETRIES} попыток: {last_error}")
 
@@ -470,8 +500,9 @@ def enhance_video(input_video, output_video):
 
 
 def process_lipsync(video_path, audio_wav, output_mp4, temp_dir, log):
-    sync_video = os.path.join(temp_dir, safe_name(os.path.basename(output_mp4)) + "_sync_input.mp4")
-    raw_video = os.path.join(temp_dir, safe_name(os.path.basename(output_mp4)) + "_raw.mp4")
+    stem = safe_name(Path(output_mp4).name)
+    sync_video = str(Path(temp_dir) / (stem + "_sync_input.mp4"))
+    raw_video = str(Path(temp_dir) / (stem + "_raw.mp4"))
     prepare_video_for_sync(video_path, audio_wav, sync_video)
     apply_lipsync_sync(sync_video, audio_wav, raw_video, log)
     enhance_video(raw_video, output_mp4)
@@ -493,8 +524,9 @@ def _ensure_ytdlp():
 def _ytdlp_ffmpeg_opts():
     """Возвращает путь к директории с ffmpeg для передачи yt-dlp."""
     bin_path = ffmpeg_bin()
-    if os.path.isabs(bin_path):
-        return os.path.dirname(bin_path)
+    p = Path(bin_path)
+    if p.is_absolute():
+        return str(p.parent)
     return None
 
 
@@ -508,7 +540,7 @@ def download_from_url(url, output_dir, mode, denoise, log):
     ensure_dir(output_dir)
 
     # Добавляем директорию с бандленным ffmpeg в PATH для yt-dlp
-    base = app_base_dir()
+    base = str(Path(app_base_dir()))
     env_path = os.environ.get("PATH", "")
     if base not in env_path.split(os.pathsep):
         os.environ["PATH"] = base + os.pathsep + env_path
@@ -528,25 +560,32 @@ def download_from_url(url, output_dir, mode, denoise, log):
                 last_pct["v"] = pct
                 log(line)
         elif d["status"] == "finished":
-            log(f"  Скачано: {os.path.basename(d.get('filename', ''))}")
+            log(f"  Скачано: {Path(d.get('filename', '')).name}")
+
+    class _YTLogger:
+        def debug(self, msg):
+            if msg.startswith("[debug]"):
+                return
+            log(msg)
+        def warning(self, msg):
+            log(f"[предупреждение] {msg}")
+        def error(self, msg):
+            log(f"[ошибка] {msg}")
 
     common = {
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
+        "logger": _YTLogger(),
         "progress_hooks": [progress_hook],
     }
     if ffmpeg_dir:
         common["ffmpeg_location"] = ffmpeg_dir
 
     if mode == "video":
-        outtmpl = os.path.join(output_dir, f"{timestamp}_%(title).80s.%(ext)s")
+        outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
         opts = {
             **common,
-            "format": (
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[ext=mp4]+bestaudio/"
-                "bestvideo+bestaudio/best"
-            ),
+            "format": "bestvideo+bestaudio/best",
             "merge_output_format": "mp4",
             "outtmpl": outtmpl,
         }
@@ -555,12 +594,12 @@ def download_from_url(url, output_dir, mode, denoise, log):
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
             if not os.path.exists(filename):
-                filename = os.path.splitext(filename)[0] + ".mp4"
+                filename = str(Path(filename).with_suffix(".mp4"))
         log(f"Сохранено: {filename}")
         return filename, None
 
     elif mode == "audio":
-        outtmpl = os.path.join(output_dir, f"{timestamp}_%(title).80s.%(ext)s")
+        outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
         opts = {
             **common,
             "format": "bestaudio/best",
@@ -575,11 +614,11 @@ def download_from_url(url, output_dir, mode, denoise, log):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             base_name = ydl.prepare_filename(info)
-        filename = os.path.splitext(base_name)[0] + ".mp3"
+        filename = str(Path(base_name).with_suffix(".mp3"))
 
         if denoise and os.path.exists(filename):
-            log(f"Передаю в audio-separator: {os.path.basename(filename)}")
-            vocals_out = os.path.splitext(filename)[0] + "_vocals.mp3"
+            log(f"Передаю в audio-separator: {Path(filename).name}")
+            vocals_out = str(Path(filename).with_suffix("")) + "_vocals.mp3"
             _separate_vocals(filename, vocals_out, log)
             os.remove(filename)
             filename = vocals_out
@@ -588,7 +627,7 @@ def download_from_url(url, output_dir, mode, denoise, log):
         return filename, None
 
     else:  # split — видео как есть + аудио отдельно
-        outtmpl = os.path.join(output_dir, f"{timestamp}_%(title).80s.%(ext)s")
+        outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
         opts = {
             **common,
             "format": (
@@ -604,7 +643,7 @@ def download_from_url(url, output_dir, mode, denoise, log):
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
             if not os.path.exists(filename):
-                filename = os.path.splitext(filename)[0] + ".mp4"
+                filename = str(Path(filename).with_suffix(".mp4"))
 
         video_out, audio_out = _split_video_audio(filename, output_dir, denoise, log)
         try:
@@ -627,18 +666,19 @@ def _separate_vocals(input_path, output_path, log):
         )
         from audio_separator.separator import Separator
 
-    log(f"[audio-separator] Входной файл: {os.path.basename(input_path)}"
-        f" ({os.path.splitext(input_path)[1].upper() or 'нет расширения'})")
+    in_p = Path(input_path)
+    log(f"[audio-separator] Входной файл: {in_p.name}"
+        f" ({in_p.suffix.upper() or 'нет расширения'})")
 
     tmp_dir = tempfile.mkdtemp()
     try:
         # ШАГ 1: конвертируем в WAV — audio-separator работает лучше с WAV
-        wav_path = os.path.join(tmp_dir, "input.wav")
+        wav_path = str(Path(tmp_dir) / "input.wav")
         log("[audio-separator] ШАГ 1: конвертирую в WAV 44100 Hz...")
         run([ffmpeg_bin(), "-y", "-i", input_path, "-ar", "44100", "-ac", "2", wav_path])
         if not os.path.exists(wav_path):
             raise RuntimeError(f"ffmpeg не создал WAV: {wav_path}")
-        log(f"[audio-separator] WAV готов: {os.path.basename(wav_path)}")
+        log(f"[audio-separator] WAV готов: {Path(wav_path).name}")
 
         # ШАГ 2: разделяем голос и музыку
         log("[audio-separator] ШАГ 2: запускаю разделение...")
@@ -646,26 +686,26 @@ def _separate_vocals(input_path, output_path, log):
         sep.load_model()
         files = sep.separate(wav_path)
 
-        log(f"[audio-separator] Сгенерированные файлы: {[os.path.basename(f) for f in files]}")
+        log(f"[audio-separator] Сгенерированные файлы: {[Path(f).name for f in files]}")
 
         # ШАГ 3: ищем файл с голосом (Vocals в имени)
         vocals = None
         for f in files:
-            full = f if os.path.isabs(f) else os.path.join(tmp_dir, os.path.basename(f))
-            if "vocal" in os.path.basename(full).lower() and os.path.exists(full):
+            full = f if Path(f).is_absolute() else str(Path(tmp_dir) / Path(f).name)
+            if "vocal" in Path(full).name.lower() and os.path.exists(full):
                 vocals = full
                 break
 
         if not vocals:
             raise RuntimeError(
                 f"audio-separator: файл с голосом не найден. "
-                f"Файлы: {[os.path.basename(f) for f in files]}"
+                f"Файлы: {[Path(f).name for f in files]}"
             )
-        log(f"[audio-separator] ШАГ 3: голос найден: {os.path.basename(vocals)}")
+        log(f"[audio-separator] ШАГ 3: голос найден: {Path(vocals).name}")
 
         # ШАГ 4: конвертируем результат в mp3
         run([ffmpeg_bin(), "-y", "-i", vocals, "-q:a", "0", output_path])
-        log(f"Голос готов: {os.path.basename(output_path)}")
+        log(f"Голос готов: {Path(output_path).name}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -677,9 +717,9 @@ def _split_video_audio(video_path, output_dir, denoise, log):
       - AUDIO.mp3  — только аудиодорожка, с денойзом если выбрано
     """
     ensure_dir(output_dir)
-    base = os.path.splitext(os.path.basename(video_path))[0]
-    video_out = os.path.join(output_dir, base + "_VIDEO.mp4")
-    audio_out = os.path.join(output_dir, base + "_AUDIO.mp3")
+    base = Path(video_path).stem
+    video_out = str(Path(output_dir) / (base + "_VIDEO.mp4"))
+    audio_out = str(Path(output_dir) / (base + "_AUDIO.mp3"))
 
     log("Копирую оригинальное видео (с голосом)...")
     shutil.copy2(video_path, video_out)
@@ -688,8 +728,8 @@ def _split_video_audio(video_path, output_dir, denoise, log):
     run([ffmpeg_bin(), "-y", "-i", video_path, "-vn", "-q:a", "0", audio_out])
 
     if denoise:
-        log(f"Передаю в audio-separator: {os.path.basename(audio_out)}")
-        vocals_out = os.path.join(output_dir, base + "_vocals.mp3")
+        log(f"Передаю в audio-separator: {Path(audio_out).name}")
+        vocals_out = str(Path(output_dir) / (base + "_vocals.mp3"))
         _separate_vocals(audio_out, vocals_out, log)
         os.remove(audio_out)
         audio_out = vocals_out
@@ -806,6 +846,9 @@ class LipsyncTwoModeApp(ctk.CTk):
         self.log_box = None
         self.is_processing = False
         self.sync_key = SYNC_API_KEY
+        self.cloudinary_cloud_name = ""
+        self.cloudinary_api_key = ""
+        self.cloudinary_api_secret = ""
         self.preview_process = None
         self.preview_voice_id = None
         self.build_ui()
@@ -935,8 +978,8 @@ class LipsyncTwoModeApp(ctk.CTk):
         # 1. Скачиваем во временный файл
         progress_label.configure(text="Скачиваю обновление...")
         parent_win.update()
-        app_dir = app_base_dir()
-        temp_path = os.path.join(app_dir, "app.py.new")
+        app_dir = Path(app_base_dir())
+        temp_path = str(app_dir / "app.py.new")
         try:
             with requests.get(raw_url, timeout=60, stream=True) as r:
                 r.raise_for_status()
@@ -994,8 +1037,8 @@ class LipsyncTwoModeApp(ctk.CTk):
         # 5. Заменяем app.py
         progress_label.configure(text="Применяю обновление...")
         parent_win.update()
-        app_path = os.path.join(app_dir, "app.py")
-        backup_path = os.path.join(app_dir, "app.py.bak")
+        app_path = str(app_dir / "app.py")
+        backup_path = str(app_dir / "app.py.bak")
         try:
             if os.path.exists(app_path):
                 shutil.copy2(app_path, backup_path)
@@ -1004,7 +1047,7 @@ class LipsyncTwoModeApp(ctk.CTk):
             raise RuntimeError(f"Не удалось заменить файл: {e}")
 
         # 6. Записываем флаг «только что обновились»
-        flag_path = os.path.join(app_dir, ".just_updated")
+        flag_path = str(app_dir / ".just_updated")
         try:
             with open(flag_path, "w", encoding="utf-8") as f:
                 f.write(new_version)
@@ -1036,15 +1079,15 @@ class LipsyncTwoModeApp(ctk.CTk):
 
     def _check_just_updated(self):
         """Если на прошлом старте было обновление — показываем toast."""
-        flag_path = os.path.join(app_base_dir(), ".just_updated")
-        if os.path.exists(flag_path):
+        flag_path = Path(app_base_dir()) / ".just_updated"
+        if flag_path.exists():
             try:
                 with open(flag_path, "r", encoding="utf-8") as f:
                     updated_to = f.read().strip()
                 os.remove(flag_path)
                 # Удаляем бэкап если всё ок
-                backup = os.path.join(app_base_dir(), "app.py.bak")
-                if os.path.exists(backup):
+                backup = Path(app_base_dir()) / "app.py.bak"
+                if backup.exists():
                     try:
                         os.remove(backup)
                     except Exception:
@@ -1107,6 +1150,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         sb_header("⚙️  НАСТРОЙКИ")
         self.api_btn = sb_btn("API key", self.show_api_key_panel)
         self.sync_btn = sb_btn("Sync key", self.show_sync_key_panel)
+        self.cloudinary_btn = sb_btn("Cloudinary key", self.show_cloudinary_panel)
 
         # 🎙 ГОЛОС
         sb_header("🎙  ГОЛОС")
@@ -1273,6 +1317,60 @@ class LipsyncTwoModeApp(ctk.CTk):
                     color=BTN_OK, hover=BTN_OK_HOVER, width=190).pack(
             anchor="e", padx=24, pady=(0, 20))
 
+    def show_cloudinary_panel(self):
+        scroll = self._start_panel("cloudinary")
+        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="x", padx=20, pady=20)
+
+        self.label(frame, "Cloudinary", size=22, weight="bold").pack(
+            anchor="w", padx=24, pady=(22, 6))
+        self.label(
+            frame,
+            "Нужен для загрузки файлов в Sync. Берётся в личном кабинете cloudinary.com.",
+            size=13, color=MUTED,
+        ).pack(anchor="w", padx=24, pady=(0, 18))
+
+        def _field(label_text, value):
+            self.label(frame, label_text, size=13, weight="bold").pack(anchor="w", padx=24)
+            box = ctk.CTkTextbox(
+                frame, height=44, fg_color="#ffffff", text_color="#111111",
+                border_width=1, border_color="#737373",
+                corner_radius=10, font=ctk.CTkFont(size=13),
+            )
+            box.pack(fill="x", padx=24, pady=(4, 14))
+            if value:
+                box.insert("1.0", value)
+            return box
+
+        cloud_box  = _field("Cloud Name",  self.cloudinary_cloud_name)
+        key_box    = _field("API Key",      self.cloudinary_api_key)
+        secret_box = _field("API Secret",   self.cloudinary_api_secret)
+
+        result_label = self.label(frame, "", size=13, color=MUTED)
+        result_label.pack(anchor="w", padx=24, pady=(0, 6))
+
+        def save():
+            cloud  = cloud_box.get("1.0", "end").strip()
+            key    = key_box.get("1.0", "end").strip()
+            secret = secret_box.get("1.0", "end").strip()
+            if not cloud or not key or not secret:
+                messagebox.showerror("Ошибка", "Заполните все три поля.", parent=self)
+                return
+            self.cloudinary_cloud_name = cloud
+            self.cloudinary_api_key    = key
+            self.cloudinary_api_secret = secret
+            global CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET
+            CLOUDINARY_CLOUD_NAME  = cloud
+            CLOUDINARY_API_KEY     = key
+            CLOUDINARY_API_SECRET  = secret
+            self.save_config()
+            self.update_status()
+            result_label.configure(text="✓ Ключи сохранены", text_color="#86efac")
+
+        self.button(frame, "Сохранить ключи", save,
+                    color=BTN_OK, hover=BTN_OK_HOVER, width=200).pack(
+            anchor="e", padx=24, pady=(0, 20))
+
     def fetch_voice_id_by_name(self, name):
         for v in self.fetch_all_voices():
             if v["name"].lower() == name.lower():
@@ -1318,7 +1416,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         }
 
         with open(audio_path, "rb") as f:
-            files = [("files", (os.path.basename(audio_path), f, "audio/mpeg"))]
+            files = [("files", (Path(audio_path).name, f, "audio/mpeg"))]
             res = requests.post(url, headers=headers, data=data, files=files, timeout=300)
 
         if res.status_code not in [200, 201]:
@@ -1400,9 +1498,9 @@ class LipsyncTwoModeApp(ctk.CTk):
                 try:
                     size_mb = os.path.getsize(f) / (1024 * 1024)
                     file_label.configure(
-                        text=f"  {os.path.basename(f)}  ({size_mb:.1f} МБ)", text_color="#111")
+                        text=f"  {Path(f).name}  ({size_mb:.1f} МБ)", text_color="#111")
                 except Exception:
-                    file_label.configure(text=f"  {os.path.basename(f)}", text_color="#111")
+                    file_label.configure(text=f"  {Path(f).name}", text_color="#111")
 
         self.button(file_row, "Выбрать файл", choose_file,
                     color=BTN, hover=BTN_HOVER, width=130).pack(side="right")
@@ -1509,7 +1607,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         folder_row = ctk.CTkFrame(outer, fg_color="transparent")
         folder_row.pack(fill="x", padx=20, pady=(0, 10))
         self.label(folder_row, "Папка:", size=12, weight="bold").pack(side="left", padx=(0, 6))
-        folder_var = ctk.StringVar(value=os.path.join(desktop_dir(), "SheqelMotion_Downloads"))
+        folder_var = ctk.StringVar(value=str(Path(desktop_dir()) / "SheqelMotion_Downloads"))
         ctk.CTkEntry(
             folder_row, textvariable=folder_var,
             fg_color="white", text_color="#111",
@@ -1562,9 +1660,9 @@ class LipsyncTwoModeApp(ctk.CTk):
                 try:
                     main_file, extra_file = download_from_url(
                         url, output_dir, mode, denoise, log)
-                    show_name = os.path.basename(main_file)
+                    show_name = Path(main_file).name
                     if extra_file:
-                        show_name += " + " + os.path.basename(extra_file)
+                        show_name += " + " + Path(extra_file).name
 
                     def mark_done(f=main_file, n=show_name):
                         if self._active_panel != "downloader":
@@ -1578,7 +1676,7 @@ class LipsyncTwoModeApp(ctk.CTk):
                         item["pbar"].configure(progress_color="#86efac")
                         item["open"].configure(
                             state="normal",
-                            command=lambda path=f: open_folder(os.path.dirname(path)),
+                            command=lambda path=f: open_folder(str(Path(path).parent)),
                         )
                     self.after(0, mark_done)
                 except Exception as e:
@@ -1680,9 +1778,9 @@ class LipsyncTwoModeApp(ctk.CTk):
         """Скачивает (если надо) и играет preview через ffplay/afplay."""
         self.stop_preview()
 
-        cache_dir = os.path.join(tempfile.gettempdir(), "sheqelmotion_previews")
+        cache_dir = Path(tempfile.gettempdir()) / "sheqelmotion_previews"
         ensure_dir(cache_dir)
-        cache_path = os.path.join(cache_dir, f"{voice_id}.mp3")
+        cache_path = str(cache_dir / f"{voice_id}.mp3")
 
         if not os.path.exists(cache_path):
             if url:
@@ -1709,18 +1807,17 @@ class LipsyncTwoModeApp(ctk.CTk):
         try:
             ffplay = shutil.which("ffplay")
             if not ffplay:
-                local = os.path.join(app_base_dir(),
-                                     "ffplay" + (".exe" if sys.platform == "win32" else ""))
-                if os.path.exists(local):
-                    ffplay = local
+                local = Path(app_base_dir()) / ("ffplay" + (".exe" if sys.platform == "win32" else ""))
+                if local.exists():
+                    ffplay = str(local)
 
             if ffplay:
                 self.preview_process = subprocess.Popen(
-                    [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", cache_path],
+                    [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", str(cache_path)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
             elif sys.platform == "darwin":
-                self.preview_process = subprocess.Popen(["afplay", cache_path])
+                self.preview_process = subprocess.Popen(["afplay", str(cache_path)])
             elif sys.platform == "win32":
                 os.startfile(cache_path)
             self.preview_voice_id = voice_id
@@ -2186,7 +2283,7 @@ class LipsyncTwoModeApp(ctk.CTk):
 
     def roll_details(self, roll):
         parts = []
-        parts.append(f"Голос: {os.path.basename(roll['voice_file'])}" if roll["voice_file"] else "Голос: не выбран")
+        parts.append(f"Голос: {Path(roll['voice_file']).name}" if roll["voice_file"] else "Голос: не выбран")
         if roll["text"]:
             preview = roll["text"].replace("\n", " ")
             if len(preview) > 95:
@@ -2195,10 +2292,10 @@ class LipsyncTwoModeApp(ctk.CTk):
         else:
             parts.append("Текст проверки: пусто")
         if roll["mode"] == "1 видео":
-            parts.append(f"Видео: {os.path.basename(roll['video_single']) if roll['video_single'] else 'не выбрано'}")
+            parts.append(f"Видео: {Path(roll['video_single']).name if roll['video_single'] else 'не выбрано'}")
         else:
-            parts.append(f"Начало: {os.path.basename(roll['video_start']) if roll['video_start'] else 'не выбрано'}")
-            parts.append(f"Конец: {os.path.basename(roll['video_end']) if roll['video_end'] else 'не выбрано'}")
+            parts.append(f"Начало: {Path(roll['video_start']).name if roll['video_start'] else 'не выбрано'}")
+            parts.append(f"Конец: {Path(roll['video_end']).name if roll['video_end'] else 'не выбрано'}")
         return " | ".join(parts)
     
     def get_roll_title(self, idx, roll):
@@ -2208,7 +2305,7 @@ class LipsyncTwoModeApp(ctk.CTk):
             title_video = roll["video_start"] or roll["video_end"]
 
         if title_video:
-            name = os.path.splitext(os.path.basename(title_video))[0]
+            name = Path(title_video).stem
             return name[:40] + "..." if len(name) > 40 else name
 
         return f"Сцена {idx + 1}"
@@ -2361,6 +2458,12 @@ class LipsyncTwoModeApp(ctk.CTk):
                 "Не задан Sync API key. Нажми кнопку «Sync key» в верхней панели и введи ключ."
             )
             return
+        if not self.cloudinary_cloud_name or not self.cloudinary_api_key or not self.cloudinary_api_secret:
+            messagebox.showerror(
+                "Ошибка",
+                "Добавьте Cloudinary ключи в Настройки.\nНажми кнопку «Cloudinary key» в боковой панели."
+            )
+            return
         global SYNC_API_KEY
         SYNC_API_KEY = self.sync_key
         self.open_log_window()
@@ -2373,18 +2476,18 @@ class LipsyncTwoModeApp(ctk.CTk):
     def _process_single_roll(self, order_num, idx, roll, batch_dir, log):
         """Обрабатывает один ролик (используется и в последовательном, и в параллельном режиме)."""
         if roll["mode"] == "1 видео":
-            roll_video_name = os.path.splitext(os.path.basename(roll["video_single"]))[0]
+            roll_video_name = Path(roll["video_single"]).stem
         else:
-            roll_video_name = os.path.splitext(os.path.basename(roll["video_start"]))[0]
+            roll_video_name = Path(roll["video_start"]).stem
 
-        roll_dir = os.path.join(batch_dir, f"{order_num:02d}_{safe_name(roll_video_name)}")
+        roll_dir = str(Path(batch_dir) / f"{order_num:02d}_{safe_name(roll_video_name)}")
         ensure_dir(roll_dir)
-        temp_dir = os.path.join(roll_dir, ".tmp")
+        temp_dir = str(Path(roll_dir) / ".tmp")
         ensure_dir(temp_dir)
 
-        full_voice_copy = copy_file(roll["voice_file"], os.path.join(roll_dir, "full_voice.mp3"))
+        full_voice_copy = copy_file(roll["voice_file"], str(Path(roll_dir) / "full_voice.mp3"))
         if roll["text"]:
-            with open(os.path.join(roll_dir, "full_text.txt"), "w", encoding="utf-8") as f:
+            with open(Path(roll_dir) / "full_text.txt", "w", encoding="utf-8") as f:
                 f.write(roll["text"])
 
         log("=" * 60)
@@ -2394,7 +2497,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         log("=" * 60)
 
         if roll["mode"] == "1 видео":
-            audio_wav = os.path.join(temp_dir, "full_voice.wav")
+            audio_wav = str(Path(temp_dir) / "full_voice.wav")
             convert_audio_to_wav_trimmed(
                 full_voice_copy,
                 audio_wav,
@@ -2404,8 +2507,8 @@ class LipsyncTwoModeApp(ctk.CTk):
             if roll.get("audio_start") or roll.get("audio_end"):
                 log(f"Обрезка: {roll.get('audio_start') or '0'} → {roll.get('audio_end') or 'конец'} сек")
 
-            video_name = safe_name(os.path.splitext(os.path.basename(roll["video_single"]))[0])
-            out = os.path.join(roll_dir, f"{video_name}.mp4")
+            video_name = safe_name(Path(roll["video_single"]).stem)
+            out = str(Path(roll_dir) / f"{video_name}.mp4")
             process_lipsync(roll["video_single"], audio_wav, out, temp_dir, log)
             log(f"ГОТОВО: {out}")
         else:
@@ -2414,11 +2517,11 @@ class LipsyncTwoModeApp(ctk.CTk):
                 full_voice_copy, roll_dir, log,
                 expected_separators=sep_count,
             )
-            video_name_start = safe_name(os.path.splitext(os.path.basename(roll["video_start"]))[0])
-            video_name_end = safe_name(os.path.splitext(os.path.basename(roll["video_end"]))[0])
+            video_name_start = safe_name(Path(roll["video_start"]).stem)
+            video_name_end = safe_name(Path(roll["video_end"]).stem)
 
-            out_start = os.path.join(roll_dir, f"{video_name_start}_start.mp4")
-            out_end = os.path.join(roll_dir, f"{video_name_end}_end.mp4")
+            out_start = str(Path(roll_dir) / f"{video_name_start}_start.mp4")
+            out_end = str(Path(roll_dir) / f"{video_name_end}_end.mp4")
             log("Lipsync start...")
             process_lipsync(roll["video_start"], part_start, out_start, temp_dir, log)
             log("Lipsync end...")
@@ -2435,11 +2538,11 @@ class LipsyncTwoModeApp(ctk.CTk):
         try:
             failed_videos = []
             failed_lock = threading.Lock()
-            base_output = os.path.join(desktop_dir(), "Lipsync_Queue_Output")
+            base_output = str(Path(desktop_dir()) / "Lipsync_Queue_Output")
             ensure_dir(base_output)
 
             batch_name = time.strftime("%d-%m-%Y_%H-%M")
-            batch_dir = os.path.join(base_output, batch_name)
+            batch_dir = str(Path(base_output) / batch_name)
             ensure_dir(batch_dir)
 
             total = len(valid_rolls)
@@ -2469,10 +2572,10 @@ class LipsyncTwoModeApp(ctk.CTk):
                     self.set_roll_status(idx, "Готово")
                 except Exception as e:
                     if roll["mode"] == "1 видео":
-                        video_name = os.path.basename(roll.get("video_single", "")) or f"ролик {idx + 1}"
+                        video_name = Path(roll.get("video_single", "")).name or f"ролик {idx + 1}"
                     else:
-                        s = os.path.basename(roll.get("video_start", ""))
-                        en = os.path.basename(roll.get("video_end", ""))
+                        s = Path(roll.get("video_start", "")).name
+                        en = Path(roll.get("video_end", "")).name
                         video_name = f"{s} + {en}" if (s and en) else f"ролик {idx + 1}"
 
                     error_text = str(e)
@@ -2598,6 +2701,13 @@ class LipsyncTwoModeApp(ctk.CTk):
                 self.sync_key = sync_key
                 global SYNC_API_KEY
                 SYNC_API_KEY = sync_key
+            self.cloudinary_cloud_name = data.get("cloudinary_cloud_name", "") or self.cloudinary_cloud_name
+            self.cloudinary_api_key    = data.get("cloudinary_api_key", "")    or self.cloudinary_api_key
+            self.cloudinary_api_secret = data.get("cloudinary_api_secret", "") or self.cloudinary_api_secret
+            global CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET
+            CLOUDINARY_CLOUD_NAME  = self.cloudinary_cloud_name
+            CLOUDINARY_API_KEY     = self.cloudinary_api_key
+            CLOUDINARY_API_SECRET  = self.cloudinary_api_secret
             self.main_voice_name = data.get("main_voice_name", "") or self.main_voice_name
         except Exception as e:
             self.log(f"Не удалось загрузить конфиг: {e}")
@@ -2606,9 +2716,12 @@ class LipsyncTwoModeApp(ctk.CTk):
         """Сохраняет API ключи и настройки в ~/.sheqelmotion.json."""
         try:
             data = {
-                "elevenlabs_api_key": self.api_key,
-                "sync_api_key": self.sync_key,
-                "main_voice_name": self.main_voice_name,
+                "elevenlabs_api_key":    self.api_key,
+                "sync_api_key":          self.sync_key,
+                "cloudinary_cloud_name": self.cloudinary_cloud_name,
+                "cloudinary_api_key":    self.cloudinary_api_key,
+                "cloudinary_api_secret": self.cloudinary_api_secret,
+                "main_voice_name":       self.main_voice_name,
             }
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
