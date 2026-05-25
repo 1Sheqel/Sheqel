@@ -48,7 +48,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.7"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -523,10 +523,15 @@ def _ensure_ytdlp():
 
 def _ytdlp_ffmpeg_opts():
     """Возвращает путь к директории с ffmpeg для передачи yt-dlp."""
-    bin_path = ffmpeg_bin()
-    p = Path(bin_path)
-    if p.is_absolute():
-        return str(p.parent)
+    # Windows: ищем ffmpeg.exe рядом с программой
+    exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    local = Path(app_base_dir()) / exe_name
+    if local.exists():
+        return str(local.parent)
+    # Системный ffmpeg
+    found = shutil.which("ffmpeg")
+    if found:
+        return str(Path(found).parent)
     return None
 
 
@@ -585,7 +590,7 @@ def download_from_url(url, output_dir, mode, denoise, log):
         outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
         opts = {
             **common,
-            "format": "bestvideo+bestaudio/best",
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
             "outtmpl": outtmpl,
         }
