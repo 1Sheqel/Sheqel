@@ -863,6 +863,7 @@ class LipsyncTwoModeApp(ctk.CTk):
         self.update_status()
         self.after(3000, lambda: self.check_for_updates(silent=True))
         self.after(500, self._check_just_updated)
+        self.after(2000, self._check_elevenlabs)
 
 
     def _reopen_window(self):
@@ -1103,6 +1104,48 @@ class LipsyncTwoModeApp(ctk.CTk):
                 ))
             except Exception:
                 pass
+
+    def _check_elevenlabs(self):
+        if not self.api_key:
+            return
+
+        def run():
+            headers = {"xi-api-key": self.api_key}
+            try:
+                res = requests.get(
+                    f"{ELEVEN_BASE_URL}/v1/user",
+                    headers=headers, timeout=10,
+                )
+            except Exception:
+                return
+
+            if res.status_code == 401:
+                self.after(0, lambda: messagebox.showwarning(
+                    "ElevenLabs",
+                    "ElevenLabs API key неверный. Обнови в Настройках.",
+                ))
+                return
+
+            if res.status_code != 200:
+                return
+
+            try:
+                models_res = requests.get(
+                    f"{ELEVEN_BASE_URL}/v1/models",
+                    headers=headers, timeout=10,
+                )
+                if models_res.status_code == 200:
+                    ids = [m.get("model_id") for m in models_res.json()]
+                    if ELEVEN_TTS_MODEL_ID not in ids:
+                        self.after(0, lambda: messagebox.showwarning(
+                            "ElevenLabs",
+                            f"Твой план ElevenLabs не поддерживает {ELEVEN_TTS_MODEL_ID}.\n"
+                            "Нужен план Creator или выше.",
+                        ))
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
 
     def button(self, parent, text, command, color=BTN_PRIMARY, hover=BTN_PRIMARY_HOVER, width=150):
         return ctk.CTkButton(parent, text=text, command=command, fg_color=color, hover_color=hover, text_color="white", corner_radius=20, height=38, width=width, font=ctk.CTkFont(size=14, weight="bold"))
@@ -1966,18 +2009,58 @@ class LipsyncTwoModeApp(ctk.CTk):
         frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="both", expand=True, padx=20, pady=20)
 
+        # ── State ─────────────────────────────────────────────────────────
+        # state["temp_path"] — dict: {"A": path|None, "B": path|None}
+        state = {"temp_path": {"A": None, "B": None}}
+
+        def _cleanup_temp(slot=None):
+            slots = ["A", "B"] if slot is None else [slot]
+            for s in slots:
+                p = state["temp_path"][s]
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+                state["temp_path"][s] = None
+
+        def _load_last_dir():
+            try:
+                if os.path.exists(CONFIG_PATH):
+                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                        d = json.load(f).get("voice_gen_last_dir", "")
+                    if d and os.path.isdir(d):
+                        return d
+            except Exception:
+                pass
+            return desktop_dir()
+
+        def _save_last_dir(path):
+            try:
+                data = {}
+                if os.path.exists(CONFIG_PATH):
+                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                data["voice_gen_last_dir"] = path
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        # ── Header ────────────────────────────────────────────────────────
         self.label(frame, "Сгенерировать full_voice.mp3", size=22, weight="bold").pack(
-            anchor="w", padx=22, pady=(20, 6))
+            anchor="w", padx=22, pady=(20, 4))
         self.label(
             frame,
-            "Пиши текст с ------. Приложение заменит ------ на паузу, ElevenLabs не будет читать тире.",
+            "Один текст — два варианта генерации параллельно. Прослушай оба, скачай лучший.",
             size=13, color=MUTED,
-        ).pack(anchor="w", padx=22, pady=(0, 16))
+        ).pack(anchor="w", padx=22, pady=(0, 14))
 
+        # ── Voice picker ──────────────────────────────────────────────────
         self.label(frame, "voice_id или имя голоса", size=14, weight="bold").pack(
             anchor="w", padx=22)
         voice_box = ctk.CTkTextbox(
-            frame, height=60, fg_color="#ffffff", text_color="#111111",
+            frame, height=56, fg_color="#ffffff", text_color="#111111",
             border_width=1, border_color="#737373",
             corner_radius=10, font=ctk.CTkFont(size=14),
         )
@@ -1992,23 +2075,223 @@ class LipsyncTwoModeApp(ctk.CTk):
         self.button(frame, "📋 Выбрать из списка моих голосов",
                     lambda: self.open_voice_picker(self, on_voice_picked),
                     color=BTN, hover=BTN_HOVER, width=320).pack(
-            anchor="w", padx=22, pady=(0, 16))
+            anchor="w", padx=22, pady=(0, 14))
 
-        self.label(frame, "Полный текст", size=14, weight="bold").pack(anchor="w", padx=22)
+        # ── Text input ────────────────────────────────────────────────────
+        self.label(frame, "Текст (один для обоих вариантов)", size=14, weight="bold").pack(
+            anchor="w", padx=22)
         text_box = ctk.CTkTextbox(
-            frame, height=220,
+            frame, height=180,
             fg_color="#ffffff", text_color="#111111",
             border_width=1, border_color="#737373",
             corner_radius=10, font=ctk.CTkFont(size=14), wrap="word",
         )
-        text_box.pack(fill="x", padx=22, pady=(6, 16))
+        text_box.pack(fill="x", padx=22, pady=(6, 14))
 
-        result_label = self.label(frame, "", size=13, color=MUTED)
-        result_label.pack(anchor="w", padx=22, pady=(0, 12))
+        # ── Кнопка запуска ────────────────────────────────────────────────
+        gen_row = ctk.CTkFrame(frame, fg_color="transparent")
+        gen_row.pack(fill="x", padx=22, pady=(0, 16))
 
-        def generate_audio():
+        gen_btn = self.button(gen_row, "⚡ Сгенерировать A и B",
+                              lambda: None,  # команда назначается ниже
+                              color=BTN_OK, hover=BTN_OK_HOVER, width=240)
+        gen_btn.pack(side="left")
+
+        gen_status = self.label(gen_row, "", size=12, color=MUTED)
+        gen_status.pack(side="left", padx=14)
+
+        # ── A/B карточки ──────────────────────────────────────────────────
+        ab_row = ctk.CTkFrame(frame, fg_color="transparent")
+        ab_row.pack(fill="x", padx=22, pady=(0, 20))
+        ab_row.columnconfigure(0, weight=1)
+        ab_row.columnconfigure(1, weight=1)
+
+        slot_widgets = {}  # "A" и "B" → dict с виджетами
+
+        for col, slot in enumerate(["A", "B"]):
+            color_accent = "#1c7ed6" if slot == "A" else "#7950f2"
+            label_text = f"Вариант {slot}"
+
+            card = ctk.CTkFrame(ab_row, fg_color=CARD, corner_radius=16)
+            card.grid(row=0, column=col, padx=(0 if col == 0 else 8, 0), sticky="nsew")
+
+            # Заголовок карточки
+            hdr = ctk.CTkFrame(card, fg_color=color_accent, corner_radius=10, height=36)
+            hdr.pack(fill="x", padx=10, pady=(10, 8))
+            hdr.pack_propagate(False)
+            ctk.CTkLabel(
+                hdr, text=label_text,
+                font=ctk.CTkFont(size=15, weight="bold"),
+                text_color="white",
+            ).pack(expand=True)
+
+            # Статус
+            status_lbl = self.label(card, "Ожидает генерации", size=12, color=MUTED)
+            status_lbl.pack(anchor="w", padx=12, pady=(0, 8))
+
+            # Прогресс-бар
+            pbar = ctk.CTkProgressBar(card, height=6, progress_color=color_accent)
+            pbar.set(0)
+            pbar.pack(fill="x", padx=12, pady=(0, 10))
+
+            # Кнопки управления — изначально скрыты
+            btn_row = ctk.CTkFrame(card, fg_color="transparent")
+            btn_row.pack(fill="x", padx=10, pady=(0, 10))
+
+            play_btn = self.button(btn_row, "▶ Слушать", lambda s=slot: _play(s),
+                                   color=BTN, hover=BTN_HOVER, width=110)
+            play_btn.pack(side="left", padx=(0, 6))
+            play_btn.configure(state="disabled")
+
+            save_btn = self.button(btn_row, "💾 Скачать", lambda s=slot: _save(s),
+                                   color=BTN_OK, hover=BTN_OK_HOVER, width=110)
+            save_btn.pack(side="left")
+            save_btn.configure(state="disabled")
+
+            regen_btn = self.button(btn_row, "🔄", lambda s=slot: _regen(s),
+                                    color=BTN_PRIMARY, hover=BTN_PRIMARY_HOVER, width=44)
+            regen_btn.pack(side="right")
+            regen_btn.configure(state="disabled")
+
+            slot_widgets[slot] = {
+                "status": status_lbl,
+                "pbar": pbar,
+                "play": play_btn,
+                "save": save_btn,
+                "regen": regen_btn,
+            }
+
+        # ── Логика ────────────────────────────────────────────────────────
+
+        def _play(slot):
+            p = state["temp_path"][slot]
+            if not p or not os.path.exists(p):
+                return
+            try:
+                if sys.platform == "darwin":
+                    subprocess.Popen(["afplay", p])
+                elif sys.platform == "win32":
+                    os.startfile(p)
+                else:
+                    subprocess.Popen(["xdg-open", p])
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось воспроизвести: {e}", parent=self)
+
+        def _save(slot):
+            p = state["temp_path"][slot]
+            if not p or not os.path.exists(p):
+                return
+            chosen = filedialog.askdirectory(
+                title=f"Сохранить вариант {slot}",
+                initialdir=_load_last_dir(),
+                parent=self,
+            )
+            if not chosen:
+                return
+            _save_last_dir(chosen)
+            dst = str(Path(chosen) / Path(p).name)
+            try:
+                shutil.copy2(p, dst)
+                slot_widgets[slot]["status"].configure(
+                    text=f"✓ Сохранено: {Path(dst).name}", text_color="#86efac")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}", parent=self)
+
+        def _regen(slot):
+            _cleanup_temp(slot)
+            w = slot_widgets[slot]
+            w["status"].configure(text="Ожидает генерации", text_color=MUTED)
+            w["pbar"].set(0)
+            w["play"].configure(state="disabled")
+            w["save"].configure(state="disabled")
+            w["regen"].configure(state="disabled")
+            _generate_slot(slot)
+
+        def _set_slot_generating(slot):
+            w = slot_widgets[slot]
+            w["status"].configure(text="Генерирую...", text_color=MUTED)
+            w["pbar"].set(0)
+            w["play"].configure(state="disabled")
+            w["save"].configure(state="disabled")
+            w["regen"].configure(state="disabled")
+
+        def _set_slot_done(slot, tmp_path):
+            state["temp_path"][slot] = tmp_path
+            w = slot_widgets[slot]
+            try:
+                dur = get_duration(tmp_path)
+                w["status"].configure(
+                    text=f"✓ Готово — {dur:.1f} сек", text_color="#86efac")
+            except Exception:
+                w["status"].configure(text="✓ Готово", text_color="#86efac")
+            w["pbar"].set(1.0)
+            w["play"].configure(state="normal")
+            w["save"].configure(state="normal")
+            w["regen"].configure(state="normal")
+            _check_both_done()
+
+        def _set_slot_error(slot, err):
+            w = slot_widgets[slot]
+            w["status"].configure(text=f"Ошибка: {str(err)[:60]}", text_color="#fca5a5")
+            w["pbar"].set(0)
+            w["regen"].configure(state="normal")
+            _check_both_done()
+
+        def _check_both_done():
+            # Разблокируем кнопку генерации когда оба слота завершились (успех или ошибка)
+            a_done = state["temp_path"]["A"] is not None or \
+                     slot_widgets["A"]["status"].cget("text").startswith("Ошибка")
+            b_done = state["temp_path"]["B"] is not None or \
+                     slot_widgets["B"]["status"].cget("text").startswith("Ошибка")
+            if a_done and b_done:
+                gen_btn.configure(state="normal", text="⚡ Сгенерировать A и B")
+                gen_status.configure(text="")
+
+        def _generate_slot(slot):
+            voice_value = voice_box.get("1.0", "end").strip()
+            full_text = text_box.get("1.0", "end").strip()
+
+            self.after(0, lambda s=slot: _set_slot_generating(s))
+
+            def run():
+                try:
+                    global ELEVENLABS_API_KEY
+                    ELEVENLABS_API_KEY = self.api_key
+
+                    if re.fullmatch(r"[A-Za-z0-9]{20}", voice_value):
+                        voice_id = voice_value
+                        vname = voice_value
+                    else:
+                        voice_id = self.fetch_voice_id_by_name(voice_value)
+                        vname = voice_value
+
+                    if not voice_id:
+                        self.after(0, lambda s=slot: _set_slot_error(
+                            s, "Голос не найден"))
+                        return
+
+                    eleven_text = full_text.replace("------", '[пауза 3 сек]')
+                    safe_vname = safe_name(vname or voice_id)
+                    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+                    tmp_dir = tempfile.mkdtemp()
+                    tmp_path = str(
+                        Path(tmp_dir) /
+                        f"{safe_vname}_{timestamp}_variant_{slot}.mp3"
+                    )
+
+                    text_to_speech_mp3(eleven_text, voice_id, tmp_path, self.log)
+                    self.after(0, lambda s=slot, p=tmp_path: _set_slot_done(s, p))
+
+                except Exception as e:
+                    err = str(e)
+                    self.after(0, lambda s=slot, er=err: _set_slot_error(s, er))
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def generate_both():
             if not self.api_key:
-                messagebox.showerror("Ошибка", "Сначала добавь ElevenLabs API key.", parent=self)
+                messagebox.showerror(
+                    "Ошибка", "Сначала добавь ElevenLabs API key.", parent=self)
                 return
             voice_value = voice_box.get("1.0", "end").strip()
             full_text = text_box.get("1.0", "end").strip()
@@ -2018,32 +2301,18 @@ class LipsyncTwoModeApp(ctk.CTk):
             if not full_text:
                 messagebox.showerror("Ошибка", "Введите текст.", parent=self)
                 return
-            try:
-                result_label.configure(text="Ищу голос...", text_color=MUTED)
-                self.update_idletasks()
-                if re.fullmatch(r"[A-Za-z0-9]{20}", voice_value):
-                    voice_id = voice_value
-                    voice_name = voice_value
-                else:
-                    voice_id = self.fetch_voice_id_by_name(voice_value)
-                    voice_name = voice_value
-                if not voice_id:
-                    result_label.configure(text="Голос с таким именем не найден.",
-                                           text_color="#fca5a5")
-                    return
-                result_label.configure(text="Генерирую full_voice.mp3...", text_color=MUTED)
-                self.update_idletasks()
-                path = generate_full_voice_to_desktop(
-                    self.api_key, voice_id, full_text, voice_name, self.log)
-                result_label.configure(text=f"✓ Готово: {path}", text_color="#86efac")
-                messagebox.showinfo("Готово", f"Голос сохранён:\n{path}", parent=self)
-            except Exception as e:
-                result_label.configure(text=f"Ошибка: {e}", text_color="#fca5a5")
-                messagebox.showerror("Ошибка", str(e), parent=self)
 
-        self.button(frame, "Сгенерировать mp3", generate_audio,
-                    color=BTN_OK, hover=BTN_OK_HOVER, width=220).pack(
-            anchor="e", padx=22, pady=(0, 20))
+            _cleanup_temp()
+            gen_btn.configure(state="disabled", text="Генерирую...")
+            gen_status.configure(text="Запускаю A и B параллельно...")
+
+            for slot in ["A", "B"]:
+                _generate_slot(slot)
+
+        gen_btn.configure(command=generate_both)
+
+        # Чистим temp файлы при уходе с панели
+        frame.bind("<Destroy>", lambda e: _cleanup_temp())
 
     def add_roll(self):
         roll = {
