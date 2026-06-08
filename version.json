@@ -3,5 +3,5 @@
   "release_notes": "Cookies браузера для YouTube, h264+AAC конвертация, убрана навязчивая проверка ключей при старте",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "c43ce4eb34a8d4c6a5ed57146662b8099cb3e5e68289183acb5330ea7ee22305"
+  "sha256": "e5ff5d70bd710ff0f13178c216d11d10b449cdd13553632330cc62905f71fe38"
 }

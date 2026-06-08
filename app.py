@@ -1003,17 +1003,22 @@ class LipsyncTwoModeApp(_BaseApp):
         btn_row.pack(fill="x", padx=20, pady=(0, 16))
 
         def do_update():
-            try:
-                self._download_and_replace(latest_version, expected_sha256, progress_label, win)
-            except Exception as e:
-                messagebox.showerror("Ошибка обновления", str(e), parent=win)
+            update_btn.configure(state="disabled")
+            def run():
+                try:
+                    self._download_and_replace(latest_version, expected_sha256, progress_label, win)
+                except Exception as e:
+                    self.after(0, lambda: messagebox.showerror("Ошибка обновления", str(e), parent=win))
+                    self.after(0, lambda: update_btn.configure(state="normal"))
+            threading.Thread(target=run, daemon=True).start()
 
         if not is_forced:
             self.button(btn_row, "Позже", win.destroy,
                         color=BTN, hover=BTN_HOVER, width=120).pack(side="right", padx=(8, 0))
 
-        self.button(btn_row, "Скачать обновление", do_update,
-                    color=BTN_OK, hover=BTN_OK_HOVER, width=220).pack(side="right")
+        update_btn = self.button(btn_row, "Скачать обновление", do_update,
+                                 color=BTN_OK, hover=BTN_OK_HOVER, width=220)
+        update_btn.pack(side="right")
 
         if is_forced:
             self.label(frame, "⚠ Это обязательное обновление.",
