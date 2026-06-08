@@ -48,7 +48,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -2247,51 +2247,6 @@ class LipsyncTwoModeApp(_BaseApp):
         frame = ctk.CTkFrame(outer, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="x", padx=20, pady=20)
 
-        # ── State ─────────────────────────────────────────────────────────
-        # state["temp_path"] — dict: {"A": path|None, "B": path|None}
-        state = {"temp_path": {"A": None, "B": None}, "proc": {"A": None, "B": None}}
-
-        def _cleanup_temp(slot=None):
-            slots = ["A", "B"] if slot is None else [slot]
-            for s in slots:
-                proc = state["proc"].get(s)
-                if proc and proc.poll() is None:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                state["proc"][s] = None
-                p = state["temp_path"][s]
-                if p and os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
-                state["temp_path"][s] = None
-
-        def _load_last_dir():
-            try:
-                if os.path.exists(CONFIG_PATH):
-                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                        d = json.load(f).get("voice_gen_last_dir", "")
-                    if d and os.path.isdir(d):
-                        return d
-            except Exception:
-                pass
-            return desktop_dir()
-
-        def _save_last_dir(path):
-            try:
-                data = {}
-                if os.path.exists(CONFIG_PATH):
-                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                data["voice_gen_last_dir"] = path
-                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-
         # ── Header ────────────────────────────────────────────────────────
         self.label(frame, "Сгенерировать full_voice.mp3", size=22, weight="bold").pack(
             anchor="w", padx=22, pady=(20, 4))
@@ -2334,90 +2289,21 @@ class LipsyncTwoModeApp(_BaseApp):
         )
         text_box.pack(fill="x", padx=22, pady=(6, 4))
         self._fix_paste(text_box)
+        tk_text = text_box._textbox  # внутренний tk.Text для тегов/биндингов
 
-        # ── Проверка текста в реальном времени ────────────────────────────
-        def check_text_errors(text):
-            import re as _re
-            errors = []
-            for line_idx, line in enumerate(text.split("\n")):
-                line_num = line_idx + 1
-                stripped = line.strip()
-                # Строки-разделители (только дефисы) — обрабатываем отдельно
-                if stripped and all(c == "-" for c in stripped):
-                    continue
-                # 1. Двойные пробелы
-                for m in _re.finditer(r"  +", line):
-                    errors.append({"line": line_num, "col": m.start(), "col_end": m.end()})
-                # 2. Пробел перед знаком препинания
-                for m in _re.finditer(r" +([,\.!?])", line):
-                    errors.append({"line": line_num, "col": m.start(), "col_end": m.end()})
-                # 3. Нет пробела после знака препинания (кроме конца строки)
-                for m in _re.finditer(r"[,!?](?=[^\s\n\"\')\]…—\-])", line):
-                    errors.append({"line": line_num, "col": m.start(), "col_end": m.end()})
-                # 4. Двойные знаки препинания
-                for m in _re.finditer(r"([?!,\.])\1+", line):
-                    errors.append({"line": line_num, "col": m.start(), "col_end": m.end()})
-                # 5. Строчная буква после конца предложения
-                for m in _re.finditer(r"[\.!?]\s+([а-яa-z])", line):
-                    errors.append({"line": line_num, "col": m.start(1), "col_end": m.start(1) + 1})
-            return errors
-
-        text_box.tag_config("error", underline=True, foreground="#ff4444")
-        text_box.tag_config("separator", foreground="#fcd34d",
-                            font=ctk.CTkFont(size=14, weight="bold"))
-
-        text_status = self.label(frame, "0 символов", size=12, color=MUTED)
-        text_status.pack(anchor="w", padx=22, pady=(0, 10))
-
-        _check_timer = {"id": None}
-
-        def _do_check():
-            _check_timer["id"] = None
-            raw = text_box.get("1.0", "end")
-            text = raw.rstrip("\n")
-            char_count = len(text)
-
-            text_box.tag_remove("error", "1.0", "end")
-            text_box.tag_remove("separator", "1.0", "end")
-
-            errors = check_text_errors(text)
-            for e in errors:
-                text_box.tag_add("error", f"{e['line']}.{e['col']}", f"{e['line']}.{e['col_end']}")
-
-            for line_idx, line in enumerate(text.split("\n")):
-                stripped = line.strip()
-                if stripped and all(c == "-" for c in stripped):
-                    col_start = line.index("-")
-                    col_end = col_start + len(stripped)
-                    tag = "separator" if stripped == "------" else "error"
-                    text_box.tag_add(tag,
-                                     f"{line_idx + 1}.{col_start}",
-                                     f"{line_idx + 1}.{col_end}")
-
-            n = len(errors)
-            if n == 0:
-                text_status.configure(
-                    text=f"{char_count} символов · ✓ Текст готов к озвучке",
-                    text_color="#86efac")
-            else:
-                word = "ошибка" if n == 1 else "ошибки" if 2 <= n <= 4 else "ошибок"
-                text_status.configure(
-                    text=f"{char_count} символов · ⚠ {n} {word} в тексте",
-                    text_color="#fcd34d")
-
-        def _on_key_release(event=None):
-            if _check_timer["id"] is not None:
-                self.after_cancel(_check_timer["id"])
-            _check_timer["id"] = self.after(300, _do_check)
-
-        text_box.bind("<KeyRelease>", _on_key_release)
+        # ── Счётчик символов ──────────────────────────────────────────────
+        status_text_label = ctk.CTkLabel(
+            frame, text="0 символов",
+            font=ctk.CTkFont(size=12), text_color=MUTED, anchor="w"
+        )
+        status_text_label.pack(anchor="w", padx=22, pady=(0, 8))
 
         # ── Кнопка запуска ────────────────────────────────────────────────
         gen_row = ctk.CTkFrame(frame, fg_color="transparent")
         gen_row.pack(fill="x", padx=22, pady=(0, 16))
 
         gen_btn = self.button(gen_row, "⚡ Сгенерировать A и B",
-                              lambda: None,  # команда назначается ниже
+                              lambda: None,
                               color=BTN_OK, hover=BTN_OK_HOVER, width=240)
         gen_btn.pack(side="left")
 
@@ -2427,37 +2313,31 @@ class LipsyncTwoModeApp(_BaseApp):
         # ── A/B карточки ──────────────────────────────────────────────────
         ab_row = ctk.CTkFrame(frame, fg_color="transparent")
         ab_row.pack(fill="x", padx=22, pady=(0, 20))
+        ab_row.columnconfigure(0, weight=1)
+        ab_row.columnconfigure(1, weight=1)
 
-        slot_widgets = {}  # "A" и "B" → dict с виджетами
+        state = {"temp_path": {"A": None, "B": None}}
+        slot_widgets = {}
 
         for col, slot in enumerate(["A", "B"]):
             color_accent = "#1c7ed6" if slot == "A" else "#7950f2"
-            label_text = f"Вариант {slot}"
-
             card = ctk.CTkFrame(ab_row, fg_color=CARD, corner_radius=16)
-            card.pack(side="left", fill="both", expand=True,
-                      padx=(0 if col == 0 else 8, 0))
+            card.grid(row=0, column=col, padx=(0 if col == 0 else 8, 0), sticky="nsew")
 
-            # Заголовок карточки
             hdr = ctk.CTkFrame(card, fg_color=color_accent, corner_radius=10, height=36)
             hdr.pack(fill="x", padx=10, pady=(10, 8))
             hdr.pack_propagate(False)
-            ctk.CTkLabel(
-                hdr, text=label_text,
-                font=ctk.CTkFont(size=15, weight="bold"),
-                text_color="white",
-            ).pack(expand=True)
+            ctk.CTkLabel(hdr, text=f"Вариант {slot}",
+                         font=ctk.CTkFont(size=15, weight="bold"),
+                         text_color="white").pack(expand=True)
 
-            # Статус
             status_lbl = self.label(card, "Ожидает генерации", size=12, color=MUTED)
             status_lbl.pack(anchor="w", padx=12, pady=(0, 8))
 
-            # Прогресс-бар
             pbar = ctk.CTkProgressBar(card, height=6, progress_color=color_accent)
             pbar.set(0)
             pbar.pack(fill="x", padx=12, pady=(0, 10))
 
-            # Кнопки управления — изначально скрыты
             btn_row = ctk.CTkFrame(card, fg_color="transparent")
             btn_row.pack(fill="x", padx=10, pady=(0, 10))
 
@@ -2471,8 +2351,8 @@ class LipsyncTwoModeApp(_BaseApp):
             save_btn.pack(side="left")
             save_btn.configure(state="disabled")
 
-            stop_btn = self.button(btn_row, "⏹ Стоп", lambda s=slot: _stop_slot(s),
-                                   color=BTN_DANGER, hover=BTN_DANGER_HOVER, width=80)
+            stop_btn = self.button(btn_row, "⏹", lambda s=slot: _stop(s),
+                                   color=BTN_DANGER, hover=BTN_DANGER_HOVER, width=44)
             stop_btn.pack(side="right")
             stop_btn.configure(state="disabled")
 
@@ -2485,52 +2365,40 @@ class LipsyncTwoModeApp(_BaseApp):
             }
 
         # ── Логика ────────────────────────────────────────────────────────
+        procs = {"A": None, "B": None}
 
-        def _on_play_done(slot):
-            state["proc"][slot] = None
-            w = slot_widgets[slot]
-            w["play"].configure(state="normal")
-            w["stop"].configure(state="disabled")
-
-        def _stop_slot(slot):
-            proc = state["proc"][slot]
-            if proc:
+        def _stop(slot):
+            p = procs[slot]
+            if p and p.poll() is None:
                 try:
-                    proc.terminate()
+                    p.terminate()
                 except Exception:
                     pass
-            _on_play_done(slot)
+            procs[slot] = None
+            slot_widgets[slot]["play"].configure(state="normal")
+            slot_widgets[slot]["stop"].configure(state="disabled")
 
         def _play(slot):
             p = state["temp_path"][slot]
             if not p or not os.path.exists(p):
                 return
-            proc = state["proc"][slot]
-            if proc and proc.poll() is None:
-                proc.terminate()
-            state["proc"][slot] = None
-            w = slot_widgets[slot]
+            _stop(slot)
             try:
                 if sys.platform == "darwin":
-                    new_proc = subprocess.Popen(["afplay", p])
-                    state["proc"][slot] = new_proc
-                    w["play"].configure(state="disabled")
-                    w["stop"].configure(state="normal")
-                    def _monitor(s=slot, pr=new_proc):
-                        pr.wait()
-                        self.after(0, lambda: _on_play_done(s))
-                    threading.Thread(target=_monitor, daemon=True).start()
+                    proc = subprocess.Popen(["afplay", p])
                 elif sys.platform == "win32":
                     os.startfile(p)
+                    return
                 else:
-                    new_proc = subprocess.Popen(["xdg-open", p])
-                    state["proc"][slot] = new_proc
-                    w["play"].configure(state="disabled")
-                    w["stop"].configure(state="normal")
-                    def _monitor(s=slot, pr=new_proc):
-                        pr.wait()
-                        self.after(0, lambda: _on_play_done(s))
-                    threading.Thread(target=_monitor, daemon=True).start()
+                    proc = subprocess.Popen(["xdg-open", p])
+                procs[slot] = proc
+                slot_widgets[slot]["play"].configure(state="disabled")
+                slot_widgets[slot]["stop"].configure(state="normal")
+                def watch(s=slot, pr=proc):
+                    pr.wait()
+                    self.after(0, lambda: slot_widgets[s]["play"].configure(state="normal"))
+                    self.after(0, lambda: slot_widgets[s]["stop"].configure(state="disabled"))
+                threading.Thread(target=watch, daemon=True).start()
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось воспроизвести: {e}", parent=self)
 
@@ -2538,14 +2406,9 @@ class LipsyncTwoModeApp(_BaseApp):
             p = state["temp_path"][slot]
             if not p or not os.path.exists(p):
                 return
-            chosen = filedialog.askdirectory(
-                title=f"Сохранить вариант {slot}",
-                initialdir=_load_last_dir(),
-                parent=self,
-            )
+            chosen = filedialog.askdirectory(title=f"Сохранить вариант {slot}", parent=self)
             if not chosen:
                 return
-            _save_last_dir(chosen)
             dst = str(Path(chosen) / Path(p).name)
             try:
                 shutil.copy2(p, dst)
@@ -2567,29 +2430,25 @@ class LipsyncTwoModeApp(_BaseApp):
             w = slot_widgets[slot]
             try:
                 dur = get_duration(tmp_path)
-                w["status"].configure(
-                    text=f"✓ Готово — {dur:.1f} сек", text_color="#86efac")
+                w["status"].configure(text=f"✓ Готово — {dur:.1f} сек", text_color="#86efac")
             except Exception:
                 w["status"].configure(text="✓ Готово", text_color="#86efac")
             w["pbar"].set(1.0)
             w["play"].configure(state="normal")
             w["save"].configure(state="normal")
-            w["stop"].configure(state="disabled")
             _check_both_done()
 
         def _set_slot_error(slot, err):
             w = slot_widgets[slot]
             w["status"].configure(text=f"Ошибка: {str(err)[:60]}", text_color="#fca5a5")
             w["pbar"].set(0)
-            w["stop"].configure(state="disabled")
             _check_both_done()
 
         def _check_both_done():
-            # Разблокируем кнопку генерации когда оба слота завершились (успех или ошибка)
             a_done = state["temp_path"]["A"] is not None or \
-                     slot_widgets["A"]["status"].cget("text").startswith("Ошибка")
+                     "Ошибка" in slot_widgets["A"]["status"].cget("text")
             b_done = state["temp_path"]["B"] is not None or \
-                     slot_widgets["B"]["status"].cget("text").startswith("Ошибка")
+                     "Ошибка" in slot_widgets["B"]["status"].cget("text")
             if a_done and b_done:
                 gen_btn.configure(state="normal", text="⚡ Сгенерировать A и B")
                 gen_status.configure(text="")
@@ -2597,38 +2456,28 @@ class LipsyncTwoModeApp(_BaseApp):
         def _generate_slot(slot):
             voice_value = voice_box.get("1.0", "end").strip()
             full_text = text_box.get("1.0", "end").strip()
-
             self.after(0, lambda s=slot: _set_slot_generating(s))
 
             def run():
                 try:
                     global ELEVENLABS_API_KEY
                     ELEVENLABS_API_KEY = self.api_key
-
                     if re.fullmatch(r"[A-Za-z0-9]{20}", voice_value):
                         voice_id = voice_value
                         vname = voice_value
                     else:
                         voice_id = self.fetch_voice_id_by_name(voice_value)
                         vname = voice_value
-
                     if not voice_id:
-                        self.after(0, lambda s=slot: _set_slot_error(
-                            s, "Голос не найден"))
+                        self.after(0, lambda s=slot: _set_slot_error(s, "Голос не найден"))
                         return
-
                     eleven_text = full_text.replace("------", '[пауза 3 сек]')
                     safe_vname = safe_name(vname or voice_id)
                     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
                     tmp_dir = tempfile.mkdtemp()
-                    tmp_path = str(
-                        Path(tmp_dir) /
-                        f"{safe_vname}_{timestamp}_variant_{slot}.mp3"
-                    )
-
+                    tmp_path = str(Path(tmp_dir) / f"{safe_vname}_{timestamp}_variant_{slot}.mp3")
                     text_to_speech_mp3(eleven_text, voice_id, tmp_path, self.log)
                     self.after(0, lambda s=slot, p=tmp_path: _set_slot_done(s, p))
-
                 except Exception as e:
                     err = str(e)
                     self.after(0, lambda s=slot, er=err: _set_slot_error(s, er))
@@ -2637,29 +2486,128 @@ class LipsyncTwoModeApp(_BaseApp):
 
         def generate_both():
             if not self.api_key:
-                messagebox.showerror(
-                    "Ошибка", "Сначала добавь ElevenLabs API key.", parent=self)
+                messagebox.showerror("Ошибка", "Сначала добавь ElevenLabs API key.", parent=self)
                 return
-            voice_value = voice_box.get("1.0", "end").strip()
-            full_text = text_box.get("1.0", "end").strip()
-            if not voice_value:
+            if not voice_box.get("1.0", "end").strip():
                 messagebox.showerror("Ошибка", "Введите voice_id или имя голоса.", parent=self)
                 return
-            if not full_text:
+            if not text_box.get("1.0", "end").strip():
                 messagebox.showerror("Ошибка", "Введите текст.", parent=self)
                 return
-
-            _cleanup_temp()
+            for s in ["A", "B"]:
+                state["temp_path"][s] = None
             gen_btn.configure(state="disabled", text="Генерирую...")
             gen_status.configure(text="Запускаю A и B параллельно...")
-
             for slot in ["A", "B"]:
                 _generate_slot(slot)
 
         gen_btn.configure(command=generate_both)
 
-        # Чистим temp файлы при уходе с панели
-        frame.bind("<Destroy>", lambda e: _cleanup_temp())
+        def _update_status(*args):
+            try:
+                tk_text.edit_modified(False)
+            except Exception:
+                pass
+            text = text_box.get("1.0", "end").strip()
+            chars = len(text)
+
+            tk_text.tag_remove("error", "1.0", "end")
+            tk_text.tag_remove("separator_ok", "1.0", "end")
+            tk_text.tag_remove("separator_bad", "1.0", "end")
+
+            tk_text.tag_config("error", underline=True, foreground="#ff4444")
+            tk_text.tag_config("separator_ok", foreground="#fcd34d", font=ctk.CTkFont(size=14, weight="bold"))
+            tk_text.tag_config("separator_bad", foreground="#ff4444", underline=True)
+
+            errors = 0
+            lines = text_box.get("1.0", "end").split("\n")
+
+            for line_idx, line in enumerate(lines):
+                line_num = line_idx + 1
+
+                for m in re.finditer(r'  +', line):
+                    tk_text.tag_add("error", f"{line_num}.{m.start()}", f"{line_num}.{m.end()}")
+                    errors += 1
+
+                for m in re.finditer(r' [,\.!?]', line):
+                    tk_text.tag_add("error", f"{line_num}.{m.start()}", f"{line_num}.{m.end()}")
+                    errors += 1
+
+                for m in re.finditer(r'[!?]{2,}|\.{4,}|,{2,}', line):
+                    tk_text.tag_add("error", f"{line_num}.{m.start()}", f"{line_num}.{m.end()}")
+                    errors += 1
+
+                for m in re.finditer(r'-{2,}', line):
+                    matched = m.group()
+                    if matched == "------":
+                        tk_text.tag_add("separator_ok", f"{line_num}.{m.start()}", f"{line_num}.{m.end()}")
+                    else:
+                        tk_text.tag_add("separator_bad", f"{line_num}.{m.start()}", f"{line_num}.{m.end()}")
+                        errors += 1
+
+            if errors == 0:
+                status_text_label.configure(
+                    text=f"✓ {chars} символов — текст готов к озвучке",
+                    text_color="#86efac")
+            else:
+                status_text_label.configure(
+                    text=f"⚠ {chars} символов · {errors} ошибок",
+                    text_color="#fcd34d")
+
+        def check_spelling(text):
+            try:
+                res = requests.post(
+                    "https://api.languagetool.org/v2/check",
+                    data={"text": text, "language": "auto"},
+                    timeout=5,
+                )
+                if res.status_code != 200:
+                    return []
+                matches = res.json().get("matches", [])
+                return [
+                    {
+                        "offset": m["offset"],
+                        "length": m["length"],
+                        "message": m["message"],
+                        "type": m["rule"]["issueType"],
+                    }
+                    for m in matches
+                    if m["rule"]["issueType"] in ("misspelling", "grammar")
+                ]
+            except Exception:
+                return []
+
+        spell_timer = {"id": None}
+
+        def _schedule_spell_check(*args):
+            if spell_timer["id"]:
+                frame.after_cancel(spell_timer["id"])
+            spell_timer["id"] = frame.after(800, _run_spell_check)
+
+        def _run_spell_check():
+            text = text_box.get("1.0", "end")
+            def run():
+                matches = check_spelling(text)
+                self.after(0, lambda m=matches: _apply_spell_tags(m))
+            threading.Thread(target=run, daemon=True).start()
+
+        def _apply_spell_tags(matches):
+            tk_text.tag_remove("spell_error", "1.0", "end")
+            tk_text.tag_config("spell_error", underline=True, foreground="#ff6b6b")
+            for m in matches:
+                start_idx = tk_text.index(f"1.0 + {m['offset']} chars")
+                end_idx = tk_text.index(f"1.0 + {m['offset'] + m['length']} chars")
+                tk_text.tag_add("spell_error", start_idx, end_idx)
+
+        tk_text.bind("<KeyRelease>", lambda e: (
+            self.after(100, _update_status),
+            _schedule_spell_check(),
+        ))
+        tk_text.bind("<<Modified>>", lambda e: self.after(100, _update_status))
+        tk_text.bind("<ButtonRelease>", lambda e: self.after(100, _update_status))
+        frame.bind("<Destroy>", lambda e: [
+            state["temp_path"].update({"A": None, "B": None})
+        ])
 
     def show_subtitles_panel(self):
         scroll = self._start_panel("subtitles")

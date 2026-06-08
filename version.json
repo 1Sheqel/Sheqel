@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.1.0",
-  "release_notes": "Проверка текста в реальном времени, исправлен скролл панели генерации голоса, кнопки A/B теперь видны",
+  "latest_version": "1.1.1",
+  "release_notes": "Проверка орфографии в реальном времени через LanguageTool, подсветка ошибок в тексте",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "47993237ca722b0bc786dfe6efe7bebac099917c935eb0b0df4ae654d6519526"
+  "sha256": "c59bac6b04ba41a619e6570c9a8fab342201fa83b09ad08a9fff9b0d5de8326d"
 }
