@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.0.8",
-  "release_notes": "A/B сравнение голосов в генераторе — два варианта параллельно, прослушай и скачай лучший",
+  "latest_version": "1.0.9",
+  "release_notes": "Cookies браузера для YouTube, h264+AAC конвертация, убрана навязчивая проверка ключей при старте",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "673a8d3d440391ed79d4e2a9a7f7ce996bd293b3681ae1d356cf92934b846f18"
+  "sha256": "c43ce4eb34a8d4c6a5ed57146662b8099cb3e5e68289183acb5330ea7ee22305"
 }
