@@ -48,7 +48,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.1.0"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -2243,9 +2243,9 @@ class LipsyncTwoModeApp(_BaseApp):
    
 
     def show_voice_gen_panel(self):
-        scroll = self._start_panel("voice_gen")
-        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
-        frame.pack(fill="both", expand=True, padx=20, pady=20)
+        outer = self._start_panel("voice_gen")
+        frame = ctk.CTkFrame(outer, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="x", padx=20, pady=20)
 
         # ── State ─────────────────────────────────────────────────────────
         # state["temp_path"] — dict: {"A": path|None, "B": path|None}
@@ -2332,8 +2332,85 @@ class LipsyncTwoModeApp(_BaseApp):
             border_width=1, border_color="#737373",
             corner_radius=10, font=ctk.CTkFont(size=14), wrap="word",
         )
-        text_box.pack(fill="x", padx=22, pady=(6, 14))
+        text_box.pack(fill="x", padx=22, pady=(6, 4))
         self._fix_paste(text_box)
+
+        # ── Проверка текста в реальном времени ────────────────────────────
+        def check_text_errors(text):
+            import re as _re
+            errors = []
+            for line_idx, line in enumerate(text.split("\n")):
+                line_num = line_idx + 1
+                stripped = line.strip()
+                # Строки-разделители (только дефисы) — обрабатываем отдельно
+                if stripped and all(c == "-" for c in stripped):
+                    continue
+                # 1. Двойные пробелы
+                for m in _re.finditer(r"  +", line):
+                    errors.append({"line": line_num, "col": m.start(), "col_end": m.end()})
+                # 2. Пробел перед знаком препинания
+                for m in _re.finditer(r" +([,\.!?])", line):
+                    errors.append({"line": line_num, "col": m.start(), "col_end": m.end()})
+                # 3. Нет пробела после знака препинания (кроме конца строки)
+                for m in _re.finditer(r"[,!?](?=[^\s\n\"\')\]…—\-])", line):
+                    errors.append({"line": line_num, "col": m.start(), "col_end": m.end()})
+                # 4. Двойные знаки препинания
+                for m in _re.finditer(r"([?!,\.])\1+", line):
+                    errors.append({"line": line_num, "col": m.start(), "col_end": m.end()})
+                # 5. Строчная буква после конца предложения
+                for m in _re.finditer(r"[\.!?]\s+([а-яa-z])", line):
+                    errors.append({"line": line_num, "col": m.start(1), "col_end": m.start(1) + 1})
+            return errors
+
+        text_box.tag_config("error", underline=True, foreground="#ff4444")
+        text_box.tag_config("separator", foreground="#fcd34d",
+                            font=ctk.CTkFont(size=14, weight="bold"))
+
+        text_status = self.label(frame, "0 символов", size=12, color=MUTED)
+        text_status.pack(anchor="w", padx=22, pady=(0, 10))
+
+        _check_timer = {"id": None}
+
+        def _do_check():
+            _check_timer["id"] = None
+            raw = text_box.get("1.0", "end")
+            text = raw.rstrip("\n")
+            char_count = len(text)
+
+            text_box.tag_remove("error", "1.0", "end")
+            text_box.tag_remove("separator", "1.0", "end")
+
+            errors = check_text_errors(text)
+            for e in errors:
+                text_box.tag_add("error", f"{e['line']}.{e['col']}", f"{e['line']}.{e['col_end']}")
+
+            for line_idx, line in enumerate(text.split("\n")):
+                stripped = line.strip()
+                if stripped and all(c == "-" for c in stripped):
+                    col_start = line.index("-")
+                    col_end = col_start + len(stripped)
+                    tag = "separator" if stripped == "------" else "error"
+                    text_box.tag_add(tag,
+                                     f"{line_idx + 1}.{col_start}",
+                                     f"{line_idx + 1}.{col_end}")
+
+            n = len(errors)
+            if n == 0:
+                text_status.configure(
+                    text=f"{char_count} символов · ✓ Текст готов к озвучке",
+                    text_color="#86efac")
+            else:
+                word = "ошибка" if n == 1 else "ошибки" if 2 <= n <= 4 else "ошибок"
+                text_status.configure(
+                    text=f"{char_count} символов · ⚠ {n} {word} в тексте",
+                    text_color="#fcd34d")
+
+        def _on_key_release(event=None):
+            if _check_timer["id"] is not None:
+                self.after_cancel(_check_timer["id"])
+            _check_timer["id"] = self.after(300, _do_check)
+
+        text_box.bind("<KeyRelease>", _on_key_release)
 
         # ── Кнопка запуска ────────────────────────────────────────────────
         gen_row = ctk.CTkFrame(frame, fg_color="transparent")
@@ -2350,8 +2427,6 @@ class LipsyncTwoModeApp(_BaseApp):
         # ── A/B карточки ──────────────────────────────────────────────────
         ab_row = ctk.CTkFrame(frame, fg_color="transparent")
         ab_row.pack(fill="x", padx=22, pady=(0, 20))
-        ab_row.columnconfigure(0, weight=1)
-        ab_row.columnconfigure(1, weight=1)
 
         slot_widgets = {}  # "A" и "B" → dict с виджетами
 
@@ -2360,7 +2435,8 @@ class LipsyncTwoModeApp(_BaseApp):
             label_text = f"Вариант {slot}"
 
             card = ctk.CTkFrame(ab_row, fg_color=CARD, corner_radius=16)
-            card.grid(row=0, column=col, padx=(0 if col == 0 else 8, 0), sticky="nsew")
+            card.pack(side="left", fill="both", expand=True,
+                      padx=(0 if col == 0 else 8, 0))
 
             # Заголовок карточки
             hdr = ctk.CTkFrame(card, fg_color=color_accent, corner_radius=10, height=36)
