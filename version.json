@@ -3,5 +3,5 @@
   "release_notes": "Клонирование голоса из видео: выбор видеофайла как источника (mp4/mov/avi/mkv/webm), автоматическое извлечение аудио через ffmpeg, опциональная очистка голоса от музыки и фона через audio-separator",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "fab95fab13c2fd6901d73f1d388403ff165edfbe85eb069ed5ead7c817923aa7"
+  "sha256": "1a52e3782ca40caa82db2dcf6ba0877f0db3f05d0bb9f523dbdad70a22be037c"
 }
