@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.1.1",
-  "release_notes": "Проверка орфографии в реальном времени через LanguageTool, подсветка ошибок в тексте",
+  "latest_version": "1.1.2",
+  "release_notes": "Клонирование голоса из видео: выбор видеофайла как источника (mp4/mov/avi/mkv/webm), автоматическое извлечение аудио через ffmpeg, опциональная очистка голоса от музыки и фона через audio-separator",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "c59bac6b04ba41a619e6570c9a8fab342201fa83b09ad08a9fff9b0d5de8326d"
+  "sha256": "fab95fab13c2fd6901d73f1d388403ff165edfbe85eb069ed5ead7c817923aa7"
 }
