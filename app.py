@@ -873,6 +873,13 @@ except ImportError:
 _BaseApp = TkinterDnD.Tk if HAS_DND else ctk.CTk
 
 
+def delete_elevenlabs_voice(voice_id, api_key):
+    url = f"{ELEVEN_BASE_URL}/v1/voices/{voice_id}"
+    headers = {"xi-api-key": api_key}
+    res = requests.delete(url, headers=headers, timeout=30)
+    return res.status_code in [200, 204]
+
+
 class LipsyncTwoModeApp(_BaseApp):
     def __init__(self):
         super().__init__()
@@ -911,6 +918,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.cloudinary_api_secret = ""
         self.preview_process = None
         self.preview_voice_id = None
+        self.voice_expiry_list = []
         self.build_ui()
         self.add_roll()
         self.poll_logs()
@@ -918,6 +926,8 @@ class LipsyncTwoModeApp(_BaseApp):
         self.update_status()
         self.after(3000, lambda: self.check_for_updates(silent=True))
         self.after(500, self._check_just_updated)
+        self.after(2000, self._cleanup_expired_voices_on_start)
+        threading.Thread(target=self._voice_expiry_watcher, daemon=True).start()
 
 
     def _reopen_window(self):
@@ -1648,6 +1658,26 @@ class LipsyncTwoModeApp(_BaseApp):
             size=13, color=MUTED,
         ).pack(anchor="w", padx=22, pady=(0, 16))
 
+        # ── Переключатель источника ────────────────────────────────────────
+        source_var = ctk.StringVar(value="audio")
+        source_row = ctk.CTkFrame(frame, fg_color=CARD, corner_radius=12)
+        source_row.pack(fill="x", padx=22, pady=(0, 16))
+
+        audio_btn = ctk.CTkButton(
+            source_row, text="🎵 Аудио файл",
+            fg_color=BTN_OK, hover_color=BTN_OK_HOVER,
+            font=ctk.CTkFont(size=13), height=36, corner_radius=10,
+        )
+        audio_btn.pack(side="left", padx=(8, 4), pady=8, expand=True, fill="x")
+
+        video_btn = ctk.CTkButton(
+            source_row, text="🎬 Видео файл",
+            fg_color=BTN, hover_color=BTN_HOVER,
+            font=ctk.CTkFont(size=13), height=36, corner_radius=10,
+        )
+        video_btn.pack(side="left", padx=(4, 8), pady=8, expand=True, fill="x")
+
+        # ── Имя и описание ─────────────────────────────────────────────────
         self.label(frame, "Имя голоса", size=14, weight="bold").pack(anchor="w", padx=22)
         name_entry = ctk.CTkEntry(
             frame, placeholder_text="например: Иван — диктор",
@@ -1666,21 +1696,26 @@ class LipsyncTwoModeApp(_BaseApp):
         desc_entry.pack(fill="x", padx=22, pady=(6, 14))
         self._fix_paste(desc_entry)
 
-        self.label(frame, "Аудио-сэмпл", size=14, weight="bold").pack(anchor="w", padx=22)
-        file_row = ctk.CTkFrame(frame, fg_color=PANEL)
-        file_row.pack(fill="x", padx=22, pady=(6, 14))
+        selected = {"path": ""}
+        extracted = {"tmp_dir": None}
+        extracting = {"active": False}
 
-        file_label = ctk.CTkLabel(
-            file_row, text="  не выбран",
+        # ── Аудио блок ─────────────────────────────────────────────────────
+        audio_block = ctk.CTkFrame(frame, fg_color="transparent")
+
+        self.label(audio_block, "Аудио-сэмпл", size=14, weight="bold").pack(anchor="w")
+        audio_file_row = ctk.CTkFrame(audio_block, fg_color=PANEL)
+        audio_file_row.pack(fill="x", pady=(6, 0))
+
+        audio_file_label = ctk.CTkLabel(
+            audio_file_row, text="  не выбран",
             fg_color="#f5f5f5", text_color="#888",
             anchor="w", corner_radius=6,
             font=ctk.CTkFont(size=12), height=32,
         )
-        file_label.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
+        audio_file_label.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
 
-        selected = {"path": ""}
-
-        def choose_file():
+        def choose_audio():
             f = filedialog.askopenfilename(
                 parent=self, title="Выбери аудио-сэмпл",
                 filetypes=[("Аудио", "*.mp3 *.wav *.m4a *.flac *.ogg"), ("Все файлы", "*.*")],
@@ -1689,13 +1724,120 @@ class LipsyncTwoModeApp(_BaseApp):
                 selected["path"] = f
                 try:
                     size_mb = os.path.getsize(f) / (1024 * 1024)
-                    file_label.configure(
+                    audio_file_label.configure(
                         text=f"  {Path(f).name}  ({size_mb:.1f} МБ)", text_color="#111")
                 except Exception:
-                    file_label.configure(text=f"  {Path(f).name}", text_color="#111")
+                    audio_file_label.configure(text=f"  {Path(f).name}", text_color="#111")
 
-        self.button(file_row, "Выбрать файл", choose_file,
+        self.button(audio_file_row, "Выбрать файл", choose_audio,
                     color=BTN, hover=BTN_HOVER, width=130).pack(side="right")
+
+        # ── Видео блок ─────────────────────────────────────────────────────
+        video_block = ctk.CTkFrame(frame, fg_color="transparent")
+
+        self.label(video_block, "Видео файл", size=14, weight="bold").pack(anchor="w")
+        video_file_row = ctk.CTkFrame(video_block, fg_color=PANEL)
+        video_file_row.pack(fill="x", pady=(6, 0))
+
+        video_file_label = ctk.CTkLabel(
+            video_file_row, text="  не выбран",
+            fg_color="#f5f5f5", text_color="#888",
+            anchor="w", corner_radius=6,
+            font=ctk.CTkFont(size=12), height=32,
+        )
+        video_file_label.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
+
+        clean_voice_var = ctk.BooleanVar(value=True)
+        extract_status_label = self.label(
+            video_block,
+            "Выбери видео — аудио будет извлечено автоматически",
+            size=12, color=MUTED,
+        )
+        extract_status_label.pack(anchor="w", pady=(8, 0))
+
+        def _cleanup_extracted():
+            if extracted["tmp_dir"]:
+                shutil.rmtree(extracted["tmp_dir"], ignore_errors=True)
+                extracted["tmp_dir"] = None
+
+        def extract_audio_from_video(video_path, clean):
+            tmp_dir = tempfile.mkdtemp()
+            extracted["tmp_dir"] = tmp_dir
+            raw_audio = str(Path(tmp_dir) / "extracted.mp3")
+            run([ffmpeg_bin(), "-y", "-i", video_path,
+                 "-vn", "-ar", "44100", "-ac", "1", "-q:a", "0", raw_audio])
+            if clean:
+                vocals_out = str(Path(tmp_dir) / "vocals.mp3")
+                def log_fn(msg): self.log(msg)
+                _separate_vocals(raw_audio, vocals_out, log_fn)
+                return vocals_out
+            return raw_audio
+
+        def choose_video():
+            f = filedialog.askopenfilename(
+                parent=self, title="Выбери видео файл",
+                filetypes=[("Видео", "*.mp4 *.mov *.MOV *.avi *.mkv *.webm"), ("Все файлы", "*.*")],
+            )
+            if not f:
+                return
+            selected["path"] = ""
+            video_file_label.configure(text=f"  {Path(f).name}", text_color="#111")
+            extract_status_label.configure(text="Извлекаю аудио...", text_color=MUTED)
+            clone_btn_ref[0].configure(state="disabled")
+            extracting["active"] = True
+
+            def worker():
+                try:
+                    out_path = extract_audio_from_video(f, clean_voice_var.get())
+                    dur = get_duration(out_path)
+                    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+                    selected["path"] = out_path
+                    self.after(0, lambda: extract_status_label.configure(
+                        text=f"✓ Аудио извлечено: {dur:.1f} сек · {size_mb:.1f} МБ",
+                        text_color="#86efac",
+                    ))
+                except Exception as e:
+                    self.after(0, lambda err=e: extract_status_label.configure(
+                        text=f"Ошибка извлечения: {err}",
+                        text_color="#fca5a5",
+                    ))
+                finally:
+                    extracting["active"] = False
+                    self.after(0, lambda: clone_btn_ref[0].configure(state="normal"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        self.button(video_file_row, "Выбрать файл", choose_video,
+                    color=BTN, hover=BTN_HOVER, width=130).pack(side="right")
+
+        ctk.CTkCheckBox(
+            video_block,
+            text="Очистить голос (убрать музыку и фон)",
+            variable=clean_voice_var,
+            text_color=TEXT, fg_color=BTN_PRIMARY,
+            font=ctk.CTkFont(size=13),
+        ).pack(anchor="w", pady=(10, 0))
+
+        # ── Переключение блоков ────────────────────────────────────────────
+        def switch_source(mode):
+            source_var.set(mode)
+            if mode == "audio":
+                video_block.pack_forget()
+                audio_block.pack(fill="x", padx=22, pady=(0, 14))
+                audio_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
+                video_btn.configure(fg_color=BTN, hover_color=BTN_HOVER)
+            else:
+                audio_block.pack_forget()
+                video_block.pack(fill="x", padx=22, pady=(0, 14))
+                video_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
+                audio_btn.configure(fg_color=BTN, hover_color=BTN_HOVER)
+            selected["path"] = ""
+
+        audio_btn.configure(command=lambda: switch_source("audio"))
+        video_btn.configure(command=lambda: switch_source("video"))
+
+        # Показываем аудио блок по умолчанию
+        audio_block.pack(fill="x", padx=22, pady=(0, 14))
 
         result_label = self.label(frame, "", size=12, color=MUTED)
         result_label.pack(anchor="w", padx=22, pady=(0, 8))
@@ -1715,8 +1857,18 @@ class LipsyncTwoModeApp(_BaseApp):
                 result_label.configure(text="Загружаю в ElevenLabs...", text_color=MUTED)
                 self.update_idletasks()
                 voice_id = self.create_voice_from_sample(path, name, description)
-                result_label.configure(text=f"✓ Готово! voice_id: {voice_id}",
-                                       text_color="#86efac")
+                _cleanup_extracted()
+                expires_at = time.time() + (10 * 60 * 60)
+                self.voice_expiry_list.append({
+                    "voice_id": voice_id,
+                    "name": name,
+                    "expires_at": expires_at,
+                })
+                self.save_config()
+                result_label.configure(
+                    text=f"✓ Голос «{name}» будет автоудалён через 10 часов",
+                    text_color="#fcd34d",
+                )
                 self.main_voice_name = name
                 self.main_voice_id = voice_id
                 messagebox.showinfo(
@@ -1728,9 +1880,12 @@ class LipsyncTwoModeApp(_BaseApp):
                 result_label.configure(text=f"Ошибка: {e}", text_color="#fca5a5")
                 messagebox.showerror("Ошибка", str(e), parent=self)
 
-        self.button(frame, "🎙 Клонировать", clone,
-                    color=BTN_OK, hover=BTN_OK_HOVER, width=200).pack(
-            anchor="e", padx=22, pady=(0, 20))
+        clone_btn = self.button(frame, "🎙 Клонировать", clone,
+                                color=BTN_OK, hover=BTN_OK_HOVER, width=200)
+        clone_btn.pack(anchor="e", padx=22, pady=(0, 20))
+        clone_btn_ref = [clone_btn]
+
+        frame.bind("<Destroy>", lambda e: _cleanup_extracted())
 
     def show_downloader_panel(self):
         try:
@@ -2187,6 +2342,19 @@ class LipsyncTwoModeApp(_BaseApp):
                         ctk.CTkLabel(name_col, text=ago,
                                      font=ctk.CTkFont(size=10),
                                      text_color=MUTED, anchor="w"
+                                     ).pack(anchor="w", padx=0)
+                    expiry_entry = next(
+                        (e for e in self.voice_expiry_list if e["voice_id"] == v["voice_id"]),
+                        None,
+                    )
+                    if expiry_entry:
+                        secs_left = max(0, int(expiry_entry["expires_at"] - time.time()))
+                        h_left = secs_left // 3600
+                        m_left = (secs_left % 3600) // 60
+                        timer_text = f"⏳ удалится через {h_left} ч {m_left} мин"
+                        ctk.CTkLabel(name_col, text=timer_text,
+                                     font=ctk.CTkFont(size=10),
+                                     text_color="#fcd34d", anchor="w"
                                      ).pack(anchor="w", padx=0)
 
                     
@@ -3851,6 +4019,38 @@ class LipsyncTwoModeApp(_BaseApp):
             pass
         self.after(120, self.poll_logs)
 
+    def _voice_expiry_watcher(self):
+        while True:
+            time.sleep(60)
+            now = time.time()
+            expired = [v for v in self.voice_expiry_list if v["expires_at"] <= now]
+            for v in expired:
+                try:
+                    if not self.api_key:
+                        continue
+                    deleted = delete_elevenlabs_voice(v["voice_id"], self.api_key)
+                    if deleted:
+                        self.log(f"Голос «{v['name']}» автоудалён (истёк срок)")
+                        self.voice_expiry_list.remove(v)
+                        self.save_config()
+                except Exception as e:
+                    self.log(f"Ошибка удаления голоса {v['name']}: {e}")
+
+    def _cleanup_expired_voices_on_start(self):
+        if not self.api_key or not self.voice_expiry_list:
+            return
+        now = time.time()
+        expired = [v for v in self.voice_expiry_list if v["expires_at"] <= now]
+        for v in expired:
+            try:
+                delete_elevenlabs_voice(v["voice_id"], self.api_key)
+                self.voice_expiry_list.remove(v)
+                self.log(f"Голос «{v['name']}» удалён при старте (просрочен)")
+            except Exception:
+                pass
+        if expired:
+            self.save_config()
+
     def load_config(self):
         """Загружает API ключи и настройки из ~/.sheqelmotion.json."""
         try:
@@ -3872,6 +4072,7 @@ class LipsyncTwoModeApp(_BaseApp):
             CLOUDINARY_API_KEY     = self.cloudinary_api_key
             CLOUDINARY_API_SECRET  = self.cloudinary_api_secret
             self.main_voice_name = data.get("main_voice_name", "") or self.main_voice_name
+            self.voice_expiry_list = data.get("voice_expiry_list", [])
         except Exception as e:
             self.log(f"Не удалось загрузить конфиг: {e}")
 
@@ -3885,6 +4086,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 "cloudinary_api_key":    self.cloudinary_api_key,
                 "cloudinary_api_secret": self.cloudinary_api_secret,
                 "main_voice_name":       self.main_voice_name,
+                "voice_expiry_list":     self.voice_expiry_list,
             }
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
