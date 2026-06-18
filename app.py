@@ -107,10 +107,16 @@ def find_binary(name):
 
 
 def ffmpeg_bin():
+    for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]:
+        if Path(p).exists():
+            return p
     return find_binary("ffmpeg")
 
 
 def ffprobe_bin():
+    for p in ["/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe"]:
+        if Path(p).exists():
+            return p
     return find_binary("ffprobe")
 
 
@@ -522,16 +528,36 @@ def _ensure_ytdlp():
 
 
 def _ytdlp_ffmpeg_opts():
-    """Возвращает путь к директории с ffmpeg для передачи yt-dlp."""
-    # Windows: ищем ffmpeg.exe рядом с программой
+    def _test_ffmpeg(path):
+        try:
+            result = subprocess.run(
+                [path, "-version"],
+                capture_output=True, timeout=5,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+
+    candidates = []
+
     local = Path(app_base_dir()) / exe_name
     if local.exists():
-        return str(local.parent)
-    # Системный ffmpeg
+        candidates.append(str(local.parent))
+
+    candidates.append("/opt/homebrew/bin")
+    candidates.append("/usr/local/bin")
+
     found = shutil.which("ffmpeg")
     if found:
-        return str(Path(found).parent)
+        candidates.append(str(Path(found).parent))
+
+    for directory in candidates:
+        ffmpeg_path = str(Path(directory) / exe_name)
+        if Path(ffmpeg_path).exists() and _test_ffmpeg(ffmpeg_path):
+            return directory
+
     return None
 
 
@@ -575,6 +601,11 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None):
     denoise: bool — применить голосовой денойз к аудио
     browser: str | None — браузер для cookiesfrombrowser
     """
+    homebrew_dirs = ["/opt/homebrew/bin", "/usr/local/bin"]
+    for d in homebrew_dirs:
+        if os.path.exists(d) and d not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+
     yt_dlp = _ensure_ytdlp()
     ensure_dir(output_dir)
 
@@ -630,6 +661,8 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None):
             "merge_output_format": "mp4",
             "format_sort": ["res", "ext:mp4:m4a"],
             "outtmpl": outtmpl,
+            "restrictfilenames": True,
+            "windowsfilenames": True,
             "postprocessors": [{
                 "key": "FFmpegVideoConvertor",
                 "preferedformat": "mp4",
@@ -653,6 +686,7 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None):
             **common,
             "format": "bestaudio/best",
             "outtmpl": outtmpl,
+            "restrictfilenames": True,
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
@@ -686,6 +720,7 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None):
             ),
             "merge_output_format": "mp4",
             "outtmpl": outtmpl,
+            "restrictfilenames": True,
         }
         log("Скачиваю видео в максимальном качестве...")
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -766,15 +801,39 @@ def _split_video_audio(video_path, output_dir, denoise, log):
       - AUDIO.mp3  — только аудиодорожка, с денойзом если выбрано
     """
     ensure_dir(output_dir)
-    base = Path(video_path).stem
+    base = safe_name(Path(video_path).stem)[:60]
     video_out = str(Path(output_dir) / (base + "_VIDEO.mp4"))
     audio_out = str(Path(output_dir) / (base + "_AUDIO.mp3"))
+
+    safe_video = str(Path(tempfile.mkdtemp()) / "input.mp4")
+    shutil.copy2(video_path, safe_video)
 
     log("Копирую оригинальное видео (с голосом)...")
     shutil.copy2(video_path, video_out)
 
     log("Извлекаю аудио в максимальном качестве...")
-    run([ffmpeg_bin(), "-y", "-i", video_path, "-vn", "-q:a", "0", audio_out])
+    try:
+        subprocess.run([
+            ffmpeg_bin(), "-y", "-i", safe_video,
+            "-vn", "-acodec", "libmp3lame", "-q:a", "0", audio_out
+        ], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        try:
+            tmp_wav = audio_out + ".wav"
+            subprocess.run([
+                ffmpeg_bin(), "-y", "-i", safe_video,
+                "-vn", "-acodec", "pcm_s16le", "-ar", "44100", tmp_wav
+            ], check=True, capture_output=True)
+            subprocess.run([
+                ffmpeg_bin(), "-y", "-i", tmp_wav,
+                "-acodec", "libmp3lame", "-q:a", "0", audio_out
+            ], check=True, capture_output=True)
+            try:
+                os.remove(tmp_wav)
+            except Exception:
+                pass
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Не удалось извлечь аудио: {e}")
 
     if denoise:
         log(f"Передаю в audio-separator: {Path(audio_out).name}")
@@ -782,6 +841,11 @@ def _split_video_audio(video_path, output_dir, denoise, log):
         _separate_vocals(audio_out, vocals_out, log)
         os.remove(audio_out)
         audio_out = vocals_out
+
+    try:
+        os.remove(safe_video)
+    except Exception:
+        pass
 
     if not file_exists_ok(video_out):
         raise RuntimeError(f"Не удалось сохранить видео: {video_out}")
@@ -880,6 +944,35 @@ def delete_elevenlabs_voice(voice_id, api_key):
     return res.status_code in [200, 204]
 
 
+def fetch_elevenlabs_balance(api_key) -> dict | None:
+    try:
+        headers = {"xi-api-key": api_key}
+        print(f"[balance] запрос с ключом {api_key[:8]}...")
+        res = requests.get(
+            f"{ELEVEN_BASE_URL}/v1/user/subscription",
+            headers=headers, timeout=10,
+        )
+        print(f"[balance] статус: {res.status_code}")
+        print(f"[balance] ответ: {res.text[:300]}")
+        if res.status_code != 200:
+            return None
+        data = res.json()
+        character_count = data.get("character_count", 0)
+        character_limit = data.get("character_limit", 0)
+        tier = data.get("tier", "")
+        next_reset = data.get("next_character_count_reset_unix", 0)
+        remaining = max(0, character_limit - character_count)
+        return {
+            "used": character_count,
+            "limit": character_limit,
+            "remaining": remaining,
+            "tier": tier,
+            "next_reset": next_reset,
+        }
+    except Exception:
+        return None
+
+
 class LipsyncTwoModeApp(_BaseApp):
     def __init__(self):
         super().__init__()
@@ -899,6 +992,7 @@ class LipsyncTwoModeApp(_BaseApp):
         except Exception:
             pass
         self.api_key = ""
+        self._el_balance = None
         self.main_voice_id = ""
         self.main_voice_name = ""
         self.rolls = []
@@ -927,6 +1021,8 @@ class LipsyncTwoModeApp(_BaseApp):
         self.after(3000, lambda: self.check_for_updates(silent=True))
         self.after(500, self._check_just_updated)
         self.after(2000, self._cleanup_expired_voices_on_start)
+        self.after(2000, self._check_elevenlabs)
+        self.after(3000, self._refresh_balance_badge)
         threading.Thread(target=self._voice_expiry_watcher, daemon=True).start()
 
 
@@ -1188,13 +1284,6 @@ class LipsyncTwoModeApp(_BaseApp):
             except Exception:
                 return
 
-            if res.status_code == 401:
-                self.after(0, lambda: messagebox.showwarning(
-                    "ElevenLabs",
-                    "ElevenLabs API key неверный. Обнови в Настройках.",
-                ))
-                return
-
             if res.status_code != 200:
                 return
 
@@ -1213,6 +1302,7 @@ class LipsyncTwoModeApp(_BaseApp):
                         ))
             except Exception:
                 pass
+            self.after(0, self._refresh_balance_badge)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1353,7 +1443,6 @@ class LipsyncTwoModeApp(_BaseApp):
         # 📥 МЕДИА
         sb_header("📥  МЕДИА")
         self.dl_btn = sb_btn("⬇  Скачать видео", self.show_downloader_panel)
-        self.subtitles_btn = sb_btn("🔤  Субтитры", self.show_subtitles_panel)
 
         # ➕ ЗАДАЧИ
         sb_header("➕  ЗАДАЧИ")
@@ -1466,6 +1555,7 @@ class LipsyncTwoModeApp(_BaseApp):
             self.api_key = api
             self.save_config()
             self.update_status()
+            self._refresh_balance_badge()
             result_label.configure(text="✓ Ключ сохранён", text_color="#86efac")
 
         self.button(frame, "Сохранить ключ", save,
@@ -1876,6 +1966,7 @@ class LipsyncTwoModeApp(_BaseApp):
                     f"Голос «{name}» клонирован.\n\nvoice_id: {voice_id}",
                     parent=self,
                 )
+                self.after(500, lambda n=name: self.show_voice_gen_panel(initial_voice=n))
             except Exception as e:
                 result_label.configure(text=f"Ошибка: {e}", text_color="#fca5a5")
                 messagebox.showerror("Ошибка", str(e), parent=self)
@@ -2410,7 +2501,7 @@ class LipsyncTwoModeApp(_BaseApp):
         win.after(100, load)
    
 
-    def show_voice_gen_panel(self):
+    def show_voice_gen_panel(self, initial_voice=""):
         outer = self._start_panel("voice_gen")
         frame = ctk.CTkFrame(outer, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="x", padx=20, pady=20)
@@ -2436,6 +2527,9 @@ class LipsyncTwoModeApp(_BaseApp):
         if self.main_voice_name:
             voice_box.insert("1.0", self.main_voice_name)
         self._fix_paste(voice_box)
+        if initial_voice:
+            voice_box.delete("1.0", "end")
+            voice_box.insert("1.0", initial_voice)
 
         def on_voice_picked(name, voice_id):
             voice_box.delete("1.0", "end")
@@ -2776,595 +2870,6 @@ class LipsyncTwoModeApp(_BaseApp):
         frame.bind("<Destroy>", lambda e: [
             state["temp_path"].update({"A": None, "B": None})
         ])
-
-    def show_subtitles_panel(self):
-        scroll = self._start_panel("subtitles")
-        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
-        frame.pack(fill="both", expand=True, padx=20, pady=20)
-
-        self.label(frame, "Транскрипция видео", size=22, weight="bold").pack(
-            anchor="w", padx=22, pady=(20, 4))
-        self.label(
-            frame,
-            "Выбери готовый ролик из очереди или загрузи свой файл для транскрипции.",
-            size=13, color=MUTED,
-        ).pack(anchor="w", padx=22, pady=(0, 16))
-
-        # ── Локальные функции ─────────────────────────────────────────────
-
-        def _time_ago_simple(timestamp):
-            diff = time.time() - timestamp
-            if diff < 3600:
-                m = int(diff / 60)
-                return f"{m} мин назад" if m > 0 else "только что"
-            elif diff < 86400:
-                return f"{int(diff / 3600)} ч назад"
-            elif diff < 86400 * 30:
-                return f"{int(diff / 86400)} дн назад"
-            else:
-                return f"{int(diff / (86400 * 30))} мес назад"
-
-        def scan_recent_videos():
-            base = Path(desktop_dir()) / "Lipsync_Queue_Output"
-            if not base.exists():
-                return []
-            videos = []
-            for mp4 in sorted(base.rglob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True):
-                if "_sync_input" in mp4.name or "_raw" in mp4.name:
-                    continue
-                try:
-                    mtime = mp4.stat().st_mtime
-                    size_mb = mp4.stat().st_size / (1024 * 1024)
-                    videos.append({
-                        "path": str(mp4),
-                        "name": mp4.name,
-                        "folder": mp4.parent.name,
-                        "mtime": mtime,
-                        "size_mb": size_mb,
-                        "time_ago": _time_ago_simple(mtime),
-                    })
-                except Exception:
-                    continue
-            return videos[:20]
-
-        # ── Состояние ─────────────────────────────────────────────────────
-        selected_video_var = ctk.StringVar(value="")
-        manual_selected = {"path": ""}
-        card_refs = []  # [(path, card_widget), ...]
-
-        def get_video_path():
-            from_list = selected_video_var.get()
-            if from_list and os.path.exists(from_list):
-                return from_list
-            return manual_selected["path"]
-
-        def _refresh_card_colors():
-            chosen = selected_video_var.get()
-            for vpath, card in card_refs:
-                if vpath == chosen and os.path.exists(vpath):
-                    card.configure(fg_color=BTN_PRIMARY)
-                else:
-                    card.configure(fg_color=CARD)
-
-        # ── Заголовок секции ──────────────────────────────────────────────
-        recent_hdr = ctk.CTkFrame(frame, fg_color="transparent")
-        recent_hdr.pack(fill="x", padx=22, pady=(0, 6))
-        self.label(recent_hdr, "Последние готовые ролики", size=14, weight="bold").pack(
-            side="left")
-
-        def _do_refresh():
-            _render_recent_list()
-
-        refresh_btn = ctk.CTkButton(
-            recent_hdr, text="🔄", command=_do_refresh,
-            fg_color=BTN, hover_color=BTN_HOVER,
-            text_color="white", corner_radius=10,
-            width=36, height=28, font=ctk.CTkFont(size=13),
-        )
-        refresh_btn.pack(side="right")
-
-        # ── Список видео ──────────────────────────────────────────────────
-        list_frame = ctk.CTkScrollableFrame(frame, fg_color=BG, height=220)
-        list_frame.pack(fill="x", padx=22, pady=(0, 8))
-
-        def _open_file(path):
-            try:
-                if sys.platform == "darwin":
-                    subprocess.Popen(["open", path])
-                elif sys.platform == "win32":
-                    os.startfile(path)
-                else:
-                    subprocess.Popen(["xdg-open", path])
-            except Exception:
-                pass
-
-        def _render_recent_list():
-            for w in list_frame.winfo_children():
-                w.destroy()
-            card_refs.clear()
-
-            videos = scan_recent_videos()
-            if not videos:
-                self.label(
-                    list_frame,
-                    "Нет готовых роликов. Сначала обработай очередь.",
-                    size=13, color=MUTED,
-                ).pack(anchor="w", padx=4, pady=12)
-                return
-
-            for v in videos:
-                exists = os.path.exists(v["path"])
-                card = ctk.CTkFrame(list_frame, fg_color=CARD, corner_radius=10)
-                card.pack(fill="x", padx=2, pady=(0, 4))
-                card_refs.append((v["path"], card))
-
-                radio = ctk.CTkRadioButton(
-                    card,
-                    text="",
-                    variable=selected_video_var,
-                    value=v["path"],
-                    width=20,
-                    state="normal" if exists else "disabled",
-                    command=lambda p=v["path"]: _on_radio_pick(p),
-                )
-                radio.pack(side="left", padx=(8, 4), pady=8)
-
-                name_col = ctk.CTkFrame(card, fg_color="transparent")
-                name_col.pack(side="left", fill="x", expand=True, padx=4, pady=6)
-
-                display_name = v["name"] if len(v["name"]) <= 45 else v["name"][:42] + "..."
-                ctk.CTkLabel(
-                    name_col,
-                    text=display_name,
-                    font=ctk.CTkFont(size=13, weight="bold"),
-                    text_color=TEXT if exists else MUTED,
-                    anchor="w",
-                ).pack(anchor="w")
-                ctk.CTkLabel(
-                    name_col,
-                    text=v["folder"],
-                    font=ctk.CTkFont(size=10),
-                    text_color=MUTED,
-                    anchor="w",
-                ).pack(anchor="w")
-
-                ctk.CTkButton(
-                    card, text="▶", width=36, height=28,
-                    fg_color=BTN, hover_color=BTN_HOVER,
-                    font=ctk.CTkFont(size=13),
-                    command=lambda p=v["path"]: _open_file(p),
-                    state="normal" if exists else "disabled",
-                ).pack(side="right", padx=(0, 8))
-
-                ctk.CTkLabel(
-                    card,
-                    text=f"{v['size_mb']:.1f} МБ",
-                    font=ctk.CTkFont(size=11),
-                    text_color=MUTED,
-                ).pack(side="right", padx=(0, 4))
-
-                ctk.CTkLabel(
-                    card,
-                    text=v["time_ago"],
-                    font=ctk.CTkFont(size=11),
-                    text_color=MUTED,
-                ).pack(side="right", padx=(0, 6))
-
-            _refresh_card_colors()
-
-        def _on_radio_pick(path):
-            _refresh_card_colors()
-            if os.path.exists(path):
-                file_label.configure(text=f"  {Path(path).name}", text_color="#111")
-
-        # ── Разделитель ───────────────────────────────────────────────────
-        ctk.CTkFrame(frame, height=1, fg_color="#2a2d3e").pack(
-            fill="x", padx=22, pady=(4, 10))
-        self.label(frame, "или выбери другой файл:", size=12, color=MUTED).pack(
-            anchor="w", padx=22, pady=(0, 8))
-
-        # ── Ручной выбор файла ────────────────────────────────────────────
-        file_row = ctk.CTkFrame(frame, fg_color="transparent")
-        file_row.pack(fill="x", padx=22, pady=(0, 16))
-
-        file_label = ctk.CTkLabel(
-            file_row, text="  не выбран",
-            fg_color="#f5f5f5", text_color="#888",
-            anchor="w", corner_radius=6,
-            font=ctk.CTkFont(size=12), height=32,
-        )
-        file_label.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
-
-        def _choose_manual():
-            f = filedialog.askopenfilename(
-                parent=self, title="Выбрать видео для транскрипции",
-                filetypes=[
-                    ("Видео", "*.mp4 *.mov *.avi *.mkv *.webm"),
-                    ("Все файлы", "*.*"),
-                ],
-            )
-            if f:
-                manual_selected["path"] = f
-                selected_video_var.set("")
-                _refresh_card_colors()
-                file_label.configure(text=f"  {Path(f).name}", text_color="#111")
-
-        self.button(file_row, "Выбрать файл", _choose_manual,
-                    color=BTN, hover=BTN_HOVER, width=140).pack(side="right")
-
-        # ── Первичная загрузка списка ─────────────────────────────────────
-        def _load_async():
-            self.after(0, _render_recent_list)
-
-        threading.Thread(target=_load_async, daemon=True).start()
-
-        # ═══════════════════════════════════════════════════════════════════
-        # Блок настроек и запуска транскрипции
-        # ═══════════════════════════════════════════════════════════════════
-
-        ctk.CTkFrame(frame, height=1, fg_color="#2a2d3e").pack(
-            fill="x", padx=22, pady=(8, 14))
-
-        settings_card = ctk.CTkFrame(frame, fg_color=CARD, corner_radius=14)
-        settings_card.pack(fill="x", padx=22, pady=(0, 12))
-
-        # ── Режим Whisper ──────────────────────────────────────────────────
-        self.label(settings_card, "Режим транскрипции", size=13, weight="bold").pack(
-            anchor="w", padx=16, pady=(14, 6))
-
-        whisper_mode = ctk.StringVar(value="api")
-
-        mode_row = ctk.CTkFrame(settings_card, fg_color="transparent")
-        mode_row.pack(fill="x", padx=16, pady=(0, 8))
-
-        # ── API секция ─────────────────────────────────────────────────────
-        api_section = ctk.CTkFrame(settings_card, fg_color="transparent")
-
-        self.label(api_section, "OpenAI API key", size=12, color=MUTED).pack(anchor="w")
-        openai_key_box = ctk.CTkTextbox(
-            api_section, height=44,
-            fg_color="#ffffff", text_color="#111111",
-            border_width=1, border_color="#737373",
-            corner_radius=8, font=ctk.CTkFont(size=13),
-        )
-        openai_key_box.pack(fill="x", pady=(4, 4))
-        self._fix_paste(openai_key_box)
-
-        def _load_openai_key():
-            try:
-                if os.path.exists(CONFIG_PATH):
-                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                        return json.load(f).get("openai_api_key", "")
-            except Exception:
-                pass
-            return ""
-
-        def _save_openai_key(key):
-            try:
-                data = {}
-                if os.path.exists(CONFIG_PATH):
-                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                data["openai_api_key"] = key
-                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-
-        saved_key = _load_openai_key()
-        if saved_key:
-            openai_key_box.insert("1.0", saved_key)
-
-        # ── Локальная секция ───────────────────────────────────────────────
-        local_section = ctk.CTkFrame(settings_card, fg_color="transparent")
-
-        self.label(local_section, "Размер модели", size=12, color=MUTED).pack(anchor="w")
-        model_var = ctk.StringVar(value="small")
-        ctk.CTkOptionMenu(
-            local_section,
-            values=["tiny", "base", "small", "medium", "large-v3"],
-            variable=model_var,
-            fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER,
-            dropdown_fg_color=PANEL, width=180,
-        ).pack(anchor="w", pady=(4, 4))
-        self.label(
-            local_section,
-            "tiny — быстро, medium/large — качественнее. При первом запуске скачивается модель.",
-            size=11, color=MUTED,
-        ).pack(anchor="w")
-
-        def _show_mode_sections():
-            if whisper_mode.get() == "api":
-                local_section.pack_forget()
-                api_section.pack(fill="x", padx=16, pady=(0, 10))
-            else:
-                api_section.pack_forget()
-                local_section.pack(fill="x", padx=16, pady=(0, 10))
-
-        ctk.CTkRadioButton(
-            mode_row, text="API (OpenAI Whisper)",
-            variable=whisper_mode, value="api",
-            command=_show_mode_sections,
-        ).pack(side="left", padx=(0, 20))
-        ctk.CTkRadioButton(
-            mode_row, text="Локально (faster-whisper)",
-            variable=whisper_mode, value="local",
-            command=_show_mode_sections,
-        ).pack(side="left")
-
-        api_section.pack(fill="x", padx=16, pady=(0, 10))
-
-        # ── Язык ──────────────────────────────────────────────────────────
-        self.label(settings_card, "Язык аудио", size=13, weight="bold").pack(
-            anchor="w", padx=16, pady=(6, 6))
-
-        lang_display_to_code = {
-            "Авто": None, "Русский": "ru", "Английский": "en",
-            "Украинский": "uk", "Немецкий": "de", "Французский": "fr",
-            "Испанский": "es", "Итальянский": "it", "Польский": "pl",
-            "Японский": "ja", "Китайский": "zh",
-        }
-        lang_display = ctk.StringVar(value="Авто")
-        ctk.CTkOptionMenu(
-            settings_card, values=list(lang_display_to_code.keys()),
-            variable=lang_display,
-            fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER,
-            dropdown_fg_color=PANEL, width=180,
-        ).pack(anchor="w", padx=16, pady=(0, 12))
-
-        # ── Стиль субтитров ───────────────────────────────────────────────
-        self.label(settings_card, "Стиль субтитров", size=13, weight="bold").pack(
-            anchor="w", padx=16, pady=(6, 6))
-
-        style_r1 = ctk.CTkFrame(settings_card, fg_color="transparent")
-        style_r1.pack(fill="x", padx=16, pady=(0, 8))
-        style_r2 = ctk.CTkFrame(settings_card, fg_color="transparent")
-        style_r2.pack(fill="x", padx=16, pady=(0, 12))
-
-        self.label(style_r1, "Размер:", size=12, color=MUTED).pack(side="left", padx=(0, 6))
-        font_size_var = ctk.StringVar(value="22")
-        ctk.CTkEntry(
-            style_r1, textvariable=font_size_var, width=60,
-            fg_color="white", text_color="#111", border_color="#737373",
-        ).pack(side="left", padx=(0, 18))
-
-        self.label(style_r1, "Позиция:", size=12, color=MUTED).pack(side="left", padx=(0, 6))
-        pos_var = ctk.StringVar(value="Снизу")
-        ctk.CTkOptionMenu(
-            style_r1, values=["Снизу", "Сверху"],
-            variable=pos_var,
-            fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER,
-            dropdown_fg_color=PANEL, width=110,
-        ).pack(side="left")
-
-        color_options = {"Белый": "&H00FFFFFF", "Жёлтый": "&H0000FFFF", "Голубой": "&H00FFFF00"}
-        self.label(style_r2, "Цвет:", size=12, color=MUTED).pack(side="left", padx=(0, 6))
-        color_var = ctk.StringVar(value="Белый")
-        ctk.CTkOptionMenu(
-            style_r2, values=list(color_options.keys()),
-            variable=color_var,
-            fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER,
-            dropdown_fg_color=PANEL, width=110,
-        ).pack(side="left", padx=(0, 18))
-
-        self.label(style_r2, "Обводка:", size=12, color=MUTED).pack(side="left", padx=(0, 6))
-        outline_var = ctk.StringVar(value="2")
-        ctk.CTkOptionMenu(
-            style_r2, values=["0", "1", "2", "3", "4"],
-            variable=outline_var,
-            fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER,
-            dropdown_fg_color=PANEL, width=80,
-        ).pack(side="left")
-
-        # ── Папка вывода ──────────────────────────────────────────────────
-        self.label(settings_card, "Папка вывода", size=13, weight="bold").pack(
-            anchor="w", padx=16, pady=(6, 6))
-
-        out_folder = {"path": ""}
-        out_dir_row = ctk.CTkFrame(settings_card, fg_color="transparent")
-        out_dir_row.pack(fill="x", padx=16, pady=(0, 14))
-
-        out_dir_lbl = ctk.CTkLabel(
-            out_dir_row, text="  автоматически (папка видео)",
-            fg_color="#f5f5f5", text_color="#888",
-            anchor="w", corner_radius=6,
-            font=ctk.CTkFont(size=12), height=32,
-        )
-        out_dir_lbl.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
-
-        def _choose_out_dir():
-            d = filedialog.askdirectory(parent=self, title="Папка для сохранения")
-            if d:
-                out_folder["path"] = d
-                out_dir_lbl.configure(text=f"  {d}", text_color="#111")
-
-        self.button(out_dir_row, "Обзор", _choose_out_dir,
-                    color=BTN, hover=BTN_HOVER, width=90).pack(side="right")
-
-        # ── Кнопка запуска ────────────────────────────────────────────────
-        run_row = ctk.CTkFrame(frame, fg_color="transparent")
-        run_row.pack(fill="x", padx=22, pady=(4, 6))
-
-        run_btn = self.button(
-            run_row,
-            "▶ Транскрибировать и добавить субтитры",
-            lambda: None,
-            color=BTN_OK, hover=BTN_OK_HOVER, width=360,
-        )
-        run_btn.pack(side="left")
-
-        # ── Прогресс ──────────────────────────────────────────────────────
-        status_lbl = self.label(frame, "", size=12, color=MUTED)
-        status_lbl.pack(anchor="w", padx=22, pady=(6, 2))
-
-        result_row = ctk.CTkFrame(frame, fg_color="transparent")
-        result_row.pack(fill="x", padx=22, pady=(4, 20))
-
-        # ── Логика ────────────────────────────────────────────────────────
-
-        def _fmt_srt_time(s):
-            h = int(s // 3600)
-            m = int((s % 3600) // 60)
-            sec = s % 60
-            return f"{h:02d}:{m:02d}:{sec:06.3f}".replace(".", ",")
-
-        def _segments_to_srt(segments):
-            lines = []
-            for i, seg in enumerate(segments, 1):
-                lines.append(str(i))
-                lines.append(f"{_fmt_srt_time(seg.start)} --> {_fmt_srt_time(seg.end)}")
-                lines.append(seg.text.strip())
-                lines.append("")
-            return "\n".join(lines)
-
-        def _burn_subs(video, srt, out, font_sz, pos, color_ass, outline):
-            alignment = 2 if pos == "Снизу" else 8
-            style = (
-                f"FontSize={font_sz},Alignment={alignment},"
-                f"PrimaryColour={color_ass},OutlineColour=&H00000000,"
-                f"Outline={outline},Shadow=0,Bold=1,MarginV=20"
-            )
-            # escape path for ffmpeg filter — колонки и бэкслеши
-            srt_esc = str(srt).replace("\\", "/")
-            if sys.platform != "win32":
-                srt_esc = srt_esc.replace(":", r"\:")
-            subprocess.run([
-                ffmpeg_bin(), "-y",
-                "-i", video,
-                "-vf", f"subtitles='{srt_esc}':force_style='{style}'",
-                "-c:a", "copy",
-                "-crf", VIDEO_CRF, "-preset", "fast",
-                out,
-            ], check=True)
-
-        def _do_transcribe():
-            video = get_video_path()
-            if not video or not os.path.exists(video):
-                messagebox.showerror("Ошибка", "Сначала выбери видео файл.", parent=self)
-                return
-
-            mode = whisper_mode.get()
-            lang_code = lang_display_to_code.get(lang_display.get())
-            font_sz = font_size_var.get().strip() or "22"
-            color_ass = color_options.get(color_var.get(), "&H00FFFFFF")
-            pos = pos_var.get()
-            outline = outline_var.get()
-            out_dir = out_folder["path"] or str(Path(video).parent)
-            stem = Path(video).stem
-            srt_out = str(Path(out_dir) / f"{stem}_subtitles.srt")
-            mp4_out = str(Path(out_dir) / f"{stem}_subtitles.mp4")
-
-            run_btn.configure(state="disabled", text="Обработка...")
-            for w in result_row.winfo_children():
-                w.destroy()
-            status_lbl.configure(text="Извлекаю аудио...", text_color=MUTED)
-
-            def _run():
-                try:
-                    tmp = tempfile.mkdtemp()
-                    wav = str(Path(tmp) / "audio.wav")
-
-                    subprocess.run([
-                        ffmpeg_bin(), "-y", "-i", video,
-                        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav,
-                    ], check=True, capture_output=True)
-
-                    self.after(0, lambda: status_lbl.configure(
-                        text="Транскрибирую аудио...", text_color=MUTED))
-
-                    if mode == "api":
-                        key = openai_key_box.get("1.0", "end").strip()
-                        if not key:
-                            raise RuntimeError("Введи OpenAI API key.")
-                        _save_openai_key(key)
-                        try:
-                            import openai as _oa
-                        except ImportError:
-                            self.after(0, lambda: status_lbl.configure(
-                                text="Устанавливаю openai...", text_color=MUTED))
-                            subprocess.run([sys.executable, "-m", "pip", "install",
-                                            "--quiet", "openai"], check=True)
-                            import openai as _oa
-                        client = _oa.OpenAI(api_key=key)
-                        kw = {} if lang_code is None else {"language": lang_code}
-                        with open(wav, "rb") as f:
-                            resp = client.audio.transcriptions.create(
-                                model="whisper-1", file=f,
-                                response_format="srt", **kw,
-                            )
-                        srt_text = str(resp)
-                    else:
-                        try:
-                            from faster_whisper import WhisperModel as _WM
-                        except ImportError:
-                            self.after(0, lambda: status_lbl.configure(
-                                text="Устанавливаю faster-whisper...", text_color=MUTED))
-                            subprocess.run([sys.executable, "-m", "pip", "install",
-                                            "--quiet", "faster-whisper"], check=True)
-                            from faster_whisper import WhisperModel as _WM
-                        sz = model_var.get()
-                        self.after(0, lambda s=sz: status_lbl.configure(
-                            text=f"Загружаю модель {s}...", text_color=MUTED))
-                        wm = _WM(sz, device="cpu", compute_type="int8")
-                        kw = {} if lang_code is None else {"language": lang_code}
-                        segs, _ = wm.transcribe(wav, **kw)
-                        srt_text = _segments_to_srt(list(segs))
-
-                    ensure_dir(out_dir)
-                    with open(srt_out, "w", encoding="utf-8") as f:
-                        f.write(srt_text)
-
-                    self.after(0, lambda: status_lbl.configure(
-                        text="Сжигаю субтитры в видео...", text_color=MUTED))
-
-                    _burn_subs(video, srt_out, mp4_out, font_sz, pos, color_ass, outline)
-                    shutil.rmtree(tmp, ignore_errors=True)
-
-                    def _done():
-                        status_lbl.configure(
-                            text=f"✓ Готово: {Path(mp4_out).name}",
-                            text_color="#86efac",
-                        )
-                        run_btn.configure(
-                            state="normal",
-                            text="▶ Транскрибировать и добавить субтитры",
-                        )
-                        for w in result_row.winfo_children():
-                            w.destroy()
-                        self.button(
-                            result_row, "▶ Открыть видео",
-                            lambda: _open_file(mp4_out),
-                            color=BTN_OK, hover=BTN_OK_HOVER, width=160,
-                        ).pack(side="left")
-                        self.button(
-                            result_row, "📂 Папка",
-                            lambda: open_folder(out_dir),
-                            color=BTN, hover=BTN_HOVER, width=110,
-                        ).pack(side="left", padx=(10, 0))
-                        self.button(
-                            result_row, "📄 SRT",
-                            lambda: _open_file(srt_out),
-                            color=BTN, hover=BTN_HOVER, width=80,
-                        ).pack(side="left", padx=(10, 0))
-
-                    self.after(0, _done)
-
-                except Exception as e:
-                    err = str(e)
-                    def _err(msg=err):
-                        status_lbl.configure(
-                            text=f"Ошибка: {msg[:80]}", text_color="#fca5a5")
-                        run_btn.configure(
-                            state="normal",
-                            text="▶ Транскрибировать и добавить субтитры",
-                        )
-                        messagebox.showerror("Ошибка транскрипции", msg, parent=self)
-                    self.after(0, _err)
-
-            threading.Thread(target=_run, daemon=True).start()
-
-        run_btn.configure(command=_do_transcribe)
-
     def add_roll(self):
         roll = {
             "id": self.next_roll_id,
@@ -3963,16 +3468,60 @@ class LipsyncTwoModeApp(_BaseApp):
                 self.update_status()
         self.after(0, update)
 
+    def _refresh_balance_badge(self):
+        if not self.api_key:
+            return
+
+        def run():
+            balance = fetch_elevenlabs_balance(self.api_key)
+            self.log(f"Balance fetch result: {balance}")
+            if balance:
+                self._el_balance = balance
+                remaining = balance["remaining"]
+                label = f"{remaining // 1000}k" if remaining >= 1000 else str(remaining)
+                pct = balance["remaining"] / max(balance["limit"], 1)
+                if pct > 0.3:
+                    badge_color = "#0a5c47"
+                    badge_text_color = "#86efac"
+                elif pct > 0.1:
+                    badge_color = "#7a4f00"
+                    badge_text_color = "#fcd34d"
+                else:
+                    badge_color = "#7a1500"
+                    badge_text_color = "#fca5a5"
+                self.after(500, lambda l=label, bc=badge_color, tc=badge_text_color:
+                    self._update_api_btn_badge(l, bc, tc))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _update_api_btn_badge(self, label, badge_color, text_color):
+        try:
+            if not self.api_btn.winfo_exists():
+                return
+            self.api_btn.configure(text=f"API key  ·  {label} симв.")
+        except Exception:
+            pass
+
     def update_status(self):
         valid, _ = self.validate_rolls()
         self.status_label.configure(text=f"готовых роликов: {len(valid)} | всего роликов: {len(self.rolls)}")
         # API key button: green if key set, primary if panel active, transparent otherwise
+        def _api_btn_text():
+            if self._el_balance:
+                remaining = self._el_balance["remaining"]
+                label = f"{remaining // 1000}k" if remaining >= 1000 else str(remaining)
+                return f"API key  ·  {label} симв."
+            return "API key"
+
         if self.api_key:
             self.api_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
+            self.api_btn.configure(text=_api_btn_text())
         elif self._active_panel == "api":
             self.api_btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
+            self.api_btn.configure(text=_api_btn_text())
         else:
             self.api_btn.configure(fg_color="transparent", hover_color=BTN_HOVER)
+            self.api_btn.configure(text=_api_btn_text())
 
         if self.sync_key and "ВСТАВЬ" not in self.sync_key:
             self.sync_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
