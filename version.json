@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.1.3",
-  "release_notes": "После клонирования голоса — автоматический переход на панель генерации с подставленным именем голоса",
+  "latest_version": "1.1.4",
+  "release_notes": "Убрана очистка голоса при клонировании из видео",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "1200fd5deb59b40550bae48d92ce8c334a6c30355fbb53799a77c0cb9aa83f25"
+  "sha256": "8eb32578531deda39c9c296fed6d1ed21ffffe702395bdfa4b02f5cce4ceff43"
 }

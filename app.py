@@ -48,7 +48,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -657,7 +657,13 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None):
         outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
         opts = {
             **common,
-            "format": "bestvideo+bestaudio/bestvideo*+bestaudio/best",
+            "format": (
+                "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/"
+                "bestvideo[ext=mp4][vcodec^=avc]+bestaudio/"
+                "bestvideo[vcodec^=avc]+bestaudio/"
+                "bestvideo+bestaudio/"
+                "best"
+            ),
             "merge_output_format": "mp4",
             "format_sort": ["res", "ext:mp4:m4a"],
             "outtmpl": outtmpl,
@@ -669,6 +675,7 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None):
             }],
             "postprocessor_args": {
                 "videoconvertor": ["-vcodec", "libx264", "-acodec", "aac"],
+                "merger": ["-c:v", "copy", "-c:a", "aac"],
             },
         }
         log("Получаю информацию о видео...")
@@ -1023,6 +1030,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.after(2000, self._cleanup_expired_voices_on_start)
         self.after(2000, self._check_elevenlabs)
         self.after(3000, self._refresh_balance_badge)
+        self.after(4000, self._check_ytdlp_update)
         threading.Thread(target=self._voice_expiry_watcher, daemon=True).start()
 
 
@@ -1303,6 +1311,49 @@ class LipsyncTwoModeApp(_BaseApp):
             except Exception:
                 pass
             self.after(0, self._refresh_balance_badge)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _check_ytdlp_update(self):
+        def run():
+            try:
+                import yt_dlp
+                current = yt_dlp.version.__version__
+
+                res = requests.get(
+                    "https://pypi.org/pypi/yt-dlp/json",
+                    timeout=10
+                )
+                if res.status_code != 200:
+                    return
+
+                latest = res.json()["info"]["version"]
+
+                if current == latest:
+                    self.log(f"yt-dlp актуален: {current}")
+                    return
+
+                self.log(f"yt-dlp устарел: {current} → {latest}. Обновляю...")
+
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install",
+                     "-U", "yt-dlp", "--quiet"],
+                    capture_output=True,
+                    encoding="utf-8",
+                    timeout=120,
+                )
+
+                if result.returncode == 0:
+                    self.log(f"yt-dlp обновлён до {latest} ✓")
+                    self.after(0, lambda v=latest: self.status_label.configure(
+                        text=f"yt-dlp обновлён до {v}"
+                    ))
+                    self.after(5000, self.update_status)
+                else:
+                    self.log(f"Ошибка обновления yt-dlp: {result.stderr[:200]}")
+
+            except Exception as e:
+                self.log(f"yt-dlp check error: {e}")
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1837,7 +1888,6 @@ class LipsyncTwoModeApp(_BaseApp):
         )
         video_file_label.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
 
-        clean_voice_var = ctk.BooleanVar(value=True)
         extract_status_label = self.label(
             video_block,
             "Выбери видео — аудио будет извлечено автоматически",
@@ -1850,17 +1900,12 @@ class LipsyncTwoModeApp(_BaseApp):
                 shutil.rmtree(extracted["tmp_dir"], ignore_errors=True)
                 extracted["tmp_dir"] = None
 
-        def extract_audio_from_video(video_path, clean):
+        def extract_audio_from_video(video_path):
             tmp_dir = tempfile.mkdtemp()
             extracted["tmp_dir"] = tmp_dir
             raw_audio = str(Path(tmp_dir) / "extracted.mp3")
             run([ffmpeg_bin(), "-y", "-i", video_path,
                  "-vn", "-ar", "44100", "-ac", "1", "-q:a", "0", raw_audio])
-            if clean:
-                vocals_out = str(Path(tmp_dir) / "vocals.mp3")
-                def log_fn(msg): self.log(msg)
-                _separate_vocals(raw_audio, vocals_out, log_fn)
-                return vocals_out
             return raw_audio
 
         def choose_video():
@@ -1878,7 +1923,7 @@ class LipsyncTwoModeApp(_BaseApp):
 
             def worker():
                 try:
-                    out_path = extract_audio_from_video(f, clean_voice_var.get())
+                    out_path = extract_audio_from_video(f)
                     dur = get_duration(out_path)
                     size_mb = os.path.getsize(out_path) / (1024 * 1024)
                     selected["path"] = out_path
@@ -1899,14 +1944,6 @@ class LipsyncTwoModeApp(_BaseApp):
 
         self.button(video_file_row, "Выбрать файл", choose_video,
                     color=BTN, hover=BTN_HOVER, width=130).pack(side="right")
-
-        ctk.CTkCheckBox(
-            video_block,
-            text="Очистить голос (убрать музыку и фон)",
-            variable=clean_voice_var,
-            text_color=TEXT, fg_color=BTN_PRIMARY,
-            font=ctk.CTkFont(size=13),
-        ).pack(anchor="w", pady=(10, 0))
 
         # ── Переключение блоков ────────────────────────────────────────────
         def switch_source(mode):
@@ -3043,6 +3080,10 @@ class LipsyncTwoModeApp(_BaseApp):
 
         self._apply_dnd(row1, lambda r=roll: r)
 
+        self.button(row1, "📁 Выбрать папку",
+                    lambda i=idx: self.choose_folder_auto(i),
+                    color=BTN, hover=BTN_HOVER, width=180).pack(side="left", padx=(0, 10))
+
         voice_text = "✅ full_voice.mp3" if roll["voice_file"] else "Выбрать full_voice"
         self.button(row1, voice_text, lambda i=idx: self.choose_voice_file(i),
                     color=BTN_OK if roll["voice_file"] else BTN_PRIMARY,
@@ -3180,6 +3221,48 @@ class LipsyncTwoModeApp(_BaseApp):
         self.update_status()
 
 
+
+    def choose_folder_auto(self, idx):
+        folder = filedialog.askdirectory(
+            parent=self, title="Выбери папку с аудио и видео"
+        )
+        if not folder:
+            return
+
+        audio_exts = {".mp3", ".wav", ".m4a", ".aac"}
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".MOV"}
+
+        audio_found = None
+        video_found = None
+
+        for f in Path(folder).iterdir():
+            if f.is_file():
+                if f.suffix.lower() in audio_exts and not audio_found:
+                    audio_found = str(f)
+                if f.suffix.lower() in video_exts and not video_found:
+                    video_found = str(f)
+
+        messages = []
+        if audio_found:
+            self.rolls[idx]["voice_file"] = audio_found
+            messages.append(f"Аудио: {Path(audio_found).name}")
+        else:
+            messages.append("⚠ Аудио не найдено")
+
+        if video_found:
+            self.rolls[idx]["video_single"] = video_found
+            messages.append(f"Видео: {Path(video_found).name}")
+        else:
+            messages.append("⚠ Видео не найдено")
+
+        self.rolls[idx]["status"] = "Ожидает"
+        self.refresh_rolls()
+
+        if audio_found or video_found:
+            messagebox.showinfo("Найдено", "\n".join(messages), parent=self)
+        else:
+            messagebox.showwarning("Ничего не найдено",
+                "В папке нет аудио или видео файлов.", parent=self)
 
     def choose_voice_file(self, idx):
         f = filedialog.askopenfilename(
