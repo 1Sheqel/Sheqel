@@ -48,7 +48,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.1.7"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -1009,7 +1009,110 @@ def fetch_elevenlabs_balance(api_key) -> dict | None:
         return None
 
 
-def transcribe_with_groq(audio_path, api_key, log) -> str:
+def translate_with_groq(text, target_lang, api_key, log) -> str:
+    import requests
+
+    lang_names = {
+        "RU": "русский", "EN": "английский", "UK": "украинский",
+        "DE": "немецкий", "FR": "французский", "ES": "испанский",
+        "IT": "итальянский", "PL": "польский", "PT": "португальский",
+        "ZH": "китайский", "JA": "японский", "KO": "корейский",
+        "AR": "арабский", "TR": "турецкий", "HI": "хинди",
+        "NL": "нидерландский", "SV": "шведский", "CS": "чешский",
+        "RO": "румынский", "HU": "венгерский",
+    }
+    lang_name = lang_names.get(target_lang, target_lang)
+
+    log(f"Перевожу на {lang_name} через Groq LLaMA...")
+
+    system_prompt = (
+        f"Ты профессиональный переводчик. Переведи текст на {lang_name} язык. "
+        f"Сохраняй стиль, тон и смысл оригинала. "
+        f"Если текст рекламный — адаптируй под культуру языка. "
+        f"Верни ТОЛЬКО переведённый текст без пояснений и комментариев. "
+        f"Если в тексте есть разделители ------ — сохраняй их на тех же местах."
+    )
+
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 4096,
+    }
+
+    res = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+
+    if res.status_code == 401:
+        raise RuntimeError("Groq API key неверный")
+    if res.status_code != 200:
+        raise RuntimeError(f"Groq error {res.status_code}: {res.text[:300]}")
+
+    result = res.json()["choices"][0]["message"]["content"].strip()
+    log(f"Переведено: {len(result)} символов")
+    return result
+
+
+def fetch_groq_usage(api_key) -> dict | None:
+    try:
+        import requests
+        res = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+        if res.status_code != 200:
+            return None
+
+        headers_lower = {k.lower(): v for k, v in res.headers.items()}
+
+        for key_remaining in [
+            "x-ratelimit-remaining-audio-seconds",
+            "x-ratelimit-remaining-tokens",
+            "ratelimit-remaining",
+        ]:
+            for key_limit in [
+                "x-ratelimit-limit-audio-seconds",
+                "x-ratelimit-limit-tokens",
+                "ratelimit-limit",
+            ]:
+                remaining = headers_lower.get(key_remaining)
+                limit = headers_lower.get(key_limit)
+                if remaining and limit:
+                    try:
+                        r = float(remaining)
+                        l = float(limit)
+                        return {
+                            "remaining_hours": r / 3600,
+                            "limit_hours": l / 3600,
+                            "remaining_sec": r,
+                            "raw_remaining": remaining,
+                            "raw_limit": limit,
+                        }
+                    except Exception:
+                        pass
+
+        return {
+            "remaining_hours": None,
+            "limit_hours": 8.0,
+            "remaining_sec": None,
+            "plan": "free",
+        }
+    except Exception:
+        return None
+
+
+def transcribe_with_groq(audio_path, api_key, log) -> tuple:
     import requests
 
     size_mb = os.path.getsize(audio_path) / (1024 * 1024)
@@ -1037,6 +1140,17 @@ def transcribe_with_groq(audio_path, api_key, log) -> str:
         working_path = tmp_path
 
     try:
+        try:
+            dur_result = subprocess.run(
+                [ffprobe_bin(), "-v", "error", "-show_entries",
+                 "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+                 working_path],
+                capture_output=True, encoding="utf-8"
+            )
+            duration_sec = float(dur_result.stdout.strip())
+        except Exception:
+            duration_sec = 0.0
+
         url = "https://api.groq.com/openai/v1/audio/transcriptions"
         headers = {"Authorization": f"Bearer {api_key}"}
 
@@ -1058,7 +1172,7 @@ def transcribe_with_groq(audio_path, api_key, log) -> str:
 
         text = res.text.strip()
         log(f"Транскрибировано: {len(text)} символов")
-        return text
+        return text, duration_sec
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -1105,6 +1219,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.cloudinary_api_key = ""
         self.cloudinary_api_secret = ""
         self.groq_api_key = ""
+        self.groq_used_seconds = 0.0
         self.preview_process = None
         self.preview_voice_id = None
         self.voice_expiry_list = []
@@ -1587,6 +1702,7 @@ class LipsyncTwoModeApp(_BaseApp):
         # 🎙 ТРАНСКРИБАЦИЯ
         sb_header("🎙  ТРАНСКРИБАЦИЯ")
         self.transcribe_btn = sb_btn("Транскрибировать", self.show_transcribe_panel)
+        self.translate_groq_btn = sb_btn("Переводчик", self.show_groq_translate_panel)
 
         # ➕ ЗАДАЧИ
         sb_header("➕  ЗАДАЧИ")
@@ -2509,8 +2625,10 @@ class LipsyncTwoModeApp(_BaseApp):
 
             def run():
                 try:
-                    text = transcribe_with_groq(
+                    text, duration_sec = transcribe_with_groq(
                         selected["path"], self.groq_api_key, self.log)
+                    self.groq_used_seconds += duration_sec
+                    self.save_config()
 
                     def on_done(t=text):
                         transcribe_btn.configure(state="normal", text="🎙 Транскрибировать")
@@ -2521,6 +2639,7 @@ class LipsyncTwoModeApp(_BaseApp):
                         result_box.configure(state="normal")
                         result_box.delete("1.0", "end")
                         result_box.insert("1.0", t)
+                        threading.Thread(target=_load_groq_limit, daemon=True).start()
 
                     self.after(0, on_done)
                 except Exception as e:
@@ -2537,6 +2656,58 @@ class LipsyncTwoModeApp(_BaseApp):
             btn_row, "🎙 Транскрибировать", do_transcribe,
             color=BTN_OK, hover=BTN_OK_HOVER, width=220)
         transcribe_btn.pack(side="left")
+
+        groq_limit_label = self.label(btn_row, "", size=12, color=MUTED)
+        groq_limit_label.pack(side="left", padx=14)
+
+        def _load_groq_limit():
+            if not self.groq_api_key:
+                return
+            limit_sec = 28800.0
+            used_sec = self.groq_used_seconds
+            remaining_sec = max(0.0, limit_sec - used_sec)
+            remaining_hours = remaining_sec / 3600
+            used_hours = used_sec / 3600
+
+            if remaining_hours >= 1:
+                remaining_text = f"{remaining_hours:.1f} ч"
+            else:
+                remaining_mins = remaining_sec / 60
+                remaining_text = f"{remaining_mins:.0f} мин"
+
+            if used_sec > 0:
+                if used_hours >= 1:
+                    used_text = f"{used_hours:.1f} ч"
+                else:
+                    used_mins = used_sec / 60
+                    used_text = f"{used_mins:.1f} мин"
+                text = f"⏱ использовано {used_text} · осталось {remaining_text}"
+            else:
+                text = "⏱ до 8 ч/день бесплатно"
+
+            pct = used_sec / limit_sec
+            if pct < 0.7:
+                color = "#86efac"
+            elif pct < 0.9:
+                color = "#fcd34d"
+            else:
+                color = "#fca5a5"
+
+            self.after(0, lambda t=text, c=color: groq_limit_label.configure(
+                text=t, text_color=c))
+
+        def reset_counter():
+            self.groq_used_seconds = 0.0
+            self.save_config()
+            _load_groq_limit()
+
+        ctk.CTkButton(
+            btn_row, text="↺", command=reset_counter,
+            fg_color=BTN, hover_color=BTN_HOVER,
+            width=32, height=32, font=ctk.CTkFont(size=14),
+        ).pack(side="left", padx=(4, 0))
+
+        threading.Thread(target=_load_groq_limit, daemon=True).start()
 
         self.label(frame, "Результат", size=14, weight="bold").pack(
             anchor="w", padx=22, pady=(8, 4))
@@ -2587,6 +2758,160 @@ class LipsyncTwoModeApp(_BaseApp):
                     color=BTN, hover=BTN_HOVER, width=140).pack(side="left", padx=(0, 8))
         self.button(actions_row, "💾 Сохранить .txt", save_result,
                     color=BTN, hover=BTN_HOVER, width=160).pack(side="left", padx=(0, 8))
+        self.button(actions_row, "🎙 В генератор голоса", send_to_voice,
+                    color=BTN_PRIMARY, hover=BTN_PRIMARY_HOVER, width=190).pack(side="left")
+
+    def show_groq_translate_panel(self):
+        scroll = self._start_panel("groq_translate")
+        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self.label(frame, "🌐 Переводчик", size=22, weight="bold").pack(
+            anchor="w", padx=22, pady=(20, 4))
+        self.label(
+            frame,
+            "Groq LLaMA — бесплатно, понимает контекст, адаптирует под культуру.",
+            size=13, color=MUTED,
+        ).pack(anchor="w", padx=22, pady=(0, 14))
+
+        lang_row = ctk.CTkFrame(frame, fg_color="transparent")
+        lang_row.pack(fill="x", padx=22, pady=(0, 14))
+
+        self.label(lang_row, "Перевести на:", size=13, weight="bold").pack(
+            side="left", padx=(0, 10))
+
+        langs = [
+            "RU — Русский", "EN — Английский", "UK — Украинский",
+            "DE — Немецкий", "FR — Французский", "ES — Испанский",
+            "IT — Итальянский", "PL — Польский", "PT — Португальский",
+            "ZH — Китайский", "JA — Японский", "KO — Корейский",
+            "AR — Арабский", "TR — Турецкий", "HI — Хинди",
+            "NL — Нидерландский", "SV — Шведский", "CS — Чешский",
+            "RO — Румынский", "HU — Венгерский",
+        ]
+
+        lang_var = ctk.StringVar(value="EN — Английский")
+        ctk.CTkOptionMenu(
+            lang_row, values=langs, variable=lang_var,
+            fg_color=BTN, button_color=BTN,
+            button_hover_color=BTN_HOVER,
+            dropdown_fg_color=PANEL,
+            width=200,
+        ).pack(side="left")
+
+        self.label(frame, "Исходный текст", size=14, weight="bold").pack(
+            anchor="w", padx=22, pady=(0, 4))
+        source_box = ctk.CTkTextbox(
+            frame, height=180,
+            fg_color="#ffffff", text_color="#111111",
+            border_width=1, border_color="#737373",
+            corner_radius=10, font=ctk.CTkFont(size=14), wrap="word",
+        )
+        source_box.pack(fill="x", padx=22, pady=(0, 10))
+        self._fix_paste(source_box)
+
+        btn_row = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_row.pack(fill="x", padx=22, pady=(0, 10))
+
+        status_label = self.label(btn_row, "", size=12, color=MUTED)
+        status_label.pack(side="right", padx=(10, 0))
+
+        def do_translate():
+            if not self.groq_api_key:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Сначала добавь Groq API key в Настройках.\n\nРегистрация бесплатно на groq.com",
+                    parent=self
+                )
+                return
+            text = source_box.get("1.0", "end").strip()
+            if not text:
+                messagebox.showerror("Ошибка", "Введи текст для перевода.", parent=self)
+                return
+
+            target_lang = lang_var.get().split(" — ")[0].strip()
+
+            translate_btn.configure(state="disabled", text="Перевожу...")
+            status_label.configure(text="Отправляю в Groq...", text_color=MUTED)
+            result_box.configure(state="normal")
+            result_box.delete("1.0", "end")
+            result_box.configure(state="disabled")
+
+            def run():
+                try:
+                    result = translate_with_groq(
+                        text, target_lang, self.groq_api_key, self.log)
+
+                    def on_done(r=result):
+                        translate_btn.configure(state="normal", text="🌐 Перевести")
+                        status_label.configure(
+                            text=f"✓ {len(r)} символов",
+                            text_color="#86efac"
+                        )
+                        result_box.configure(state="normal")
+                        result_box.delete("1.0", "end")
+                        result_box.insert("1.0", r)
+
+                    self.after(0, on_done)
+                except Exception as e:
+                    err = str(e)
+                    self.after(0, lambda: translate_btn.configure(
+                        state="normal", text="🌐 Перевести"))
+                    self.after(0, lambda: status_label.configure(
+                        text=f"Ошибка: {err[:60]}", text_color="#fca5a5"))
+                    self.after(0, lambda: messagebox.showerror("Ошибка", err, parent=self))
+
+            threading.Thread(target=run, daemon=True).start()
+
+        translate_btn = self.button(
+            btn_row, "🌐 Перевести", do_translate,
+            color=BTN_OK, hover=BTN_OK_HOVER, width=180)
+        translate_btn.pack(side="left")
+
+        self.label(frame, "Перевод", size=14, weight="bold").pack(
+            anchor="w", padx=22, pady=(4, 4))
+
+        result_box = ctk.CTkTextbox(
+            frame, height=180,
+            fg_color="#ffffff", text_color="#111111",
+            border_width=1, border_color="#737373",
+            corner_radius=10, font=ctk.CTkFont(size=14), wrap="word",
+        )
+        result_box.pack(fill="x", padx=22, pady=(0, 10))
+        result_box.configure(state="disabled")
+        self._fix_paste(result_box)
+
+        actions_row = ctk.CTkFrame(frame, fg_color="transparent")
+        actions_row.pack(fill="x", padx=22, pady=(0, 20))
+
+        def copy_result():
+            text = result_box.get("1.0", "end").strip()
+            if text:
+                self.clipboard_clear()
+                self.clipboard_append(text)
+                status_label.configure(text="✓ Скопировано!", text_color="#86efac")
+
+        def send_to_voice():
+            text = result_box.get("1.0", "end").strip()
+            if not text:
+                return
+            self.show_voice_gen_panel(initial_text=text)
+
+        def swap_texts():
+            res = result_box.get("1.0", "end").strip()
+            if not res:
+                return
+            source_box.delete("1.0", "end")
+            source_box.insert("1.0", res)
+            result_box.configure(state="normal")
+            result_box.delete("1.0", "end")
+            result_box.configure(state="disabled")
+            status_label.configure(text="", text_color=MUTED)
+
+        self.button(actions_row, "📋 Копировать", copy_result,
+                    color=BTN, hover=BTN_HOVER, width=130).pack(side="left", padx=(0, 8))
+        self.button(actions_row, "⇄ Поменять", swap_texts,
+                    color=BTN, hover=BTN_HOVER, width=120).pack(side="left", padx=(0, 8))
         self.button(actions_row, "🎙 В генератор голоса", send_to_voice,
                     color=BTN_PRIMARY, hover=BTN_PRIMARY_HOVER, width=190).pack(side="left")
 
@@ -3934,6 +4259,7 @@ class LipsyncTwoModeApp(_BaseApp):
             (self.clone_btn, "voice_clone"),
             (self.dl_btn, "downloader"),
             (self.transcribe_btn, "transcribe"),
+            (self.translate_groq_btn, "groq_translate"),
         ]:
             if self._active_panel == panel:
                 btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
@@ -4023,6 +4349,7 @@ class LipsyncTwoModeApp(_BaseApp):
             self.main_voice_name = data.get("main_voice_name", "") or self.main_voice_name
             self.voice_expiry_list = data.get("voice_expiry_list", [])
             self.groq_api_key = data.get("groq_api_key", "") or self.groq_api_key
+            self.groq_used_seconds = float(data.get("groq_used_seconds", 0.0))
         except Exception as e:
             self.log(f"Не удалось загрузить конфиг: {e}")
 
@@ -4038,6 +4365,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 "main_voice_name":       self.main_voice_name,
                 "voice_expiry_list":     self.voice_expiry_list,
                 "groq_api_key":          self.groq_api_key,
+                "groq_used_seconds":     self.groq_used_seconds,
             }
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
