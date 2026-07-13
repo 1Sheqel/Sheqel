@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.1.4",
-  "release_notes": "Убрана очистка голоса при клонировании из видео",
+  "latest_version": "1.1.5",
+  "release_notes": "Убрана точка в начале/конце имени сцены при safe_name",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "8eb32578531deda39c9c296fed6d1ed21ffffe702395bdfa4b02f5cce4ceff43"
+  "sha256": "ae8a74308a9901a4b10d92063ac56d7621beb7d7ea3b2988570233a6a85aaddc"
 }

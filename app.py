@@ -48,7 +48,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -134,7 +134,13 @@ def file_exists_ok(path, min_size=1024):
 
 def safe_name(name):
     name = re.sub(r"[^a-zA-Z0-9а-яА-ЯёЁ_-]+", "_", name)
-    return name.strip("_") or "roll"
+    name = name.strip("_").strip(".")  # убираем точки тоже
+    # Убираем точки в начале и конце
+    while name.startswith("."):
+        name = name[1:]
+    while name.endswith("."):
+        name = name[:-1:]
+    return name or "roll"
 
 
 def desktop_dir():
