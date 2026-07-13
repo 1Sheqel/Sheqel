@@ -48,7 +48,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -179,7 +179,8 @@ def get_duration(path):
 
 def copy_file(src, dst):
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    import shutil as _sh
+    _sh.copy2(src, dst)
     if not file_exists_ok(dst, min_size=100):
         raise RuntimeError(f"Не удалось скопировать файл: {dst}")
     return dst
@@ -388,21 +389,43 @@ def _init_cloudinary():
     )
 
 def upload_to_cloudinary(file_path, log):
-    """Загружает файл на Cloudinary. Возвращает (url, public_id).
-    Файлы > 100MB грузятся чанками через upload_large."""
     import cloudinary.uploader
+    import tempfile as _tmpfile
     _init_cloudinary()
-    size_mb = os.path.getsize(file_path) / (1024 * 1024)
-    log(f"Загружаю {Path(file_path).name} ({size_mb:.1f} MB) на Cloudinary...")
-    opts = dict(resource_type="video", invalidate=True)
-    if size_mb > 90:
-        result = cloudinary.uploader.upload_large(file_path, **opts, chunk_size=50 * 1024 * 1024)
-    else:
-        result = cloudinary.uploader.upload(file_path, **opts)
-    url = result["secure_url"]
-    public_id = result["public_id"]
-    log(f"  → {url}")
-    return url, public_id
+
+    # Исправляем имя файла если начинается с . или _
+    file_name = Path(file_path).name
+    clean_name = file_name.lstrip("._")
+    if not clean_name:
+        clean_name = "file" + Path(file_path).suffix
+
+    tmp_path = None
+    if file_name != clean_name:
+        tmp_path = str(Path(_tmpfile.mkdtemp()) / clean_name)
+        import shutil as _shutil
+        _shutil.copy2(file_path, tmp_path)
+        file_path = tmp_path
+        log(f"Переименован для загрузки: {clean_name}")
+
+    try:
+        size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        log(f"Загружаю {Path(file_path).name} ({size_mb:.1f} MB) на Cloudinary...")
+        opts = dict(resource_type="video", invalidate=True)
+        if size_mb > 90:
+            result = cloudinary.uploader.upload_large(
+                file_path, **opts, chunk_size=50 * 1024 * 1024)
+        else:
+            result = cloudinary.uploader.upload(file_path, **opts)
+        url = result["secure_url"]
+        public_id = result["public_id"]
+        log(f"  → {url}")
+        return url, public_id
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 def delete_from_cloudinary(public_id, log):
     """Удаляет файл с Cloudinary по public_id."""
@@ -986,6 +1009,64 @@ def fetch_elevenlabs_balance(api_key) -> dict | None:
         return None
 
 
+def transcribe_with_groq(audio_path, api_key, log) -> str:
+    import requests
+
+    size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+    log(f"Транскрибирую {Path(audio_path).name} ({size_mb:.1f} MB)...")
+
+    working_path = audio_path
+    tmp_path = None
+
+    if size_mb > 24:
+        log("Файл большой — сжимаю аудио...")
+        tmp_path = str(Path(tempfile.mkdtemp()) / "audio_compressed.mp3")
+        subprocess.run([
+            ffmpeg_bin(), "-y", "-i", audio_path,
+            "-vn", "-ar", "16000", "-ac", "1",
+            "-b:a", "64k", tmp_path
+        ], check=True, capture_output=True)
+        working_path = tmp_path
+    elif Path(audio_path).suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+        log("Извлекаю аудио из видео...")
+        tmp_path = str(Path(tempfile.mkdtemp()) / "audio_extracted.mp3")
+        subprocess.run([
+            ffmpeg_bin(), "-y", "-i", audio_path,
+            "-vn", "-ar", "16000", "-ac", "1", "-q:a", "0", tmp_path
+        ], check=True, capture_output=True)
+        working_path = tmp_path
+
+    try:
+        url = "https://api.groq.com/openai/v1/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        with open(working_path, "rb") as f:
+            files = {"file": (Path(working_path).name, f, "audio/mpeg")}
+            data = {
+                "model": "whisper-large-v3",
+                "response_format": "text",
+            }
+            res = requests.post(url, headers=headers,
+                                files=files, data=data, timeout=120)
+
+        if res.status_code == 401:
+            raise RuntimeError("Groq API key неверный")
+        if res.status_code == 413:
+            raise RuntimeError("Файл слишком большой для Groq (макс 25MB)")
+        if res.status_code != 200:
+            raise RuntimeError(f"Groq error {res.status_code}: {res.text[:300]}")
+
+        text = res.text.strip()
+        log(f"Транскрибировано: {len(text)} символов")
+        return text
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 class LipsyncTwoModeApp(_BaseApp):
     def __init__(self):
         super().__init__()
@@ -1023,6 +1104,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.cloudinary_cloud_name = ""
         self.cloudinary_api_key = ""
         self.cloudinary_api_secret = ""
+        self.groq_api_key = ""
         self.preview_process = None
         self.preview_voice_id = None
         self.voice_expiry_list = []
@@ -1491,6 +1573,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.api_btn = sb_btn("API key", self.show_api_key_panel)
         self.sync_btn = sb_btn("Sync key", self.show_sync_key_panel)
         self.cloudinary_btn = sb_btn("Cloudinary key", self.show_cloudinary_panel)
+        self.groq_btn = sb_btn("Groq key", self.show_groq_key_panel)
 
         # 🎙 ГОЛОС
         sb_header("🎙  ГОЛОС")
@@ -1500,6 +1583,10 @@ class LipsyncTwoModeApp(_BaseApp):
         # 📥 МЕДИА
         sb_header("📥  МЕДИА")
         self.dl_btn = sb_btn("⬇  Скачать видео", self.show_downloader_panel)
+
+        # 🎙 ТРАНСКРИБАЦИЯ
+        sb_header("🎙  ТРАНСКРИБАЦИЯ")
+        self.transcribe_btn = sb_btn("Транскрибировать", self.show_transcribe_panel)
 
         # ➕ ЗАДАЧИ
         sb_header("➕  ЗАДАЧИ")
@@ -1715,6 +1802,46 @@ class LipsyncTwoModeApp(_BaseApp):
 
         self.button(frame, "Сохранить ключи", save,
                     color=BTN_OK, hover=BTN_OK_HOVER, width=200).pack(
+            anchor="e", padx=24, pady=(0, 20))
+
+    def show_groq_key_panel(self):
+        scroll = self._start_panel("groq")
+        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="x", padx=20, pady=20)
+
+        self.label(frame, "Groq API key", size=22, weight="bold").pack(
+            anchor="w", padx=24, pady=(22, 6))
+        self.label(
+            frame,
+            "Бесплатно. Регистрация на groq.com → API Keys",
+            size=13, color=MUTED,
+        ).pack(anchor="w", padx=24, pady=(0, 18))
+        self.label(frame, "API key (начинается с gsk_...)", size=14, weight="bold").pack(
+            anchor="w", padx=24)
+        groq_box = ctk.CTkTextbox(
+            frame, height=80, fg_color="#ffffff", text_color="#111111",
+            border_width=1, border_color="#737373",
+            corner_radius=10, font=ctk.CTkFont(size=13),
+        )
+        groq_box.pack(fill="x", padx=24, pady=(6, 14))
+        if self.groq_api_key:
+            groq_box.insert("1.0", self.groq_api_key)
+        self._fix_paste(groq_box)
+        result_label = self.label(frame, "", size=13, color=MUTED)
+        result_label.pack(anchor="w", padx=24, pady=(0, 6))
+
+        def save():
+            key = groq_box.get("1.0", "end").strip()
+            if not key:
+                messagebox.showerror("Ошибка", "Введите Groq API key.", parent=self)
+                return
+            self.groq_api_key = key
+            self.save_config()
+            self.update_status()
+            result_label.configure(text="✓ Ключ сохранён", text_color="#86efac")
+
+        self.button(frame, "Сохранить ключ", save,
+                    color=BTN_OK, hover=BTN_OK_HOVER, width=190).pack(
             anchor="e", padx=24, pady=(0, 20))
 
     def fetch_voice_id_by_name(self, name):
@@ -2309,6 +2436,160 @@ class LipsyncTwoModeApp(_BaseApp):
 
             return {"status": status_lbl, "name": name_lbl, "pbar": pbar, "open": open_btn_h}
 
+    def show_transcribe_panel(self):
+        scroll = self._start_panel("transcribe")
+        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self.label(frame, "🎙 Транскрибировать", size=22, weight="bold").pack(
+            anchor="w", padx=22, pady=(20, 4))
+        self.label(
+            frame,
+            "Загрузи аудио или видео — Groq распознает речь на любом языке автоматически.",
+            size=13, color=MUTED,
+        ).pack(anchor="w", padx=22, pady=(0, 16))
+
+        self.label(frame, "Файл", size=14, weight="bold").pack(anchor="w", padx=22)
+        file_row = ctk.CTkFrame(frame, fg_color="transparent")
+        file_row.pack(fill="x", padx=22, pady=(6, 14))
+
+        file_label = ctk.CTkLabel(
+            file_row, text="  не выбран",
+            fg_color="#f5f5f5", text_color="#888",
+            anchor="w", corner_radius=6,
+            font=ctk.CTkFont(size=12), height=32,
+        )
+        file_label.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
+
+        selected = {"path": ""}
+
+        def choose_file():
+            f = filedialog.askopenfilename(
+                parent=self,
+                title="Выбери аудио или видео",
+                filetypes=[
+                    ("Медиа файлы", "*.mp3 *.wav *.m4a *.mp4 *.mov *.avi *.mkv *.webm *.flac *.ogg"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            if f:
+                selected["path"] = f
+                size_mb = os.path.getsize(f) / (1024 * 1024)
+                file_label.configure(
+                    text=f"  {Path(f).name}  ({size_mb:.1f} МБ)",
+                    text_color="#111"
+                )
+
+        self.button(file_row, "Выбрать файл", choose_file,
+                    color=BTN, hover=BTN_HOVER, width=140).pack(side="right")
+
+        status_label = self.label(frame, "", size=12, color=MUTED)
+        status_label.pack(anchor="w", padx=22, pady=(0, 8))
+
+        btn_row = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_row.pack(fill="x", padx=22, pady=(0, 14))
+
+        def do_transcribe():
+            if not self.groq_api_key:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Сначала добавь Groq API key в Настройках.\n\nРегистрация бесплатно на groq.com",
+                    parent=self
+                )
+                return
+            if not selected["path"]:
+                messagebox.showerror("Ошибка", "Выбери файл.", parent=self)
+                return
+
+            transcribe_btn.configure(state="disabled", text="Транскрибирую...")
+            status_label.configure(text="Отправляю в Groq...", text_color=MUTED)
+            result_box.configure(state="normal")
+            result_box.delete("1.0", "end")
+            result_box.configure(state="disabled")
+
+            def run():
+                try:
+                    text = transcribe_with_groq(
+                        selected["path"], self.groq_api_key, self.log)
+
+                    def on_done(t=text):
+                        transcribe_btn.configure(state="normal", text="🎙 Транскрибировать")
+                        status_label.configure(
+                            text=f"✓ Готово — {len(t)} символов",
+                            text_color="#86efac"
+                        )
+                        result_box.configure(state="normal")
+                        result_box.delete("1.0", "end")
+                        result_box.insert("1.0", t)
+
+                    self.after(0, on_done)
+                except Exception as e:
+                    err = str(e)
+                    self.after(0, lambda: transcribe_btn.configure(
+                        state="normal", text="🎙 Транскрибировать"))
+                    self.after(0, lambda: status_label.configure(
+                        text=f"Ошибка: {err[:80]}", text_color="#fca5a5"))
+                    self.after(0, lambda: messagebox.showerror("Ошибка", err, parent=self))
+
+            threading.Thread(target=run, daemon=True).start()
+
+        transcribe_btn = self.button(
+            btn_row, "🎙 Транскрибировать", do_transcribe,
+            color=BTN_OK, hover=BTN_OK_HOVER, width=220)
+        transcribe_btn.pack(side="left")
+
+        self.label(frame, "Результат", size=14, weight="bold").pack(
+            anchor="w", padx=22, pady=(8, 4))
+
+        result_box = ctk.CTkTextbox(
+            frame, height=280,
+            fg_color="#ffffff", text_color="#111111",
+            border_width=1, border_color="#737373",
+            corner_radius=10, font=ctk.CTkFont(size=14), wrap="word",
+        )
+        result_box.pack(fill="x", padx=22, pady=(0, 10))
+        result_box.configure(state="disabled")
+        self._fix_paste(result_box)
+
+        actions_row = ctk.CTkFrame(frame, fg_color="transparent")
+        actions_row.pack(fill="x", padx=22, pady=(0, 20))
+
+        def copy_result():
+            text = result_box.get("1.0", "end").strip()
+            if text:
+                self.clipboard_clear()
+                self.clipboard_append(text)
+                status_label.configure(text="✓ Скопировано!", text_color="#86efac")
+
+        def save_result():
+            text = result_box.get("1.0", "end").strip()
+            if not text:
+                return
+            f = filedialog.asksaveasfilename(
+                parent=self,
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("Все файлы", "*.*")],
+                initialfile="transcript.txt",
+            )
+            if f:
+                with open(f, "w", encoding="utf-8") as fp:
+                    fp.write(text)
+                status_label.configure(
+                    text=f"✓ Сохранено: {Path(f).name}", text_color="#86efac")
+
+        def send_to_voice():
+            text = result_box.get("1.0", "end").strip()
+            if not text:
+                return
+            self.show_voice_gen_panel(initial_text=text)
+
+        self.button(actions_row, "📋 Копировать", copy_result,
+                    color=BTN, hover=BTN_HOVER, width=140).pack(side="left", padx=(0, 8))
+        self.button(actions_row, "💾 Сохранить .txt", save_result,
+                    color=BTN, hover=BTN_HOVER, width=160).pack(side="left", padx=(0, 8))
+        self.button(actions_row, "🎙 В генератор голоса", send_to_voice,
+                    color=BTN_PRIMARY, hover=BTN_PRIMARY_HOVER, width=190).pack(side="left")
+
     def stop_preview(self):
         """Останавливает текущий preview если играет."""
         if self.preview_process and self.preview_process.poll() is None:
@@ -2544,7 +2825,7 @@ class LipsyncTwoModeApp(_BaseApp):
         win.after(100, load)
    
 
-    def show_voice_gen_panel(self, initial_voice=""):
+    def show_voice_gen_panel(self, initial_voice="", initial_text=""):
         outer = self._start_panel("voice_gen")
         frame = ctk.CTkFrame(outer, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="x", padx=20, pady=20)
@@ -2594,6 +2875,8 @@ class LipsyncTwoModeApp(_BaseApp):
         )
         text_box.pack(fill="x", padx=22, pady=(6, 4))
         self._fix_paste(text_box)
+        if initial_text:
+            text_box.insert("1.0", initial_text)
         tk_text = text_box._textbox  # внутренний tk.Text для тегов/биндингов
 
         # ── Счётчик символов ──────────────────────────────────────────────
@@ -3166,7 +3449,8 @@ class LipsyncTwoModeApp(_BaseApp):
 
     def roll_details(self, roll):
         parts = []
-        parts.append(f"Голос: {Path(roll['voice_file']).name}" if roll["voice_file"] else "Голос: не выбран")
+        voice_name = Path(roll['voice_file']).name.lstrip("._") if roll["voice_file"] else ""
+        parts.append(f"Голос: {voice_name}" if voice_name else "Голос: не выбран")
         if roll["text"]:
             preview = roll["text"].replace("\n", " ")
             if len(preview) > 95:
@@ -3175,10 +3459,13 @@ class LipsyncTwoModeApp(_BaseApp):
         else:
             parts.append("Текст проверки: пусто")
         if roll["mode"] == "1 видео":
-            parts.append(f"Видео: {Path(roll['video_single']).name if roll['video_single'] else 'не выбрано'}")
+            video_name = Path(roll['video_single']).name.lstrip("._") if roll['video_single'] else ''
+            parts.append(f"Видео: {video_name}" if video_name else "Видео: не выбрано")
         else:
-            parts.append(f"Начало: {Path(roll['video_start']).name if roll['video_start'] else 'не выбрано'}")
-            parts.append(f"Конец: {Path(roll['video_end']).name if roll['video_end'] else 'не выбрано'}")
+            start_name = Path(roll['video_start']).name.lstrip("._") if roll['video_start'] else ''
+            end_name = Path(roll['video_end']).name.lstrip("._") if roll['video_end'] else ''
+            parts.append(f"Начало: {start_name}" if start_name else "Начало: не выбрано")
+            parts.append(f"Конец: {end_name}" if end_name else "Конец: не выбрано")
         return " | ".join(parts)
     
     def get_roll_title(self, idx, roll):
@@ -3189,6 +3476,9 @@ class LipsyncTwoModeApp(_BaseApp):
 
         if title_video:
             name = Path(title_video).stem
+            while name.startswith(".") or name.startswith("_"):
+                name = name[1:]
+            name = name or f"Сцена {idx + 1}"
             return name[:40] + "..." if len(name) > 40 else name
 
         return f"Сцена {idx + 1}"
@@ -3241,12 +3531,16 @@ class LipsyncTwoModeApp(_BaseApp):
         audio_found = None
         video_found = None
 
-        for f in Path(folder).iterdir():
-            if f.is_file():
-                if f.suffix.lower() in audio_exts and not audio_found:
-                    audio_found = str(f)
-                if f.suffix.lower() in video_exts and not video_found:
-                    video_found = str(f)
+        for f in sorted(Path(folder).iterdir()):
+            if not f.is_file():
+                continue
+            # Пропускаем скрытые файлы macOS (._filename, .DS_Store и тд)
+            if f.name.startswith(".") or f.name.startswith("._"):
+                continue
+            if f.suffix.lower() in audio_exts and not audio_found:
+                audio_found = str(f)
+            if f.suffix.lower() in video_exts and not video_found:
+                video_found = str(f)
 
         messages = []
         if audio_found:
@@ -3406,10 +3700,19 @@ class LipsyncTwoModeApp(_BaseApp):
         else:
             roll_video_name = Path(roll["video_start"]).stem
 
-        temp_dir = str(Path(batch_dir) / f".tmp_{order_num:02d}_{safe_name(roll_video_name)}")
+        temp_dir = str(Path(batch_dir) / f"tmp_{order_num:02d}_{safe_name(roll_video_name)}")
         ensure_dir(temp_dir)
 
-        full_voice_copy = copy_file(roll["voice_file"], str(Path(temp_dir) / "full_voice.mp3"))
+        # Копируем с безопасным именем без точек в начале
+        full_voice_copy = copy_file(
+            roll["voice_file"],
+            str(Path(temp_dir) / "full_voice.mp3")
+        )
+
+        # Если исходный файл не скопировался — пробуем через shutil напрямую
+        if not file_exists_ok(full_voice_copy):
+            import shutil as _sh
+            _sh.copy2(roll["voice_file"], str(Path(temp_dir) / "full_voice.mp3"))
         if roll["text"]:
             with open(Path(temp_dir) / "full_text.txt", "w", encoding="utf-8") as f:
                 f.write(roll["text"])
@@ -3619,10 +3922,18 @@ class LipsyncTwoModeApp(_BaseApp):
         else:
             self.sync_btn.configure(fg_color="transparent", hover_color=BTN_HOVER)
 
+        if self.groq_api_key:
+            self.groq_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
+        elif self._active_panel == "groq":
+            self.groq_btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
+        else:
+            self.groq_btn.configure(fg_color="transparent", hover_color=BTN_HOVER)
+
         for btn, panel in [
             (self.voice_btn, "voice_gen"),
             (self.clone_btn, "voice_clone"),
             (self.dl_btn, "downloader"),
+            (self.transcribe_btn, "transcribe"),
         ]:
             if self._active_panel == panel:
                 btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
@@ -3711,6 +4022,7 @@ class LipsyncTwoModeApp(_BaseApp):
             CLOUDINARY_API_SECRET  = self.cloudinary_api_secret
             self.main_voice_name = data.get("main_voice_name", "") or self.main_voice_name
             self.voice_expiry_list = data.get("voice_expiry_list", [])
+            self.groq_api_key = data.get("groq_api_key", "") or self.groq_api_key
         except Exception as e:
             self.log(f"Не удалось загрузить конфиг: {e}")
 
@@ -3725,6 +4037,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 "cloudinary_api_secret": self.cloudinary_api_secret,
                 "main_voice_name":       self.main_voice_name,
                 "voice_expiry_list":     self.voice_expiry_list,
+                "groq_api_key":          self.groq_api_key,
             }
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)

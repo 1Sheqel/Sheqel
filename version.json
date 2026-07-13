@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.1.5",
-  "release_notes": "Убрана точка в начале/конце имени сцены при safe_name",
+  "latest_version": "1.1.6",
+  "release_notes": "- Транскрибация через Groq API (бесплатно, все языки)\n- Фикс скрытых macOS файлов при выборе папки\n- Убрана очистка голоса из клонирования",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "ae8a74308a9901a4b10d92063ac56d7621beb7d7ea3b2988570233a6a85aaddc"
+  "sha256": "c31eccbf4bc90048c11076af89eb93a9a153538f4845a9f9addb8830f67a042f"
 }
