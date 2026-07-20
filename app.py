@@ -12,6 +12,7 @@ def _ensure_deps():
         ("yt_dlp",         "yt-dlp"),
         ("audio_separator","audio-separator[cpu]"),
         ("cloudinary",     "cloudinary"),
+
     ]
     for module, pkg in packages:
         try:
@@ -48,7 +49,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.1.8"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -217,15 +218,33 @@ def text_to_speech_mp3(text, voice_id, output_mp3, log):
             "use_speaker_boost": True,
         },
     }
+    chars = len(text)
+    log(f"[TIMING] Текст: {chars} символов")
     log("Генерирую аудио ElevenLabs...")
+
+    t_api_start = time.time()
     res = requests.post(url, headers=headers, json=data, timeout=300)
+    t_api_end = time.time()
+    t_api = t_api_end - t_api_start
+    log(f"[TIMING] ElevenLabs API (ожидание ответа): {t_api:.2f} сек  (статус {res.status_code})")
+
     if res.status_code != 200:
         raise RuntimeError(f"ElevenLabs TTS error: {res.status_code}\n{res.text}")
+
+    t_save_start = time.time()
     with open(output_mp3, "wb") as f:
         f.write(res.content)
+    t_save_end = time.time()
+    log(f"[TIMING] Сохранение файла ({len(res.content) // 1024} KB): {t_save_end - t_save_start:.2f} сек")
+
     if not file_exists_ok(output_mp3):
         raise RuntimeError(f"Пустой mp3: {output_mp3}")
-    log(f"Аудио готово: {get_duration(output_mp3):.2f} сек")
+
+    t_dur_start = time.time()
+    dur = get_duration(output_mp3)
+    t_dur_end = time.time()
+    log(f"[TIMING] get_duration (ffprobe): {t_dur_end - t_dur_start:.2f} сек")
+    log(f"[TIMING] ИТОГО: {t_dur_end - t_api_start:.2f} сек | Аудио готово: {dur:.2f} сек")
     return output_mp3
 
 
@@ -1019,7 +1038,7 @@ def translate_with_groq(text, target_lang, api_key, log) -> str:
         "ZH": "китайский", "JA": "японский", "KO": "корейский",
         "AR": "арабский", "TR": "турецкий", "HI": "хинди",
         "NL": "нидерландский", "SV": "шведский", "CS": "чешский",
-        "RO": "румынский", "HU": "венгерский",
+        "RO": "румынский", "HU": "венгерский", "LT": "литовский",
     }
     lang_name = lang_names.get(target_lang, target_lang)
 
@@ -2787,7 +2806,7 @@ class LipsyncTwoModeApp(_BaseApp):
             "ZH — Китайский", "JA — Японский", "KO — Корейский",
             "AR — Арабский", "TR — Турецкий", "HI — Хинди",
             "NL — Нидерландский", "SV — Шведский", "CS — Чешский",
-            "RO — Румынский", "HU — Венгерский",
+            "RO — Румынский", "HU — Венгерский", "LT — Литовский",
         ]
 
         lang_var = ctk.StringVar(value="EN — Английский")

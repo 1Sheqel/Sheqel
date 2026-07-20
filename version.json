@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.1.7",
-  "release_notes": "- Переводчик через Groq LLaMA (бесплатно, все языки)\n- Транскрибация с счётчиком использованных секунд\n- Кнопка сброса счётчика Groq",
+  "latest_version": "1.1.8",
+  "release_notes": "Добавлен литовский язык в переводчик",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "459cf1971ee4018bb474911b914873f586447b350046b5eb2de3b7cd501b0152"
+  "sha256": "84cdd2770b458a8cc41decad661a9ffe2dc05f1da9daa4092fa27f07e209708d"
 }
