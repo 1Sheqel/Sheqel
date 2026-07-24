@@ -49,7 +49,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.1.9"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -458,12 +458,37 @@ def delete_from_cloudinary(public_id, log):
 
 def apply_lipsync_sync(video_in, audio_wav, final_out, log):
     """Отправляет видео и аудио в Sync через URL-загрузку (без лимита 20MB)."""
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    # Все варианты сетевых обрывов — включая RemoteDisconnected, BrokenPipe,
+    # ConnectionReset и timeout (requests.exceptions.ConnectionError покрывает их всех).
+    _NET_ERRORS = (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        ConnectionResetError,
+        BrokenPipeError,
+    )
+
+    def _make_session():
+        """Новая изолированная сессия с retry-адаптером на транспортном уровне."""
+        s = requests.Session()
+        retry = Retry(
+            total=3, backoff_factor=1, connect=3, read=3,
+            status_forcelist=[502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        return s
+
     headers = {"x-api-key": SYNC_API_KEY, "Content-Type": "application/json"}
     last_error = None
 
     for attempt in range(1, SYNC_RETRIES + 1):
         video_pub_id = None
         audio_pub_id = None
+        session = _make_session()
         try:
             log(f"Отправляю в Sync... попытка {attempt}/{SYNC_RETRIES}")
 
@@ -480,11 +505,11 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
                 ],
             }
 
-            res = requests.post(
+            res = session.post(
                 SYNC_GENERATE_URL,
                 headers=headers,
                 json=payload,
-                timeout=300,
+                timeout=30,
             )
             log(f"Sync create response: {res.status_code}")
             log(res.text[:1500])
@@ -502,7 +527,13 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
             while True:
                 if time.time() - started > SYNC_TIMEOUT_SEC:
                     raise RuntimeError("Sync timeout.")
-                status_res = requests.get(status_url, headers=headers, timeout=60)
+                try:
+                    status_res = session.get(status_url, headers=headers, timeout=30)
+                except _NET_ERRORS as e:
+                    log(f"Сетевая ошибка при polling статуса: {e} — пересоздаю сессию")
+                    session = _make_session()
+                    time.sleep(5)
+                    continue
                 if status_res.status_code != 200:
                     raise RuntimeError(f"Sync status error: {status_res.status_code}\n{status_res.text}")
                 status = status_res.json()
@@ -514,13 +545,24 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
                     video_url_out = status.get("outputUrl") or status.get("output_url")
                     if not video_url_out:
                         raise RuntimeError(f"Sync completed без outputUrl: {status}")
-                    video_data = requests.get(video_url_out, timeout=300).content
-                    with open(final_out, "wb") as f:
-                        f.write(video_data)
-                    if not file_exists_ok(final_out):
-                        raise RuntimeError(f"Sync скачал пустое видео: {final_out}")
-                    log("Lipsync готов.")
-                    return final_out
+                    # Задача уже COMPLETED — не пересоздаём её при сбое скачивания,
+                    # просто повторяем запрос за результатом на свежей сессии.
+                    for dl_attempt in range(1, 4):
+                        try:
+                            dl_session = _make_session()
+                            video_data = dl_session.get(video_url_out, timeout=300).content
+                            dl_session.close()
+                            with open(final_out, "wb") as f:
+                                f.write(video_data)
+                            if not file_exists_ok(final_out):
+                                raise RuntimeError(f"Sync скачал пустое видео: {final_out}")
+                            log("Lipsync готов.")
+                            return final_out
+                        except _NET_ERRORS as e:
+                            log(f"Ошибка скачивания результата (попытка {dl_attempt}/3): {e}")
+                            if dl_attempt < 3:
+                                time.sleep(5)
+                    raise RuntimeError("Не удалось скачать результат Sync после 3 попыток")
                 if state in ["FAILED", "REJECTED"]:
                     raise RuntimeError(f"Sync failed: {status}")
                 time.sleep(SYNC_POLL_INTERVAL_SEC)
@@ -531,6 +573,7 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
                 log("Пауза 60 секунд перед повтором...")
                 time.sleep(60)
         finally:
+            session.close()
             # Удаляем файлы с Cloudinary всегда — и при успехе и при ошибке
             for pub_id in (video_pub_id, audio_pub_id):
                 if pub_id:

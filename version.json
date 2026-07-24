@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.1.8",
-  "release_notes": "Добавлен литовский язык в переводчик",
+  "latest_version": "1.1.9",
+  "release_notes": "Исправлена устойчивость к обрывам соединения при рендере через Sync.so (ConnectionReset/RemoteDisconnected/BrokenPipe/зависания): изолированные HTTP-сессии на ролик, таймауты на все запросы, retry на транспортном уровне, не пересоздаём готовую задачу при сбое получения результата",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "84cdd2770b458a8cc41decad661a9ffe2dc05f1da9daa4092fa27f07e209708d"
+  "sha256": "a4f5b6791a4ea59cd1849c0d54a7d4bdddafaa3ee45e16483f7791a3beb6ea37"
 }
