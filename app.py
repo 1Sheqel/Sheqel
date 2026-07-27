@@ -49,7 +49,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.2.0"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
@@ -1082,6 +1082,7 @@ def translate_with_groq(text, target_lang, api_key, log) -> str:
         "AR": "арабский", "TR": "турецкий", "HI": "хинди",
         "NL": "нидерландский", "SV": "шведский", "CS": "чешский",
         "RO": "румынский", "HU": "венгерский", "LT": "литовский",
+        "ET": "эстонский", "LV": "латышский",
     }
     lang_name = lang_names.get(target_lang, target_lang)
 
@@ -2850,6 +2851,7 @@ class LipsyncTwoModeApp(_BaseApp):
             "AR — Арабский", "TR — Турецкий", "HI — Хинди",
             "NL — Нидерландский", "SV — Шведский", "CS — Чешский",
             "RO — Румынский", "HU — Венгерский", "LT — Литовский",
+            "ET — Эстонский", "LV — Латышский",
         ]
 
         lang_var = ctk.StringVar(value="EN — Английский")
