@@ -49,19 +49,38 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 
 
 ELEVEN_BASE_URL = "https://api.elevenlabs.io"
-ELEVEN_TTS_MODEL_ID = "eleven_v3"
+ELEVEN_TTS_MODEL_ID = "eleven_v4"      # модель по умолчанию
+ELEVEN_TTS_MODEL_ID_V3 = "eleven_v3"   # для обратной совместимости — выбирается в UI
 ELEVEN_OUTPUT_FORMAT = "mp3_44100_192"
 
+# Языки для TTS-панели (language_code в ElevenLabs API). "Авто" — поле не отправляется.
+ELEVEN_TTS_LANGUAGES = {
+    "Авто": None,
+    "Русский": "ru", "Английский": "en", "Украинский": "uk",
+    "Немецкий": "de", "Французский": "fr", "Испанский": "es",
+    "Итальянский": "it", "Польский": "pl", "Португальский": "pt",
+    "Китайский": "zh", "Японский": "ja", "Корейский": "ko",
+    "Арабский": "ar", "Турецкий": "tr", "Хинди": "hi",
+    "Нидерландский": "nl", "Шведский": "sv", "Чешский": "cs",
+    "Румынский": "ro", "Венгерский": "hu", "Литовский": "lt",
+    "Эстонский": "et", "Латышский": "lv",
+}
+
+GROQ_TRANSLATE_MODEL = "openai/gpt-oss-120b"  # llama-3.3-70b-versatile депрекейтнута Groq
+GROQ_TRANSLATE_RETRIES = 3
+
 SYNC_GENERATE_URL = "https://api.sync.so/v2/generate"
+SYNC_LIST_URL = "https://api.sync.so/v2/generations"
 SYNC_MODEL = "sync-3"
 SYNC_POLL_INTERVAL_SEC = 5
 SYNC_TIMEOUT_SEC = 30 * 60
+SYNC_CREATE_TIMEOUT_SEC = 90
 
 VIDEO_CRF = "13"
 VIDEO_PRESET = "slow"
@@ -205,12 +224,17 @@ def parse_start_end_text(full_text):
     return start_text, end_text, len(separators)
 
 
-def text_to_speech_mp3(text, voice_id, output_mp3, log):
+def text_to_speech_mp3(text, voice_id, output_mp3, log, model_id=None, language_code=None):
+    """
+    model_id: str | None — ELEVEN_TTS_MODEL_ID (v4) по умолчанию, либо ELEVEN_TTS_MODEL_ID_V3
+    language_code: str | None — ISO 639-1 код (напр. "ru"); None/не передан — автоопределение
+    """
+    model_id = model_id or ELEVEN_TTS_MODEL_ID
     url = f"{ELEVEN_BASE_URL}/v1/text-to-speech/{voice_id}?output_format={ELEVEN_OUTPUT_FORMAT}"
     headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
     data = {
         "text": text,
-        "model_id": ELEVEN_TTS_MODEL_ID,
+        "model_id": model_id,
         "voice_settings": {
             "stability": 0.55,
             "similarity_boost": 1.0,
@@ -218,8 +242,11 @@ def text_to_speech_mp3(text, voice_id, output_mp3, log):
             "use_speaker_boost": True,
         },
     }
+    if language_code:
+        data["language_code"] = language_code
     chars = len(text)
-    log(f"[TIMING] Текст: {chars} символов")
+    log(f"[TIMING] Текст: {chars} символов, модель: {model_id}" +
+        (f", язык: {language_code}" if language_code else ""))
     log("Генерирую аудио ElevenLabs...")
 
     t_api_start = time.time()
@@ -483,18 +510,70 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
         return s
 
     headers = {"x-api-key": SYNC_API_KEY, "Content-Type": "application/json"}
+
+    # Пары Cloudinary-файлов по каждой попытке. "safe" ставится True только когда
+    # исход job'а на стороне Sync подтверждён (COMPLETED/FAILED/REJECTED, либо
+    # точно подтверждённое "job не создан") — удаляем в самом конце функции
+    # только такие пары, чтобы не выбить файл из-под ещё живой задачи.
+    uploaded_pairs = []
+
+    def _find_existing_job(video_url, audio_url):
+        """Ambiguous-ошибка на create (timeout/connection error) — не значит, что
+        job не создался на стороне Sync. Проверяем список активных generations
+        по /v2/generations, прежде чем считать попытку проваленной.
+        Возвращает (job_id_или_None, confirmed) — confirmed=True значит исход
+        точно установлен (job найден, либо точно не найден)."""
+        vs = _make_session()
+        try:
+            resp = vs.get(
+                SYNC_LIST_URL,
+                headers=headers,
+                params={"status": "PENDING,PROCESSING"},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                log(f"Verification: /v2/generations вернул {resp.status_code} — не удалось подтвердить исход")
+                return None, False
+            for gen in resp.json():
+                urls = {i.get("url") for i in gen.get("input", []) if isinstance(i, dict)}
+                if video_url in urls and audio_url in urls:
+                    log(f"Verification: найден уже созданный job {gen.get('id')} для этой загрузки")
+                    return gen.get("id"), True
+            log("Verification: подходящего job'а не найдено — create действительно не удался")
+            return None, True
+        except Exception as e:
+            log(f"Verification: ошибка при проверке /v2/generations: {e} — не удалось подтвердить исход")
+            return None, False
+        finally:
+            vs.close()
+
+    def _cleanup_confirmed():
+        orphaned = []
+        for p in uploaded_pairs:
+            if p["safe"]:
+                for pub_id in (p["video"], p["audio"]):
+                    if pub_id:
+                        delete_from_cloudinary(pub_id, log)
+            else:
+                orphaned.extend(pid for pid in (p["video"], p["audio"]) if pid)
+        if orphaned:
+            log(
+                "⚠️ Не удалены с Cloudinary (исход job'а не подтверждён, оставлены "
+                f"во избежание обрыва живой задачи): {', '.join(orphaned)}"
+            )
+
     last_error = None
 
     for attempt in range(1, SYNC_RETRIES + 1):
-        video_pub_id = None
-        audio_pub_id = None
         session = _make_session()
+        pair = {"video": None, "audio": None, "safe": False}
+        uploaded_pairs.append(pair)
         try:
             log(f"Отправляю в Sync... попытка {attempt}/{SYNC_RETRIES}")
 
             # 1. Загружаем на Cloudinary → получаем URL + public_id для удаления
-            video_url, video_pub_id = upload_to_cloudinary(video_in, log)
-            audio_url, audio_pub_id = upload_to_cloudinary(audio_wav, log)
+            video_url, pair["video"] = upload_to_cloudinary(video_in, log)
+            audio_url, pair["audio"] = upload_to_cloudinary(audio_wav, log)
 
             # 2. Отправляем в Sync только URL
             payload = {
@@ -505,21 +584,37 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
                 ],
             }
 
-            res = session.post(
-                SYNC_GENERATE_URL,
-                headers=headers,
-                json=payload,
-                timeout=30,
-            )
-            log(f"Sync create response: {res.status_code}")
-            log(res.text[:1500])
-            if res.status_code not in [200, 201]:
-                raise RuntimeError(f"Sync create error: {res.status_code}\n{res.text}")
-
-            job_id = res.json().get("id")
-            if not job_id:
-                raise RuntimeError(f"Sync не вернул job id: {res.text}")
-            log(f"Sync job: {job_id}")
+            job_id = None
+            try:
+                res = session.post(
+                    SYNC_GENERATE_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=SYNC_CREATE_TIMEOUT_SEC,
+                )
+            except _NET_ERRORS as e:
+                # Неопределённая ошибка: неизвестно, создался ли job на стороне Sync,
+                # прежде чем считать попытку проваленной — проверяем.
+                log(f"Ambiguous-ошибка при создании job'а: {e} — проверяю через /v2/generations")
+                found_id, confirmed = _find_existing_job(video_url, audio_url)
+                if found_id:
+                    job_id = found_id
+                    log(f"Job подтверждён (id={job_id}) несмотря на ошибку create-запроса — продолжаю без повторной загрузки")
+                else:
+                    if confirmed:
+                        pair["safe"] = True
+                    raise
+            else:
+                log(f"Sync create response: {res.status_code}")
+                log(res.text[:1500])
+                if res.status_code not in [200, 201]:
+                    pair["safe"] = True
+                    raise RuntimeError(f"Sync create error: {res.status_code}\n{res.text}")
+                job_id = res.json().get("id")
+                if not job_id:
+                    pair["safe"] = True
+                    raise RuntimeError(f"Sync не вернул job id: {res.text}")
+                log(f"Sync job: {job_id}")
 
             status_url = f"{SYNC_GENERATE_URL}/{job_id}"
             started = time.time()
@@ -535,13 +630,33 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
                     time.sleep(5)
                     continue
                 if status_res.status_code != 200:
-                    raise RuntimeError(f"Sync status error: {status_res.status_code}\n{status_res.text}")
+                    # Транзитная ошибка статус-эндпоинта (502/429 и т.п.) не значит,
+                    # что сама задача умерла — толерантно повторяем опрос, как с _NET_ERRORS.
+                    log(f"Sync status error: {status_res.status_code} — повторяю опрос")
+                    recovered = False
+                    for retry_i in range(1, 4):
+                        time.sleep(5)
+                        try:
+                            status_res = session.get(status_url, headers=headers, timeout=30)
+                        except _NET_ERRORS as e:
+                            log(f"Сетевая ошибка при повторном опросе статуса: {e} — пересоздаю сессию")
+                            session = _make_session()
+                            continue
+                        if status_res.status_code == 200:
+                            recovered = True
+                            break
+                        log(f"Повтор опроса {retry_i}/3: статус-эндпоинт снова вернул {status_res.status_code}")
+                    if not recovered:
+                        # Исход job'а так и не подтверждён — не помечаем pair как safe.
+                        raise RuntimeError(f"Sync status error после повторов: {status_res.status_code}\n{status_res.text}")
                 status = status_res.json()
                 state = status.get("status")
                 if state != last_state:
                     log(f"Sync status: {state}")
                     last_state = state
                 if state == "COMPLETED":
+                    # Sync подтвердил, что забрал входные файлы — можно удалять.
+                    pair["safe"] = True
                     video_url_out = status.get("outputUrl") or status.get("output_url")
                     if not video_url_out:
                         raise RuntimeError(f"Sync completed без outputUrl: {status}")
@@ -557,6 +672,9 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
                             if not file_exists_ok(final_out):
                                 raise RuntimeError(f"Sync скачал пустое видео: {final_out}")
                             log("Lipsync готов.")
+                            for p in uploaded_pairs:
+                                p["safe"] = True
+                            _cleanup_confirmed()
                             return final_out
                         except _NET_ERRORS as e:
                             log(f"Ошибка скачивания результата (попытка {dl_attempt}/3): {e}")
@@ -564,6 +682,8 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
                                 time.sleep(5)
                     raise RuntimeError("Не удалось скачать результат Sync после 3 попыток")
                 if state in ["FAILED", "REJECTED"]:
+                    # Терминальный статус от Sync — job точно больше не тронет входные файлы.
+                    pair["safe"] = True
                     raise RuntimeError(f"Sync failed: {status}")
                 time.sleep(SYNC_POLL_INTERVAL_SEC)
         except Exception as e:
@@ -574,11 +694,12 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log):
                 time.sleep(60)
         finally:
             session.close()
-            # Удаляем файлы с Cloudinary всегда — и при успехе и при ошибке
-            for pub_id in (video_pub_id, audio_pub_id):
-                if pub_id:
-                    delete_from_cloudinary(pub_id, log)
 
+    # Удаляем с Cloudinary только те пары, чей исход подтверждён.
+    # Файлы с неопределённым исходом (ambiguous timeout/connection error без
+    # подтверждения, исчерпанные повторы статус-эндпоинта, общий таймаут) —
+    # намеренно НЕ удаляются, чтобы не оборвать возможно ещё живую задачу.
+    _cleanup_confirmed()
     raise RuntimeError(f"Sync не сработал после {SYNC_RETRIES} попыток: {last_error}")
 
 
@@ -652,19 +773,24 @@ def _ytdlp_ffmpeg_opts():
     return None
 
 
+def _browser_priority_order():
+    """Порядок перебора браузеров для авто-режима cookies.
+    На Windows Firefox — первым: он не подвержен DPAPI-багу шифрования
+    cookies в Chrome/Chromium/Edge 127+ (известный нерешённый баг yt-dlp)."""
+    if sys.platform == "darwin":
+        return ["chrome", "firefox", "safari", "edge", "brave", "chromium"]
+    elif sys.platform == "win32":
+        return ["firefox", "chrome", "edge", "brave", "chromium"]
+    else:
+        return ["firefox", "chrome", "chromium", "brave", "edge"]
+
+
 def find_best_browser_with_google():
     """
     Ищет браузер где выполнен вход в Google аккаунт.
     Возвращает название браузера для yt-dlp или None.
     """
-    if sys.platform == "darwin":
-        candidates = ["chrome", "firefox", "safari", "edge", "brave", "chromium"]
-    elif sys.platform == "win32":
-        candidates = ["chrome", "firefox", "edge", "brave", "chromium"]
-    else:
-        candidates = ["chrome", "firefox", "chromium", "brave", "edge"]
-
-    for browser in candidates:
+    for browser in _browser_priority_order():
         try:
             import yt_dlp
             ydl_opts = {
@@ -685,12 +811,19 @@ def find_best_browser_with_google():
     return None
 
 
-def download_from_url(url, output_dir, mode, denoise, log, browser=None):
+AUTO_BROWSER = "__AUTO__"
+_DPAPI_ERROR_HINT = "decrypt with dpapi"
+
+
+def download_from_url(url, output_dir, mode, denoise, log, browser=None, cookies_file=None):
     """
     Скачивает видео или аудио через yt-dlp в максимальном качестве.
     mode: 'video' | 'audio'
     denoise: bool — применить голосовой денойз к аудио
-    browser: str | None — браузер для cookiesfrombrowser
+    browser: str | None — браузер для cookiesfrombrowser, либо AUTO_BROWSER —
+             перебор браузеров по приоритету (см. _browser_priority_order),
+             с переходом к следующему при ошибке (напр. DPAPI на Windows)
+    cookies_file: str | None — путь к cookies.txt; приоритет над browser
     """
     homebrew_dirs = ["/opt/homebrew/bin", "/usr/local/bin"]
     for d in homebrew_dirs:
@@ -723,116 +856,173 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None):
         elif d["status"] == "finished":
             log(f"  Скачано: {Path(d.get('filename', '')).name}")
 
+    # dpapi_seen фиксирует, всплыло ли "Failed to decrypt with DPAPI" в логах
+    # yt-dlp за текущую попытку — используется для показа понятного сообщения
+    # об известном баге Chrome/Chromium/Edge 127+ на Windows вместо сырой ошибки.
+    dpapi_seen = {"v": False}
+
     class _YTLogger:
         def debug(self, msg):
             if msg.startswith("[debug]"):
                 return
             log(msg)
         def warning(self, msg):
+            if _DPAPI_ERROR_HINT in msg.lower():
+                dpapi_seen["v"] = True
             log(f"[предупреждение] {msg}")
         def error(self, msg):
+            if _DPAPI_ERROR_HINT in msg.lower():
+                dpapi_seen["v"] = True
             log(f"[ошибка] {msg}")
 
-    common = {
+    base_common = {
         "quiet": True,
         "no_warnings": False,
         "logger": _YTLogger(),
         "progress_hooks": [progress_hook],
     }
     if ffmpeg_dir:
-        common["ffmpeg_location"] = ffmpeg_dir
-    if browser:
-        common["cookiesfrombrowser"] = (browser.lower(),)
+        base_common["ffmpeg_location"] = ffmpeg_dir
 
-    if mode == "video":
-        outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
-        opts = {
-            **common,
-            "format": (
-                "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/"
-                "bestvideo[ext=mp4][vcodec^=avc]+bestaudio/"
-                "bestvideo[vcodec^=avc]+bestaudio/"
-                "bestvideo+bestaudio/"
-                "best"
-            ),
-            "merge_output_format": "mp4",
-            "format_sort": ["res", "ext:mp4:m4a"],
-            "outtmpl": outtmpl,
-            "restrictfilenames": True,
-            "windowsfilenames": True,
-            "postprocessors": [{
-                "key": "FFmpegVideoConvertor",
-                "preferedformat": "mp4",
-            }],
-            "postprocessor_args": {
-                "videoconvertor": ["-vcodec", "libx264", "-acodec", "aac"],
-                "merger": ["-c:v", "copy", "-c:a", "aac"],
-            },
-        }
-        log("Получаю информацию о видео...")
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if not os.path.exists(filename):
-                filename = str(Path(filename).with_suffix(".mp4"))
-        log(f"Сохранено: {filename}")
-        return filename, None
+    def _attempt(common):
+        if mode == "video":
+            outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
+            opts = {
+                **common,
+                "format": (
+                    "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/"
+                    "bestvideo[ext=mp4][vcodec^=avc]+bestaudio/"
+                    "bestvideo[vcodec^=avc]+bestaudio/"
+                    "bestvideo+bestaudio/"
+                    "best"
+                ),
+                "merge_output_format": "mp4",
+                "format_sort": ["res", "ext:mp4:m4a"],
+                "outtmpl": outtmpl,
+                "restrictfilenames": True,
+                "windowsfilenames": True,
+                "postprocessors": [{
+                    "key": "FFmpegVideoConvertor",
+                    "preferedformat": "mp4",
+                }],
+                "postprocessor_args": {
+                    "videoconvertor": ["-vcodec", "libx264", "-acodec", "aac"],
+                    "merger": ["-c:v", "copy", "-c:a", "aac"],
+                },
+            }
+            log("Получаю информацию о видео...")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                if not os.path.exists(filename):
+                    filename = str(Path(filename).with_suffix(".mp4"))
+            log(f"Сохранено: {filename}")
+            return filename, None
 
-    elif mode == "audio":
-        outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
-        opts = {
-            **common,
-            "format": "bestaudio/best",
-            "outtmpl": outtmpl,
-            "restrictfilenames": True,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "0",
-            }],
-        }
-        log("Получаю информацию об аудио...")
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            base_name = ydl.prepare_filename(info)
-        filename = str(Path(base_name).with_suffix(".mp3"))
+        elif mode == "audio":
+            outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
+            opts = {
+                **common,
+                "format": "bestaudio/best",
+                "outtmpl": outtmpl,
+                "restrictfilenames": True,
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "0",
+                }],
+            }
+            log("Получаю информацию об аудио...")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                base_name = ydl.prepare_filename(info)
+            filename = str(Path(base_name).with_suffix(".mp3"))
 
-        if denoise and os.path.exists(filename):
-            log(f"Передаю в audio-separator: {Path(filename).name}")
-            vocals_out = str(Path(filename).with_suffix("")) + "_vocals.mp3"
-            _separate_vocals(filename, vocals_out, log)
-            os.remove(filename)
-            filename = vocals_out
+            if denoise and os.path.exists(filename):
+                log(f"Передаю в audio-separator: {Path(filename).name}")
+                vocals_out = str(Path(filename).with_suffix("")) + "_vocals.mp3"
+                _separate_vocals(filename, vocals_out, log)
+                os.remove(filename)
+                filename = vocals_out
 
-        log(f"Сохранено: {filename}")
-        return filename, None
+            log(f"Сохранено: {filename}")
+            return filename, None
 
-    else:  # split — видео как есть + аудио отдельно
-        outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
-        opts = {
-            **common,
-            "format": (
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[ext=mp4]+bestaudio/"
-                "bestvideo+bestaudio/best"
-            ),
-            "merge_output_format": "mp4",
-            "outtmpl": outtmpl,
-            "restrictfilenames": True,
-        }
-        log("Скачиваю видео в максимальном качестве...")
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if not os.path.exists(filename):
-                filename = str(Path(filename).with_suffix(".mp4"))
+        else:  # split — видео как есть + аудио отдельно
+            outtmpl = str(Path(output_dir) / f"{timestamp}_%(title).80s.%(ext)s")
+            opts = {
+                **common,
+                "format": (
+                    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                    "bestvideo[ext=mp4]+bestaudio/"
+                    "bestvideo+bestaudio/best"
+                ),
+                "merge_output_format": "mp4",
+                "outtmpl": outtmpl,
+                "restrictfilenames": True,
+            }
+            log("Скачиваю видео в максимальном качестве...")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                if not os.path.exists(filename):
+                    filename = str(Path(filename).with_suffix(".mp4"))
 
-        video_out, audio_out = _split_video_audio(filename, output_dir, denoise, log)
+            video_out, audio_out = _split_video_audio(filename, output_dir, denoise, log)
+            try:
+                os.remove(filename)
+            except Exception:
+                pass
+            return video_out, audio_out
+
+    def _friendly_error(exc, dpapi):
+        if dpapi:
+            return (
+                "Не удалось прочитать куки из браузера (известный баг Chrome на Windows). "
+                "Попробуйте выбрать Firefox или загрузить файл cookies.txt в настройках."
+            )
+        return str(exc)
+
+    # ── cookies.txt — приоритет над cookies-from-browser ────────────────────
+    if cookies_file:
+        common = {**base_common, "cookiefile": cookies_file}
         try:
-            os.remove(filename)
-        except Exception:
-            pass
-        return video_out, audio_out
+            return _attempt(common)
+        except Exception as e:
+            dpapi = dpapi_seen["v"] or (_DPAPI_ERROR_HINT in str(e).lower())
+            raise RuntimeError(_friendly_error(e, dpapi)) from e
+
+    # ── Авто: перебор браузеров по приоритету, следующий при ошибке ─────────
+    if browser == AUTO_BROWSER:
+        candidates = _browser_priority_order()
+        last_err = None
+        any_dpapi = False
+        for i, b in enumerate(candidates, start=1):
+            dpapi_seen["v"] = False
+            common = {**base_common, "cookiesfrombrowser": (b,)}
+            try:
+                log(f"Пробую cookies из браузера: {b.capitalize()} ({i}/{len(candidates)})...")
+                return _attempt(common)
+            except Exception as e:
+                last_err = e
+                dpapi = dpapi_seen["v"] or (_DPAPI_ERROR_HINT in str(e).lower())
+                any_dpapi = any_dpapi or dpapi
+                reason = "не удалось расшифровать cookies (DPAPI)" if dpapi else str(e)[:150]
+                log(f"⚠ {b.capitalize()} не сработал: {reason} — пробую следующий браузер")
+                continue
+        raise RuntimeError(_friendly_error(last_err, any_dpapi))
+
+    # ── Конкретный браузер, выбранный вручную ────────────────────────────────
+    if browser:
+        common = {**base_common, "cookiesfrombrowser": (browser.lower(),)}
+        try:
+            return _attempt(common)
+        except Exception as e:
+            dpapi = dpapi_seen["v"] or (_DPAPI_ERROR_HINT in str(e).lower())
+            raise RuntimeError(_friendly_error(e, dpapi)) from e
+
+    # ── Без cookies ───────────────────────────────────────────────────────
+    return _attempt(base_common)
 
 
 def _separate_vocals(input_path, output_path, log):
@@ -1097,7 +1287,7 @@ def translate_with_groq(text, target_lang, api_key, log) -> str:
     )
 
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": GROQ_TRANSLATE_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
@@ -1106,24 +1296,43 @@ def translate_with_groq(text, target_lang, api_key, log) -> str:
         "max_tokens": 4096,
     }
 
-    res = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=60,
-    )
+    last_err = None
+    for attempt in range(1, GROQ_TRANSLATE_RETRIES + 1):
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=60,
+        )
 
-    if res.status_code == 401:
-        raise RuntimeError("Groq API key неверный")
-    if res.status_code != 200:
-        raise RuntimeError(f"Groq error {res.status_code}: {res.text[:300]}")
+        if res.status_code == 401:
+            raise RuntimeError("Groq API key неверный")
 
-    result = res.json()["choices"][0]["message"]["content"].strip()
-    log(f"Переведено: {len(result)} символов")
-    return result
+        if res.status_code == 429:
+            wait = 5.0
+            try:
+                wait = max(wait, float(res.headers.get("retry-after", wait)))
+            except ValueError:
+                pass
+            last_err = RuntimeError(f"Groq error 429: {res.text[:300]}")
+            if attempt < GROQ_TRANSLATE_RETRIES:
+                log(f"Groq: превышен лимит запросов, пауза {wait:.0f} сек "
+                    f"(попытка {attempt}/{GROQ_TRANSLATE_RETRIES})...")
+                time.sleep(wait)
+                continue
+            raise last_err
+
+        if res.status_code != 200:
+            raise RuntimeError(f"Groq error {res.status_code}: {res.text[:300]}")
+
+        result = res.json()["choices"][0]["message"]["content"].strip()
+        log(f"Переведено: {len(result)} символов")
+        return result
+
+    raise last_err
 
 
 def fetch_groq_usage(api_key) -> dict | None:
@@ -1572,7 +1781,8 @@ class LipsyncTwoModeApp(_BaseApp):
                         self.after(0, lambda: messagebox.showwarning(
                             "ElevenLabs",
                             f"Твой план ElevenLabs не поддерживает {ELEVEN_TTS_MODEL_ID}.\n"
-                            "Нужен план Creator или выше.",
+                            "Нужен план Creator или выше. Можно выбрать Eleven v3 "
+                            "в панели генерации голоса.",
                         ))
             except Exception:
                 pass
@@ -2375,13 +2585,43 @@ class LipsyncTwoModeApp(_BaseApp):
         browser_override_var = ctk.StringVar(value="Авто")
         ctk.CTkOptionMenu(
             cookies_row,
-            values=["Авто", "Chrome", "Firefox", "Safari", "Edge", "Brave", "Chromium"],
+            values=["Авто", "Chrome", "Firefox", "Safari", "Edge", "Brave", "Chromium", "Файл cookies.txt"],
             variable=browser_override_var,
             fg_color=BTN, button_color=BTN,
             button_hover_color=BTN_HOVER,
-            width=120,
+            width=150,
         ).pack(side="right")
         self.label(cookies_row, "Браузер:", size=12, color=MUTED).pack(side="right", padx=(0, 6))
+
+        # ── Путь к cookies.txt (показывается только при выборе "Файл cookies.txt") ──
+        cookies_file_var = ctk.StringVar(value="")
+        cookies_file_row = ctk.CTkFrame(outer, fg_color="transparent")
+
+        ctk.CTkEntry(
+            cookies_file_row, textvariable=cookies_file_var,
+            fg_color="white", text_color="#111",
+            border_color="#737373", font=ctk.CTkFont(size=11),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        def choose_cookies_file():
+            f = filedialog.askopenfilename(
+                parent=self, title="Выбери cookies.txt",
+                filetypes=[("Cookies", "*.txt"), ("Все файлы", "*.*")],
+            )
+            if f:
+                cookies_file_var.set(f)
+
+        self.button(cookies_file_row, "Обзор...", choose_cookies_file,
+                    color=BTN, hover=BTN_HOVER, width=90).pack(side="left")
+
+        def _update_cookies_file_vis(*_):
+            if browser_override_var.get() == "Файл cookies.txt":
+                cookies_file_row.pack(fill="x", padx=20, pady=(0, 8))
+            else:
+                cookies_file_row.pack_forget()
+
+        browser_override_var.trace_add("write", _update_cookies_file_vis)
+        _update_cookies_file_vis()
 
         def _auto_detect_browser():
             if not self._browser_checked:
@@ -2482,12 +2722,16 @@ class LipsyncTwoModeApp(_BaseApp):
             output_dir = folder_var.get()
 
             def get_browser_for_download():
+                """Возвращает (browser, cookies_file) для download_from_url."""
                 if not use_cookies_var.get():
-                    return None
+                    return None, None
                 override = browser_override_var.get()
+                if override == "Файл cookies.txt":
+                    path = cookies_file_var.get().strip()
+                    return (None, path) if path else (None, None)
                 if override != "Авто":
-                    return override.lower()
-                return self._detected_browser
+                    return override.lower(), None
+                return AUTO_BROWSER, None
 
             dl_btn.configure(state="disabled", text="Скачиваю...")
             stop_btn.configure(state="normal")
@@ -2508,9 +2752,10 @@ class LipsyncTwoModeApp(_BaseApp):
                         self.after(0, lambda s=short: item["name"].configure(text=s))
 
                 try:
+                    browser_choice, cookies_file_choice = get_browser_for_download()
                     main_file, extra_file = download_from_url(
                         url, output_dir, mode, denoise, log,
-                        browser=get_browser_for_download())
+                        browser=browser_choice, cookies_file=cookies_file_choice)
                     show_name = Path(main_file).name
                     if extra_file:
                         show_name += " + " + Path(extra_file).name
@@ -3275,6 +3520,26 @@ class LipsyncTwoModeApp(_BaseApp):
         )
         status_text_label.pack(anchor="w", padx=22, pady=(0, 8))
 
+        # ── Модель и язык ─────────────────────────────────────────────────
+        model_row = ctk.CTkFrame(frame, fg_color="transparent")
+        model_row.pack(fill="x", padx=22, pady=(0, 10))
+
+        self.label(model_row, "Модель:", size=12, color=MUTED).pack(side="left", padx=(0, 6))
+        model_var = ctk.StringVar(value="Eleven v4")
+        ctk.CTkOptionMenu(
+            model_row, values=["Eleven v4", "Eleven v3"],
+            variable=model_var, fg_color=BTN, button_color=BTN,
+            button_hover_color=BTN_HOVER, width=130,
+        ).pack(side="left", padx=(0, 20))
+
+        self.label(model_row, "Язык:", size=12, color=MUTED).pack(side="left", padx=(0, 6))
+        lang_var = ctk.StringVar(value="Авто")
+        ctk.CTkOptionMenu(
+            model_row, values=list(ELEVEN_TTS_LANGUAGES.keys()),
+            variable=lang_var, fg_color=BTN, button_color=BTN,
+            button_hover_color=BTN_HOVER, width=150,
+        ).pack(side="left")
+
         # ── Кнопка запуска ────────────────────────────────────────────────
         gen_row = ctk.CTkFrame(frame, fg_color="transparent")
         gen_row.pack(fill="x", padx=22, pady=(0, 16))
@@ -3433,6 +3698,9 @@ class LipsyncTwoModeApp(_BaseApp):
         def _generate_slot(slot):
             voice_value = voice_box.get("1.0", "end").strip()
             full_text = text_box.get("1.0", "end").strip()
+            model_id = (ELEVEN_TTS_MODEL_ID_V3 if model_var.get() == "Eleven v3"
+                        else ELEVEN_TTS_MODEL_ID)
+            language_code = ELEVEN_TTS_LANGUAGES.get(lang_var.get())
             self.after(0, lambda s=slot: _set_slot_generating(s))
 
             def run():
@@ -3453,7 +3721,8 @@ class LipsyncTwoModeApp(_BaseApp):
                     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
                     tmp_dir = tempfile.mkdtemp()
                     tmp_path = str(Path(tmp_dir) / f"{safe_vname}_{timestamp}_variant_{slot}.mp3")
-                    text_to_speech_mp3(eleven_text, voice_id, tmp_path, self.log)
+                    text_to_speech_mp3(eleven_text, voice_id, tmp_path, self.log,
+                                        model_id=model_id, language_code=language_code)
                     self.after(0, lambda s=slot, p=tmp_path: _set_slot_done(s, p))
                 except Exception as e:
                     err = str(e)
