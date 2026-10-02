@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.2.0",
-  "release_notes": "Добавлены эстонский и латышский языки в переводчик",
+  "latest_version": "1.3.0",
+  "release_notes": "Eleven v4 в генераторе голоса, фикс переводчика Groq (модель llama-3.3-70b-versatile удалена Groq), устойчивость Sync.so и yt-dlp (cookies.txt, авто-перебор браузеров)",
   "force_update": false,
   "min_required_version": "1.0.0",
-  "sha256": "61a1a610aa8a2f8ea998429fbd27a2241dcc7a016cf8b7a288610fe75d95b70d"
+  "sha256": "4778701c20f5341904fd2a94013d40a26a5ad2b49c25d2739ed4fdb3c8ed1e63"
 }
