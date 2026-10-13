@@ -29,3 +29,4 @@ sheqelmotion_previews/
 .claude/
 app.py.bak
 app_before_*.py
+test_report.txt

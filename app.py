@@ -102,7 +102,13 @@ def rotate_log_file():
 _MEDIA_EXT = r"(?:mp4|mov|mkv|avi|webm|m4v|mp3|wav|m4a|aac|flac|ogg|opus|txt|json|srt|vtt|png|jpe?g)"
 # Порядок важен: сначала URL и ключи, потом пути, имена файлов и длинные токены.
 _SANITIZE_RULES = [
+    (re.compile(r"(?i)\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "<email>"),
     (re.compile(r"(?i)\b(?:https?|ftp)://[^\s\"'<>\]})]+"), "<url>"),
+    # IP-адреса и имена компьютеров (Mac: «…-MacBook-Pro.local», Windows: «DESKTOP-ABC1234»).
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<ip>"),
+    (re.compile(r"(?i)\b(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}\b"), "<ip>"),
+    (re.compile(r"(?i)\b[\w-]+\.(?:local|lan|home|localdomain)\b"), "<host>"),
+    (re.compile(r"\b(?:DESKTOP|LAPTOP|WIN|PC)-[A-Z0-9]{4,}\b"), "<host>"),
     # Параметры подписи вне URL (обрывки presigned-ссылок в текстах ошибок хранилищ).
     (re.compile(r"(?i)\b(X-Amz-[A-Za-z-]+|X-Goog-[A-Za-z-]+|Signature|Expires|Policy|Key-Pair-Id|"
                 r"token|sig)=[^&\s\"'<>]+"), r"\1=<redacted>"),
@@ -117,6 +123,7 @@ _SANITIZE_RULES = [
     # Пути в кавычках скрываем целиком — внутри бывают пробелы («Рабочий стол»).
     (re.compile(r"([\"'])~[/\\][^\"'\n]*\1"), r"\1~/…\1"),
     (re.compile(r"(?i)([\"'])(?:/|[A-Z]:\\)[^\"'\n]*\1"), r"\1<path>\1"),
+    (re.compile(r"(?i)~[/\\][^\n\"'<>]*?\." + _MEDIA_EXT + r"\b"), "~/…"),
     (re.compile(r"~[/\\][^\s\"'<>]*"), "~/…"),
     (re.compile(r"(?i)\b[A-Z]:\\[^\s\"'<>]*"), "<path>"),
     (re.compile(r"(?<![\w.~])/(?:[^\s/\"'<>]+/)+[^\s\"'<>]*"), "<path>"),
@@ -139,14 +146,39 @@ _CONTENT_MARKERS = re.compile(
     r"Аудио сохранено:|Lipsync готов:|Передаю в audio-separator:|voice_id:)")
 
 
+_LOCAL_IDENTITY = None
+
+
+def _local_identity_values():
+    """Имя пользователя и компьютера этой машины — вырезаются из отчёта дословно."""
+    global _LOCAL_IDENTITY
+    if _LOCAL_IDENTITY is None:
+        values = set()
+        for getter in (lambda: os.environ.get("USER"), lambda: os.environ.get("USERNAME"),
+                       lambda: Path.home().name, platform.node,
+                       lambda: platform.node().split(".")[0]):
+            try:
+                v = (getter() or "").strip()
+            except Exception:
+                v = ""
+            if len(v) >= 3:
+                values.add(v)
+        _LOCAL_IDENTITY = sorted(values, key=len, reverse=True)
+    return _LOCAL_IDENTITY
+
+
 def sanitize_for_report(text):
-    """Вырезает из строки ключи, токены, URL, пути, имена файлов и голосов."""
+    """Вырезает из строки ключи, токены, URL, пути, имена файлов и голосов, почту, IP,
+    имя пользователя и компьютера."""
     text = str(text)
     m = _CONTENT_MARKERS.search(text)
     if m:
         text = text[:m.end()] + " …"
     for pattern, repl in _SANITIZE_RULES:
         text = pattern.sub(repl, text)
+    # Последним шагом: имя пользователя и компьютера, если они встретились вне путей.
+    for value in _local_identity_values():
+        text = re.sub(r"(?<![\w-])" + re.escape(value) + r"(?![\w-])", "<local>", text, flags=re.IGNORECASE)
     return text
 
 
@@ -664,6 +696,123 @@ def set_adaptive_window(win, width_ratio=0.72, height_ratio=0.82, min_width=900,
 
     win.geometry(f"{width}x{height}+{x}+{y}")
     win.minsize(min_width, min_height)
+
+
+# ── Боковое меню: иконки, подсказки, подгонка подписей ─────────────────────
+# Все иконки меню — здесь. Если на какой-то системе символ не отрисуется, меняется одна строка.
+NAV_ICONS = {
+    "voice_gen": "🎤",
+    "voice_clone": "👥",
+    "downloader": "⬇",
+    "compress": "📦",
+    "transcribe": "📝",
+    "groq_translate": "🌐",
+    "new_task": "➕",
+    "clear_all": "🗑",
+    "update": "🔄",
+    "settings": "⚙",
+}
+NAV_ARROW_OPEN = "▼"
+NAV_ARROW_CLOSED = "►"
+SIDEBAR_WIDTH = 210
+MAIN_MIN_HEIGHT = 640
+KEY_DOT_ON = "#4ade80"
+KEY_DOT_OFF = "#5b6178"
+SETTINGS_PANELS = {"settings", "api", "sync", "cloudinary", "groq"}
+
+
+def fit_text(font, text, max_px):
+    """Подпись, которая помещается в max_px пикселей; иначе обрезка с «…». (текст, обрезан_ли)."""
+    if font.measure(text) <= max_px:
+        return text, False
+    cut = text
+    while cut and font.measure(cut + "…") > max_px:
+        cut = cut[:-1]
+    return cut.rstrip() + "…", True
+
+
+def balance_style(balance):
+    """Текст и цвет баланса ElevenLabs (пороги прежнего бейджа на кнопке API key)."""
+    if not balance:
+        return "", MUTED
+    remaining = balance["remaining"]
+    label = f"{remaining // 1000}k" if remaining >= 1000 else str(remaining)
+    pct = remaining / max(balance["limit"], 1)
+    color = "#86efac" if pct > 0.3 else "#fcd34d" if pct > 0.1 else "#fca5a5"
+    return f"{label} симв.", color
+
+
+def reveal_in_file_manager(path, platform_name=None, popen=None):
+    """Показывает файл в Finder / Проводнике. Если файла нет — открывает папку."""
+    platform_name = platform_name or sys.platform
+    popen = popen or subprocess.Popen
+    folder = os.path.dirname(path) or "."
+    if not os.path.exists(path):
+        open_folder(folder)
+        return "folder"
+    if platform_name == "darwin":
+        popen(["open", "-R", path])
+    elif platform_name == "win32":
+        # Проводник разбирает /select сам: путь целиком в кавычках, строкой.
+        popen(f'explorer /select,"{os.path.normpath(path)}"')
+    else:
+        open_folder(folder)
+        return "folder"
+    return "file"
+
+
+class HoverTip:
+    """Подсказка при наведении. text — строка или функция (для меняющегося текста)."""
+
+    def __init__(self, widget, text, delay=500):
+        self.widget, self.text, self.delay = widget, text, delay
+        self._job = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def current_text(self):
+        return self.text() if callable(self.text) else self.text
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._job = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._job is not None:
+            try:
+                self.widget.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _show(self):
+        self._job = None
+        text = self.current_text()
+        if not text or self._tip is not None:
+            return
+        try:
+            tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            tip.attributes("-topmost", True)
+            tk.Label(tip, text=text, justify="left", bg="#2a2d3e", fg=TEXT, padx=8, pady=5,
+                     wraplength=320, font=("Helvetica", 11)).pack()
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 2
+            tip.wm_geometry(f"+{x}+{y}")
+            self._tip = tip
+        except Exception:
+            self._tip = None
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
 
 
 def get_duration(path):
@@ -2467,7 +2616,7 @@ SYNC_ESTIMATE_TIMEOUT_SEC = 10
 SYNC_PRICE_PER_FRAME = 0.00427        # по ответу estimate для sync-3; запасной вариант локальной оценки
 SYNC_SEC_PER_VIDEO_SEC = (20, 30)     # время обработки sync-3 на секунду видео
 SYNC_QUEUE_OVERHEAD_SEC = (60, 120)   # ожидание в очереди Sync на каждую задачу
-COST_CONFIRM_DEFAULT_THRESHOLD = 5.0
+COST_CONFIRM_DEFAULT_THRESHOLD = 20.0
 
 
 # Последняя цена за кадр из успешного ответа estimate (сохраняется в конфиге между сессиями).
@@ -3519,7 +3668,7 @@ class LipsyncTwoModeApp(_BaseApp):
     def __init__(self):
         super().__init__()
         self.title("SheqelMotion Studio")
-        set_adaptive_window(self)   
+        set_adaptive_window(self, min_height=MAIN_MIN_HEIGHT)
         self.resizable(True, True)
         self.configure(fg_color=BG)
         # Принудительно поднимаем окно на передний план (фикс для macOS)
@@ -3612,6 +3761,11 @@ class LipsyncTwoModeApp(_BaseApp):
                 self.createcommand("::tk::mac::Quit", self._on_close)
             except Exception:
                 pass
+        self._nav_buttons = {}
+        self._nav_sections = {}
+        self._key_dots = {}
+        self._balance_lbl = None
+        self._settings_widgets = None
         self.build_ui()
         self.add_roll()
         self.poll_logs()
@@ -3619,11 +3773,8 @@ class LipsyncTwoModeApp(_BaseApp):
         self._init_error_reporting()
         self.cost_confirm_var.set(self.cost_confirm_enabled)
         self._saved_sync_price = sync_price_state["per_frame"]
-        self.sync_fps_menu.set(SYNC_FPS_LABELS[self.sync_fps_mode])
-        self.sync_storage_menu.set(SYNC_STORAGE_LABELS[self.sync_storage])
-        self.cost_threshold_entry.delete(0, "end")
-        self.cost_threshold_entry.insert(0, f"{self.cost_confirm_threshold:g}")
         self._restore_state()
+        self._apply_nav_collapsed()
         global sync_job_hook
         sync_job_hook = self._on_sync_journal_event
         self.update_status()
@@ -3760,6 +3911,8 @@ class LipsyncTwoModeApp(_BaseApp):
         self.sync_storage = self._sync_storage_choice
         self.save_config()
         self.log(f"Хранилище для Sync: {label}")
+        if self._settings_widgets:
+            self._render_settings()   # подсказка «Выбрано вами»
 
     def _on_sync_fps_change(self, label):
         self.sync_fps_mode = SYNC_FPS_MODES[label]
@@ -4254,7 +4407,7 @@ class LipsyncTwoModeApp(_BaseApp):
         body.pack(fill="both", expand=True)
 
         # ── Sidebar ──────────────────────────────────────────────────────────
-        sidebar = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=0, width=200)
+        sidebar = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=0, width=SIDEBAR_WIDTH)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
 
@@ -4267,94 +4420,16 @@ class LipsyncTwoModeApp(_BaseApp):
         ctk.CTkFrame(sidebar, height=1, fg_color="#2a2d3e", corner_radius=0).pack(
             fill="x", padx=12, pady=(0, 4))
 
-        def sb_header(text):
-            ctk.CTkLabel(
-                sidebar, text=text, text_color=MUTED,
-                font=ctk.CTkFont(size=10, weight="bold"), anchor="w",
-            ).pack(fill="x", padx=14, pady=(10, 2))
-
-        def sb_btn(text, command, color="transparent", hover=BTN_HOVER):
-            btn = ctk.CTkButton(
-                sidebar, text=f"  {text}", command=command,
-                fg_color=color, hover_color=hover,
-                text_color=TEXT, anchor="w",
-                corner_radius=8, height=36,
-                font=ctk.CTkFont(size=13),
-            )
-            btn.pack(fill="x", padx=8, pady=2)
-            return btn
-
-        # ⚙️ НАСТРОЙКИ
-        sb_header("⚙️  НАСТРОЙКИ")
-        self.api_btn = sb_btn("API key", self.show_api_key_panel)
-        self.sync_btn = sb_btn("Sync key", self.show_sync_key_panel)
-        self.cloudinary_btn = sb_btn("Cloudinary key", self.show_cloudinary_panel)
-        self.groq_btn = sb_btn("Groq key", self.show_groq_key_panel)
-        ctk.CTkSwitch(
-            sidebar, text="Отчёты об ошибках",
-            variable=self.error_reports_var, command=self._on_error_reports_toggle,
-            progress_color=BTN_OK, text_color=TEXT, font=ctk.CTkFont(size=12),
-        ).pack(fill="x", padx=14, pady=(6, 2))
-        ctk.CTkSwitch(
-            sidebar, text="Окно стоимости",
-            variable=self.cost_confirm_var, command=self._on_cost_confirm_toggle,
-            progress_color=BTN_OK, text_color=TEXT, font=ctk.CTkFont(size=12),
-        ).pack(fill="x", padx=14, pady=(4, 2))
-        ctk.CTkLabel(sidebar, text="Частота кадров для Sync:", text_color=MUTED, anchor="w",
-                     font=ctk.CTkFont(size=11)).pack(fill="x", padx=14, pady=(4, 0))
-        self.sync_fps_menu = ctk.CTkOptionMenu(
-            sidebar, values=list(SYNC_FPS_MODES), command=self._on_sync_fps_change,
-            fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER,
-            dropdown_fg_color=PANEL, dropdown_hover_color=BTN_HOVER,
-            font=ctk.CTkFont(size=11), dropdown_font=ctk.CTkFont(size=11), height=26,
-        )
-        self.sync_fps_menu.set(SYNC_FPS_LABELS[self.sync_fps_mode])
-        self.sync_fps_menu.pack(fill="x", padx=12, pady=(2, 4))
-        ctk.CTkLabel(sidebar, text="Хранилище для Sync:", text_color=MUTED, anchor="w",
-                     font=ctk.CTkFont(size=11)).pack(fill="x", padx=14, pady=(2, 0))
-        self.sync_storage_menu = ctk.CTkOptionMenu(
-            sidebar, values=list(SYNC_STORAGE_MODES), command=self._on_sync_storage_change,
-            fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER,
-            dropdown_fg_color=PANEL, dropdown_hover_color=BTN_HOVER,
-            font=ctk.CTkFont(size=11), dropdown_font=ctk.CTkFont(size=11), height=26,
-        )
-        self.sync_storage_menu.set(SYNC_STORAGE_LABELS[self.sync_storage])
-        self.sync_storage_menu.pack(fill="x", padx=12, pady=(2, 4))
-        threshold_row = ctk.CTkFrame(sidebar, fg_color="transparent")
-        threshold_row.pack(fill="x", padx=14, pady=(0, 2))
-        ctk.CTkLabel(threshold_row, text="Всегда спрашивать от $", text_color=MUTED,
-                     font=ctk.CTkFont(size=11)).pack(side="left")
-        self.cost_threshold_entry = ctk.CTkEntry(threshold_row, width=52, height=24,
-                                                 font=ctk.CTkFont(size=11))
-        self.cost_threshold_entry.pack(side="left", padx=(4, 0))
-        self.cost_threshold_entry.insert(0, f"{self.cost_confirm_threshold:g}")
-        for seq in ("<Return>", "<FocusOut>"):
-            self.cost_threshold_entry.bind(
-                seq, lambda e: self._on_cost_threshold_change(self.cost_threshold_entry))
-        self.clear_data_btn = sb_btn("Очистить сохранённые данные", self.clear_saved_data)
-
-        # 🎙 ГОЛОС
-        sb_header("🎙  ГОЛОС")
-        self.voice_btn = sb_btn("Сгенерировать голос", self.show_voice_gen_panel)
-        self.clone_btn = sb_btn("Клонировать голос", self.show_voice_clone_panel)
-
-        # 📥 МЕДИА
-        sb_header("📥  МЕДИА")
-        self.dl_btn = sb_btn("⬇  Скачать видео", self.show_downloader_panel)
-        self.compress_btn = sb_btn("🗜  Сжать видео", self.show_compress_panel)
-
-        # 🎙 ТРАНСКРИБАЦИЯ
-        sb_header("🎙  ТРАНСКРИБАЦИЯ")
-        self.transcribe_btn = sb_btn("Транскрибировать", self.show_transcribe_panel)
-        self.translate_groq_btn = sb_btn("Переводчик", self.show_groq_translate_panel)
-
-        # ➕ ЗАДАЧИ
-        sb_header("➕  ЗАДАЧИ")
-        self.add_btn = sb_btn("Новая задача", self.add_roll,
-                              color=BTN_PRIMARY, hover=BTN_PRIMARY_HOVER)
-        self.clear_btn = sb_btn("Очистить всё", self.clear_rolls)
-        self.update_btn = sb_btn("🔄  Обновить",
-                                 lambda: self.check_for_updates(silent=False))
+        # Нижний блок закреплён (упакован первым), меню над ним прокручивается.
+        sidebar_bottom = ctk.CTkFrame(sidebar, fg_color=PANEL, corner_radius=0)
+        sidebar_bottom.pack(side="bottom", fill="x")
+        nav_scroll = ctk.CTkScrollableFrame(sidebar, fg_color=PANEL, corner_radius=0,
+                                            scrollbar_button_color=PANEL,
+                                            scrollbar_button_hover_color="#3d3d6a")
+        nav_scroll.pack(fill="both", expand=True, padx=(4, 0))
+        self._build_nav(nav_scroll)
+        self._build_sidebar_bottom(sidebar_bottom)
+        self._enable_mousewheel(nav_scroll)
 
         # Thin vertical divider
         ctk.CTkFrame(body, width=1, fg_color="#2a2d3e", corner_radius=0).pack(
@@ -4425,7 +4500,26 @@ class LipsyncTwoModeApp(_BaseApp):
             container = factory()
             self._panels[name] = container
         container.pack(fill="both", expand=True)
+        if not created and hasattr(container, "_parent_canvas"):
+            self.after(30, lambda c=container._parent_canvas: self._repaint_scroll(c))
         return container, created
+
+    @staticmethod
+    def _repaint_scroll(canvas):
+        """macOS: после смены размера окна скрытая прокручиваемая панель при повторном показе
+        иногда остаётся недорисованной, пока её не прокрутят. Сдвиг на шаг и возврат на место
+        её перерисовывает; прокрутка «на ту же позицию» не помогает."""
+        try:
+            if not canvas.winfo_exists():
+                return
+            top = canvas.yview()[0]
+            if top > 0:
+                canvas.yview_scroll(-1, "units")
+            else:
+                canvas.yview_scroll(1, "units")
+            canvas.after(40, lambda: canvas.winfo_exists() and canvas.yview_moveto(top))
+        except Exception:
+            pass
 
     def _start_panel(self, name):
         """Панели не уничтожаются: создаются один раз, дальше только скрываются и показываются.
@@ -4551,6 +4645,319 @@ class LipsyncTwoModeApp(_BaseApp):
             self._sync_journal.append(event)
             del self._sync_journal[:-MAX_SYNC_JOURNAL]
             self._journal_dirty = True
+
+    # ── Боковое меню (только навигация) ───────────────────────────────────
+    def _nav_spec(self):
+        """Разделы меню. Пункт: (панель или None, иконка, подпись, подсказка, команда).
+        Новый пункт — одна строка здесь."""
+        return [
+            ("voice", "ГОЛОС", [
+                ("voice_gen", "voice_gen", "Сгенерировать", "Сгенерировать голос (ElevenLabs)",
+                 self.show_voice_gen_panel),
+                ("voice_clone", "voice_clone", "Клонировать", "Клонировать голос (ElevenLabs)",
+                 self.show_voice_clone_panel),
+            ]),
+            ("media", "МЕДИА", [
+                ("downloader", "downloader", "Скачать видео", "Скачать видео или аудио по ссылке",
+                 self.show_downloader_panel),
+                ("compress", "compress", "Сжать видео", "Сжать видео локально через ffmpeg",
+                 self.show_compress_panel),
+            ]),
+            ("text", "ТЕКСТ", [
+                ("transcribe", "transcribe", "Транскрибация", "Распознать речь из аудио или видео (Groq)",
+                 self.show_transcribe_panel),
+                ("groq_translate", "groq_translate", "Переводчик", "Перевести текст (Groq)",
+                 self.show_groq_translate_panel),
+            ]),
+            ("tasks", "ЗАДАЧИ", [
+                (None, "new_task", "Новая задача", "Добавить ролик в очередь", self.add_roll),
+                (None, "clear_all", "Очистить всё", "Очистить очередь роликов", self.clear_rolls),
+                (None, "update", "Обновить", "Проверить обновления приложения",
+                 lambda: self.check_for_updates(silent=False)),
+            ]),
+        ]
+
+    def _key_spec(self):
+        """Ключи: (id, название, задан ли, панель изменения, назначение, необязательный)."""
+        return [
+            ("elevenlabs", "ElevenLabs", lambda: bool(self.api_key), self.show_api_key_panel,
+             "Озвучка и клонирование голоса", False),
+            ("sync", "Sync", lambda: bool(self.sync_key) and "ВСТАВЬ" not in self.sync_key,
+             self.show_sync_key_panel, "Липсинк", False),
+            ("cloudinary", "Cloudinary", cloudinary_configured, self.show_cloudinary_panel,
+             "Запасное хранилище для Sync", True),
+            ("groq", "Groq", lambda: bool(self.groq_api_key), self.show_groq_key_panel,
+             "Транскрибация и переводчик", False),
+        ]
+
+    def _nav_button(self, parent, panel, icon_key, label, tip, command):
+        font = ctk.CTkFont(size=13)
+        icon = NAV_ICONS.get(icon_key, "•")
+        text, cut = fit_text(font, f"{icon}  {label}", SIDEBAR_WIDTH - 52)
+        btn = ctk.CTkButton(parent, text=text, command=command, fg_color="transparent",
+                            hover_color=BTN_HOVER, text_color=TEXT, anchor="w", corner_radius=8,
+                            height=34, font=font)
+        btn.pack(fill="x", padx=4, pady=1)
+        HoverTip(btn, f"{label}\n{tip}" if cut else tip)
+        if panel:
+            self._nav_buttons[panel] = btn
+        return btn
+
+    def _build_nav(self, parent):
+        self._nav_sections = {}
+        for key, title, items in self._nav_spec():
+            header = ctk.CTkButton(parent, text=f"{NAV_ARROW_OPEN}  {title}", anchor="w",
+                                   fg_color="transparent", hover_color=BTN_HOVER, text_color=MUTED, height=24,
+                                   corner_radius=6, font=ctk.CTkFont(size=11, weight="bold"),
+                                   command=lambda k=key: self._toggle_nav_section(k))
+            header.pack(fill="x", padx=4, pady=(8, 0))
+            body = ctk.CTkFrame(parent, fg_color="transparent")
+            body.pack(fill="x")
+            for item in items:
+                self._nav_button(body, *item)
+            self._nav_sections[key] = {"header": header, "body": body, "title": title}
+
+    def _nav_collapsed(self):
+        return set(self._panel_state_get("sidebar", "collapsed") or [])
+
+    def _apply_nav_collapsed(self):
+        collapsed = self._nav_collapsed()
+        for key, sec in self._nav_sections.items():
+            hidden = key in collapsed
+            sec["header"].configure(text=f"{NAV_ARROW_CLOSED if hidden else NAV_ARROW_OPEN}  {sec['title']}")
+            if hidden and sec["body"].winfo_manager():
+                sec["body"].pack_forget()
+            elif not hidden and not sec["body"].winfo_manager():
+                sec["body"].pack(fill="x", after=sec["header"])
+
+    def _toggle_nav_section(self, key):
+        collapsed = self._nav_collapsed()
+        collapsed ^= {key}
+        self._panel_state_set("sidebar", collapsed=sorted(collapsed))
+        self._apply_nav_collapsed()
+
+    def _build_sidebar_bottom(self, parent):
+        ctk.CTkFrame(parent, height=1, fg_color="#2a2d3e", corner_radius=0).pack(fill="x", padx=12, pady=(4, 6))
+        keys_row = ctk.CTkFrame(parent, fg_color="transparent")
+        keys_row.pack(fill="x", padx=14, pady=(0, 2))
+        self.label(keys_row, "Ключи", size=11, color=MUTED).pack(side="left", padx=(0, 6))
+        self._key_dots = {}
+        for key_id, name, is_set, _panel, purpose, optional in self._key_spec():
+            dot = ctk.CTkLabel(keys_row, text="●", text_color=KEY_DOT_OFF, font=ctk.CTkFont(size=15),
+                               cursor="hand2", width=18)
+            dot.pack(side="left", padx=1)
+            dot.bind("<Button-1>", lambda e: self.show_settings_panel())
+            HoverTip(dot, lambda n=name, s=is_set, p=purpose, o=optional:
+                     f"{n}: {'задан' if s() else 'не задан'}" + (" (необязателен)" if o else "") + f"\n{p}")
+            self._key_dots[key_id] = dot
+        self._balance_lbl = self.label(parent, "", size=11, color=MUTED)
+        self._balance_lbl.pack(anchor="w", fill="x", padx=14, pady=(0, 4))
+        HoverTip(self._balance_lbl, "Остаток символов ElevenLabs в этом месяце")
+        self._nav_button(parent, "settings", "settings", "Настройки", "Ключи, Sync, отчёты об ошибках, лог",
+                         self.show_settings_panel)
+        self.label(parent, f"SheqelMotion Studio {APP_VERSION}", size=10, color=MUTED).pack(
+            anchor="w", padx=14, pady=(2, 10))
+
+    def _render_key_status(self):
+        for key_id, _name, is_set, *_rest in self._key_spec():
+            dot = self._key_dots.get(key_id)
+            if dot is not None:
+                dot.configure(text_color=KEY_DOT_ON if is_set() else KEY_DOT_OFF)
+        self._render_balance()
+        if self._settings_widgets:
+            self._render_settings()
+
+    def _render_balance(self):
+        text, color = balance_style(self._el_balance)
+        if self._balance_lbl is not None:
+            self._balance_lbl.configure(text=f"ElevenLabs: {text}" if text else
+                                        ("ElevenLabs: баланс…" if self.api_key else ""), text_color=color)
+        w = (self._settings_widgets or {}).get("keys", {}).get("elevenlabs")
+        if w is not None:
+            w["extra"].configure(text=f"баланс {text}" if text else "", text_color=color)
+
+    def _render_nav_active(self):
+        active = self._active_panel
+        for panel, btn in self._nav_buttons.items():
+            on = active == panel or (panel == "settings" and active in SETTINGS_PANELS)
+            btn.configure(fg_color=BTN_PRIMARY if on else "transparent",
+                          hover_color=BTN_PRIMARY_HOVER if on else BTN_HOVER)
+
+    # ── Вкладка «Настройки» ───────────────────────────────────────────────
+    def _settings_back_link(self, parent):
+        """Строка «← Настройки» над панелями ключей."""
+        ctk.CTkButton(parent, text="←  Настройки", command=self.show_settings_panel, anchor="w",
+                      fg_color="transparent", hover_color=BTN_HOVER, text_color=MUTED, width=120, height=28,
+                      font=ctk.CTkFont(size=12)).pack(anchor="w", padx=20, pady=(14, 0))
+
+    def _settings_card(self, parent, title, subtitle=""):
+        card = ctk.CTkFrame(parent, fg_color=PANEL, corner_radius=20)
+        card.pack(fill="x", padx=20, pady=(0, 14))
+        self.label(card, title, size=18, weight="bold").pack(anchor="w", padx=22, pady=(18, 2))
+        if subtitle:
+            lbl = self.label(card, subtitle, size=12, color=MUTED)
+            lbl.configure(wraplength=480)
+            lbl.pack(anchor="w", fill="x", padx=22, pady=(0, 6))
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(fill="x", padx=22, pady=(4, 18))
+        body.columnconfigure(1, weight=1)
+        return body
+
+    def _sync_settings_spec(self):
+        """Карточка «Липсинк Sync»: (вид, подпись, …). Те же обработчики и ключи конфига, что раньше."""
+        return [
+            ("menu", "Хранилище файлов для Sync", list(SYNC_STORAGE_MODES),
+             lambda: SYNC_STORAGE_LABELS[self.sync_storage], self._on_sync_storage_change,
+             lambda: "По умолчанию: Sync. " + ("Выбрано вами." if self._sync_storage_choice
+                                               else "Сейчас действует умолчание.")),
+            ("menu", "Частота кадров для Sync", list(SYNC_FPS_MODES),
+             lambda: SYNC_FPS_LABELS[self.sync_fps_mode], self._on_sync_fps_change),
+            ("switch", "Показывать окно стоимости перед запуском", self.cost_confirm_var,
+             self._on_cost_confirm_toggle),
+            ("entry", "Всегда спрашивать, если очередь дороже, $",
+             lambda: f"{self.cost_confirm_threshold:g}", self._on_cost_threshold_change,
+             lambda: f"По умолчанию: {COST_CONFIRM_DEFAULT_THRESHOLD:g} $"),
+        ]
+
+    def _app_settings_spec(self):
+        return [
+            ("switch", "Отправлять разработчику обезличенные отчёты об ошибках", self.error_reports_var,
+             self._on_error_reports_toggle),
+            ("buttons", "Лог", [("Открыть лог", self.open_log_window, BTN),
+                                ("Показать файл лога в папке", self.reveal_log_file, BTN)]),
+            ("buttons", "Сохранённые данные", [("Очистить сохранённые данные", self.clear_saved_data,
+                                               BTN_DANGER)]),
+            ("buttons", f"Версия {APP_VERSION}", [("Проверить обновления",
+                                                   lambda: self.check_for_updates(silent=False), BTN)]),
+        ]
+
+    def _settings_rows(self, body, spec):
+        """Строки карточки из списка. Подпись слева переносится, кнопки — отдельной строкой:
+        вкладка помещается в узкую область (~560 px при окне 1100 px)."""
+        widgets = []
+        row = 0
+        for item in spec:
+            kind, title = item[0], item[1]
+            title_lbl = self.label(body, title, size=13)
+            title_lbl.configure(wraplength=230)
+            if kind == "buttons":
+                title_lbl.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 2))
+                row += 1
+                cell = ctk.CTkFrame(body, fg_color="transparent")
+                cell.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+                for text, command, color in item[2]:
+                    hover = BTN_DANGER_HOVER if color == BTN_DANGER else BTN_HOVER
+                    self.button(cell, text, command, color=color, hover=hover,
+                                width=max(140, 9 * len(text))).pack(side="left", padx=(0, 8))
+                row += 1
+                continue
+            hint_fn = item[5] if kind == "menu" and len(item) > 5 else item[4] if kind == "entry" and len(item) > 4 else None
+            if hint_fn:
+                cell = ctk.CTkFrame(body, fg_color="transparent")
+                cell.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 16))
+                title_lbl.destroy()
+                title_lbl = self.label(cell, title, size=13)
+                title_lbl.configure(wraplength=230)
+                title_lbl.pack(anchor="w")
+                hint = self.label(cell, hint_fn(), size=11, color=MUTED)
+                hint.configure(wraplength=230)
+                hint.pack(anchor="w")
+                widgets.append(("hint", hint, hint_fn))
+            else:
+                title_lbl.grid(row=row, column=0, sticky="w", pady=6, padx=(0, 16))
+            if kind == "menu":
+                values, current, command = item[2], item[3], item[4]
+                m = ctk.CTkOptionMenu(body, values=values, command=command, width=220, height=30,
+                                      fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER,
+                                      dropdown_fg_color=PANEL, dropdown_hover_color=BTN_HOVER,
+                                      font=ctk.CTkFont(size=12), dropdown_font=ctk.CTkFont(size=12))
+                m.grid(row=row, column=1, sticky="w", pady=6)
+                widgets.append(("menu", m, current))
+            elif kind == "switch":
+                var, command = item[2], item[3]
+                ctk.CTkSwitch(body, text="", variable=var, command=command, progress_color=BTN_OK,
+                              width=50).grid(row=row, column=1, sticky="w", pady=6)
+            elif kind == "entry":
+                current, command = item[2], item[3]
+                e = ctk.CTkEntry(body, width=90, height=30, font=ctk.CTkFont(size=12))
+                e.grid(row=row, column=1, sticky="w", pady=6)
+                for seq in ("<Return>", "<FocusOut>"):
+                    e.bind(seq, lambda ev, e=e, c=command: c(e))
+                widgets.append(("entry", e, current))
+            row += 1
+        return widgets
+
+    def show_settings_panel(self):
+        scroll = self._start_panel("settings")
+        if scroll is None:
+            return
+        self._enable_mousewheel(scroll)
+        self.label(scroll, "Настройки", size=24, weight="bold").pack(anchor="w", padx=24, pady=(20, 12))
+
+        body = self._settings_card(scroll, "Ключи", "Ключи хранятся только на этом компьютере в файле настроек.")
+        keys = {}
+        for row, (key_id, name, _is_set, panel, purpose, optional) in enumerate(self._key_spec()):
+            dot = ctk.CTkLabel(body, text="●", text_color=KEY_DOT_OFF, font=ctk.CTkFont(size=16), width=18)
+            dot.grid(row=row, column=0, sticky="nw", pady=(8, 6))
+            info = ctk.CTkFrame(body, fg_color="transparent")
+            info.grid(row=row, column=1, sticky="ew", pady=6, padx=(8, 8))
+            line = ctk.CTkFrame(info, fg_color="transparent")
+            line.pack(anchor="w", fill="x")
+            self.label(line, name, size=14, weight="bold").pack(side="left")
+            status = self.label(line, "", size=12)
+            status.pack(side="left", padx=(10, 0))
+            extra = self.label(line, "", size=12, color=MUTED)
+            extra.pack(side="left", padx=(10, 0))
+            note = purpose + (" · необязательно" if optional else "")
+            desc = self.label(info, note, size=11, color=MUTED)
+            desc.configure(wraplength=360)
+            desc.pack(anchor="w", fill="x")
+            self.button(body, "Изменить", panel, color=BTN, hover=BTN_HOVER, width=100).grid(
+                row=row, column=2, sticky="e", pady=6)
+            keys[key_id] = {"dot": dot, "status": status, "extra": extra}
+
+        sync_body = self._settings_card(
+            scroll, "Липсинк Sync",
+            "Хранилище — куда загружать видео и аудио перед отправкой в Sync. Окно стоимости показывает "
+            "оценку перед запуском очереди.")
+        sync_widgets = self._settings_rows(sync_body, self._sync_settings_spec())
+        app_body = self._settings_card(scroll, "Приложение")
+        self._settings_rows(app_body, self._app_settings_spec())
+        self._settings_widgets = {"keys": keys, "rows": sync_widgets}
+        self._register_renderer("settings", self._render_settings)
+
+    def _render_settings(self):
+        w = self._settings_widgets
+        if not w:
+            return
+        for key_id, _name, is_set, *_rest in self._key_spec():
+            row = w["keys"].get(key_id)
+            if row is None or not row["dot"].winfo_exists():
+                continue
+            on = is_set()
+            text = "✓ задан" if on else "не задан"
+            if row["status"].cget("text") != text:
+                row["dot"].configure(text_color=KEY_DOT_ON if on else KEY_DOT_OFF)
+                row["status"].configure(text=text, text_color="#86efac" if on else MUTED)
+        for kind, widget, current in w["rows"]:   # пишем в виджет только при реальном изменении
+            value = current()
+            if kind == "hint" and widget.cget("text") != value:
+                widget.configure(text=value)
+            elif kind == "menu" and widget.get() != value:
+                widget.set(value)
+            elif kind == "entry" and widget.get() != value and widget.focus_get() is not widget._entry:
+                widget.delete(0, "end")
+                widget.insert(0, value)
+        text, color = balance_style(self._el_balance)
+        el = w["keys"].get("elevenlabs")
+        if el is not None:
+            el["extra"].configure(text=f"баланс {text}" if text else "", text_color=color)
+
+    def reveal_log_file(self):
+        try:
+            reveal_in_file_manager(LOG_FILE_PATH)
+        except Exception as e:
+            messagebox.showerror("Лог", f"Не удалось открыть: {e}", parent=self)
 
     # ── Сжать видео ───────────────────────────────────────────────────────
     COMPRESS_RES_LABELS = {"Как в исходнике": "source", "1080p": "1080", "720p": "720"}
@@ -5331,9 +5738,11 @@ class LipsyncTwoModeApp(_BaseApp):
             self._panels.pop(name).destroy()
             self._panel_renderers.pop(name, None)
         self._vg = None
+        self._settings_widgets = None
         self.rolls = []
         self.next_roll_id = 1
         self._state_ready = True
+        self._apply_nav_collapsed()
         self.add_roll()
         self.log(f"Сохранённые данные очищены: файлов состояния {removed}, голосовых файлов {voices}")
         messagebox.showinfo("Сохранённые данные", "Готово: сохранённые данные очищены.", parent=self)
@@ -5476,6 +5885,7 @@ class LipsyncTwoModeApp(_BaseApp):
         scroll = self._start_panel("api")
         if scroll is None:
             return
+        self._settings_back_link(scroll)
         frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="x", padx=20, pady=20)
 
@@ -5518,6 +5928,7 @@ class LipsyncTwoModeApp(_BaseApp):
         scroll = self._start_panel("sync")
         if scroll is None:
             return
+        self._settings_back_link(scroll)
         frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="x", padx=20, pady=20)
 
@@ -5563,6 +5974,7 @@ class LipsyncTwoModeApp(_BaseApp):
         scroll = self._start_panel("cloudinary")
         if scroll is None:
             return
+        self._settings_back_link(scroll)
         frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="x", padx=20, pady=20)
 
@@ -5622,6 +6034,7 @@ class LipsyncTwoModeApp(_BaseApp):
         scroll = self._start_panel("groq")
         if scroll is None:
             return
+        self._settings_back_link(scroll)
         frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="x", padx=20, pady=20)
 
@@ -5732,7 +6145,7 @@ class LipsyncTwoModeApp(_BaseApp):
     
     def show_voice_clone_panel(self):
         if not self.api_key:
-            messagebox.showerror("Ошибка", "Сначала добавь ElevenLabs API key (⚙️ Настройки → API key).", parent=self)
+            messagebox.showerror("Ошибка", "Сначала добавь ElevenLabs API key: «Настройки» → «Ключи» → ElevenLabs.", parent=self)
             self.show_api_key_panel()
             return
         scroll = self._start_panel("voice_clone")
@@ -8225,15 +8638,15 @@ class LipsyncTwoModeApp(_BaseApp):
         if not self.sync_key or "ВСТАВЬ" in self.sync_key:
             messagebox.showerror(
                 "Ошибка",
-                "Не задан Sync API key. Нажми кнопку «Sync key» в верхней панели и введи ключ."
+                "Не задан Sync API key. Открой «Настройки» → «Ключи» → Sync → «Изменить»."
             )
             return
         if self.sync_storage == "cloudinary" and not (
                 self.cloudinary_cloud_name and self.cloudinary_api_key and self.cloudinary_api_secret):
             messagebox.showerror(
                 "Ошибка",
-                "Выбрано хранилище Cloudinary, но ключи не заданы.\nНажми «Cloudinary key» в боковой "
-                "панели или выбери «Хранилище для Sync: Sync (рекомендуется)»."
+                "Выбрано хранилище Cloudinary, но ключи не заданы.\nЗадай их в «Настройки» → «Ключи» → "
+                "Cloudinary или выбери в «Настройки» → «Липсинк Sync» хранилище «Sync (рекомендуется)»."
             )
             return
         global SYNC_API_KEY
@@ -8630,10 +9043,9 @@ class LipsyncTwoModeApp(_BaseApp):
         threading.Thread(target=run, daemon=True).start()
 
     def _update_api_btn_badge(self, label, badge_color, text_color):
+        """Баланс ElevenLabs теперь в нижнем блоке сайдбара и в «Настройках»."""
         try:
-            if not self.api_btn.winfo_exists():
-                return
-            self.api_btn.configure(text=f"API key  ·  {label} симв.")
+            self._render_balance()
         except Exception:
             pass
 
@@ -8644,51 +9056,8 @@ class LipsyncTwoModeApp(_BaseApp):
         self.status_label.configure(
             text=f"готовых роликов: {len(valid)} | всего роликов: {len(self.rolls)}"
                  + (f" | {queue_estimate}" if queue_estimate else ""))
-        # API key button: green if key set, primary if panel active, transparent otherwise
-        def _api_btn_text():
-            if self._el_balance:
-                remaining = self._el_balance["remaining"]
-                label = f"{remaining // 1000}k" if remaining >= 1000 else str(remaining)
-                return f"API key  ·  {label} симв."
-            return "API key"
-
-        if self.api_key:
-            self.api_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
-            self.api_btn.configure(text=_api_btn_text())
-        elif self._active_panel == "api":
-            self.api_btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
-            self.api_btn.configure(text=_api_btn_text())
-        else:
-            self.api_btn.configure(fg_color="transparent", hover_color=BTN_HOVER)
-            self.api_btn.configure(text=_api_btn_text())
-
-        if self.sync_key and "ВСТАВЬ" not in self.sync_key:
-            self.sync_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
-        elif self._active_panel == "sync":
-            self.sync_btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
-        else:
-            self.sync_btn.configure(fg_color="transparent", hover_color=BTN_HOVER)
-
-        if self.groq_api_key:
-            self.groq_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
-        elif self._active_panel == "groq":
-            self.groq_btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
-        else:
-            self.groq_btn.configure(fg_color="transparent", hover_color=BTN_HOVER)
-
-        for btn, panel in [
-            (self.voice_btn, "voice_gen"),
-            (self.clone_btn, "voice_clone"),
-            (self.dl_btn, "downloader"),
-            (self.compress_btn, "compress"),
-            (self.transcribe_btn, "transcribe"),
-            (self.translate_groq_btn, "groq_translate"),
-        ]:
-            if self._active_panel == panel:
-                btn.configure(fg_color=BTN_PRIMARY, hover_color=BTN_PRIMARY_HOVER)
-            else:
-                btn.configure(fg_color="transparent", hover_color=BTN_HOVER)
-
+        self._render_key_status()   # точки ключей, баланс, строки «Настроек»
+        self._render_nav_active()
 
     def open_log_window(self):
         if self.log_window is not None and self.log_window.winfo_exists():
@@ -8807,7 +9176,9 @@ class LipsyncTwoModeApp(_BaseApp):
             self._sync_storage_choice = choice if choice in SYNC_STORAGE_MODES.values() else None
             has_cloudinary = bool(self.cloudinary_cloud_name and self.cloudinary_api_key
                                   and self.cloudinary_api_secret)
-            self.sync_storage = self._sync_storage_choice or ("cloudinary" if has_cloudinary else "sync")
+            # Без явного выбора — Sync для всех (в том числе при настроенном Cloudinary).
+            # Явный выбор Cloudinary сохраняется; откат на Cloudinary при ошибке загрузки — как раньше.
+            self.sync_storage = self._sync_storage_choice or "sync"
             self.sync_fps_mode = data.get("sync_fps_mode", "source")
             if self.sync_fps_mode not in SYNC_FPS_MODES.values():
                 self.sync_fps_mode = "source"

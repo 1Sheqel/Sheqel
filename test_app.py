@@ -445,7 +445,7 @@ if source:
     for pattern, desc in hardcoded_patterns:
         matches = re.findall(pattern, source)
         # исключаем строки в комментариях и docstrings (грубая эвристика)
-        real_matches = [m for m in matches if m not in ("/Users/admin/.config/", "/Users/admin/Library/")]
+        real_matches = [m for m in matches if m not in ("/Users/username/.config/", "/Users/username/Library/")]
         if real_matches:
             unique = list(set(real_matches))[:3]
             warn(f"Хардкодные пути: {desc}", f"найдено: {unique}", "🟡")
