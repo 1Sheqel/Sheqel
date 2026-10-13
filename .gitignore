@@ -24,3 +24,8 @@ ffprobe.exe
 Lipsync_Queue_Output/
 ElevenLabs_Generated_Voices/
 sheqelmotion_previews/
+
+# Локальные служебные файлы и резервные копии
+.claude/
+app.py.bak
+app_before_*.py
