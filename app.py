@@ -3728,6 +3728,8 @@ class LipsyncTwoModeApp(_BaseApp):
         self.error_reports_enabled = True
         self.error_reports_notice_shown = False
         self.error_reports_var = ctk.BooleanVar(value=True)
+        self.clear_text_after_clone = True
+        self.clear_text_after_clone_var = ctk.BooleanVar(value=True)
         self.cost_confirm_enabled = True
         self.cost_confirm_threshold = COST_CONFIRM_DEFAULT_THRESHOLD
         self.queue_panel_mode = "running"
@@ -3764,6 +3766,9 @@ class LipsyncTwoModeApp(_BaseApp):
         self._journal_dirty = False
         self._sync_fetch_widgets = None
         self._sync_fetch_pending = set()
+        self._clone_pending = set()      # задачи клонирования, итог которых ещё не применён
+        self._clone_cleanup = None       # очистка извлечённого аудио (из вкладки клонирования)
+        self._notice_w = {}
         # Сжатие видео: параметры файлов, оценки размера (кэш), запущенные ffmpeg
         self._compress_lock = threading.Lock()
         self._compress_info = {}
@@ -3796,6 +3801,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.load_config()
         self._init_error_reporting()
         self.cost_confirm_var.set(self.cost_confirm_enabled)
+        self.clear_text_after_clone_var.set(self.clear_text_after_clone)
         self._saved_sync_price = sync_price_state["per_frame"]
         self._restore_state()
         self._apply_nav_collapsed()
@@ -4513,6 +4519,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.start_btn.pack(fill="x")
         # Ход очереди — над нижней строкой; появляется только во время очереди и с её итогом.
         self._build_queue_panel(right_section, before=bottom)
+        self._build_notice_bar(right_section, before=bottom)
 
     def _show_container(self, name, factory):
         """Скрывает все панели, показывает панель name. Возвращает (контейнер, создан_ли_сейчас)."""
@@ -4590,6 +4597,9 @@ class LipsyncTwoModeApp(_BaseApp):
                 if task_id in self._sync_fetch_pending and task["status"] in TASK_FINISHED:
                     self._sync_fetch_pending.discard(task_id)
                     self._finish_sync_fetch(task)
+                if task_id in self._clone_pending and task["status"] in TASK_FINISHED:
+                    self._clone_pending.discard(task_id)
+                    self._on_clone_finished(task)
         for name in panels:
             self._render_panel(name)  # скрытая панель обновится при показе
         self._schedule_state_save()
@@ -4849,6 +4859,8 @@ class LipsyncTwoModeApp(_BaseApp):
         return [
             ("switch", "Отправлять разработчику обезличенные отчёты об ошибках", self.error_reports_var,
              self._on_error_reports_toggle),
+            ("switch", "После клонирования очищать текст генерации", self.clear_text_after_clone_var,
+             self._on_clear_after_clone_toggle),
             ("menu", "Ход очереди", list(QUEUE_PANEL_MODES), lambda: QUEUE_PANEL_LABELS[self.queue_panel_mode],
              self._on_queue_panel_mode_change, lambda: "По умолчанию: показывать во время работы."),
             ("buttons", "Лог", [("Открыть лог", self.open_log_window, BTN),
@@ -5902,6 +5914,82 @@ class LipsyncTwoModeApp(_BaseApp):
         else:
             messagebox.showwarning("Результат из Sync", text, parent=self)
 
+    # ── Итог клонирования: голос в генератор, очистка текста ─────────────
+    def _on_clear_after_clone_toggle(self):
+        self.clear_text_after_clone = bool(self.clear_text_after_clone_var.get())
+        self.save_config()
+
+    def _on_clone_finished(self, task):
+        """Главный поток. Успех: голос в генератор (в данных — даже если вкладки ещё нет), текст
+        очищается (по настройке). Ошибка или прерывание: ничего не меняется."""
+        if task["status"] != "done":
+            return
+        name, voice_id = task["result"]["name"], task["result"]["voice_id"]
+        self._apply_cloned_voice(name, voice_id)
+        if self._clone_cleanup is not None:
+            try:
+                self._clone_cleanup()
+            except Exception:
+                pass
+        if self._active_panel == "voice_clone":
+            messagebox.showinfo("Готово", f"Голос «{name}» клонирован.\n\nvoice_id: {voice_id}", parent=self)
+            self.after(300, self.show_voice_gen_panel)
+        else:
+            self._show_notice(f"Голос «{name}» готов", "Открыть генерацию", self.show_voice_gen_panel)
+
+    def _apply_cloned_voice(self, name, voice_id):
+        self.main_voice_name = name
+        self.main_voice_id = voice_id
+        state = self._panel_state.setdefault("voice_gen", {})
+        state["voice"] = name
+        state["voice_id"] = voice_id
+        cleared = False
+        if self.clear_text_after_clone and (state.get("text") or "").strip():
+            state["text_backup"] = state["text"]     # «Вернуть» — и после перезапуска
+            state["text"] = ""
+            cleared = True
+        self._panel_state_set("voice_gen")
+        self.save_config()
+        vg = self._vg
+        if vg and vg["voice_box"].winfo_exists():
+            vg["voice_box"].delete("1.0", "end")
+            vg["voice_box"].insert("1.0", name)
+            if cleared:
+                vg["text_box"].delete("1.0", "end")
+                vg["update_status"]()
+            vg["render_restore_notice"]()
+        self.log(f"Клон «{name}» подставлен в генератор" + (", текст очищен (можно вернуть)" if cleared else ""))
+
+    def _build_notice_bar(self, parent, before):
+        bar = ctk.CTkFrame(parent, fg_color="#1f3a2e", corner_radius=12)
+        lbl = self.label(bar, "", size=13, color="#86efac")
+        lbl.pack(side="left", padx=14, pady=8)
+        close = ctk.CTkButton(bar, text="✕", width=28, height=24, fg_color="transparent", hover_color=BTN_HOVER,
+                              text_color=TEXT, command=self._hide_notice)
+        close.pack(side="right", padx=(4, 10))
+        action = ctk.CTkButton(bar, text="", width=150, height=26, fg_color=BTN_OK, hover_color=BTN_OK_HOVER,
+                               text_color="white", corner_radius=10)
+        action.pack(side="right")
+        self._notice_w = {"bar": bar, "label": lbl, "action": action, "before": before}
+
+    def _show_notice(self, text, action_text, action):
+        """Ненавязчивое уведомление внизу окна: не модальное, фокус не забирает."""
+        w = self._notice_w
+        if not w:
+            return
+        w["label"].configure(text=text)
+
+        def run():
+            self._hide_notice()
+            action()
+        w["action"].configure(text=action_text, command=run)
+        if not w["bar"].winfo_manager():
+            w["bar"].pack(fill="x", padx=20, pady=(4, 0), before=w["before"])
+
+    def _hide_notice(self):
+        if self._notice_w and self._notice_w["bar"].winfo_manager():
+            self._notice_w["bar"].pack_forget()
+
     def _panel_state_set(self, panel, **fields):
         self._panel_state.setdefault(panel, {}).update(fields)
         self._schedule_state_save()
@@ -6415,6 +6503,7 @@ class LipsyncTwoModeApp(_BaseApp):
             task_id = tasks.create("clone_upload", "voice_clone", title=f"Клон «{name}»",
                                    meta={"name": name}, status="running")
             clone_state["announce"] = task_id
+            self._clone_pending.add(task_id)
             render_clone()
 
             def worker():
@@ -6423,8 +6512,7 @@ class LipsyncTwoModeApp(_BaseApp):
                     self._expiry_add({"voice_id": voice_id, "name": name,
                                       "expires_at": time.time() + 10 * 60 * 60})
                     self.save_config()
-                    self.main_voice_name = name
-                    self.main_voice_id = voice_id
+                    # Голос и текст генератора меняет главный поток (_on_clone_finished) — при любой вкладке.
                     tasks.update(task_id, status="done", result={"voice_id": voice_id, "name": name})
                 except Exception as e:
                     tasks.update(task_id, status="error", error=str(e))
@@ -6452,15 +6540,8 @@ class LipsyncTwoModeApp(_BaseApp):
                 result_label.configure(text=f"Ошибка: {up.get('error')}", text_color="#fca5a5")
             if clone_state["announce"] == up["id"] and st in TASK_FINISHED:
                 clone_state["announce"] = None      # итог — один раз
-                if st == "done":
-                    _cleanup_extracted()
-                    voice_id = up["result"]["voice_id"]
-                    messagebox.showinfo("Готово", f"Голос «{name}» клонирован.\n\nvoice_id: {voice_id}",
-                                        parent=self)
-                    # Сразу к генерации — только если итог пришёл, пока вкладка открыта.
-                    if time.time() - up["updated"] < 5:
-                        self.after(500, lambda n=name: self.show_voice_gen_panel(initial_voice=n))
-                elif st == "error":
+                # Успех применяет _on_clone_finished (при любой вкладке); здесь — только ошибка.
+                if st == "error":
                     messagebox.showerror("Ошибка", str(up.get("error")), parent=self)
 
         clone_btn = self.button(frame, "🎙 Клонировать", clone,
@@ -6469,6 +6550,7 @@ class LipsyncTwoModeApp(_BaseApp):
         clone_btn_ref = [clone_btn]
 
         frame.bind("<Destroy>", lambda e: _cleanup_extracted())
+        self._clone_cleanup = _cleanup_extracted
         self._register_renderer("voice_clone", render_clone)
 
     def show_downloader_panel(self):
@@ -7325,6 +7407,18 @@ class LipsyncTwoModeApp(_BaseApp):
         except Exception as e:
             self.log(f"Не удалось воспроизвести: {e}")
 
+    def _selected_generator_voice(self):
+        """(voice_id, имя) голоса, выбранного в генераторе: из поля, состояния вкладки или конфига."""
+        state = self._panel_state.get("voice_gen", {})
+        name = state.get("voice") or self.main_voice_name
+        vg = self._vg
+        if vg and vg["voice_box"].winfo_exists():
+            name = vg["voice_box"].get("1.0", "end").strip() or name
+        voice_id = state.get("voice_id") or self.main_voice_id
+        if voice_id and name and name not in (state.get("voice"), self.main_voice_name, voice_id):
+            voice_id = ""          # в поле уже другой голос — сверяем по имени
+        return voice_id, name
+
     def open_voice_picker(self, parent_win, on_pick):
         """Окошко с выбором голоса. on_pick(name, voice_id) при выборе."""
         win = ctk.CTkToplevel(parent_win)
@@ -7417,9 +7511,15 @@ class LipsyncTwoModeApp(_BaseApp):
                              text_color=section_color
                              ).pack(side="left", padx=4)
 
+                sel_id, sel_name = self._selected_generator_voice()
                 for v in section_voices:
-                    row = ctk.CTkFrame(list_frame, fg_color=CARD, corner_radius=14)
+                    is_selected = (v["voice_id"] == sel_id) if sel_id else (bool(sel_name) and v["name"] == sel_name)
+                    row = ctk.CTkFrame(list_frame, fg_color="#1f3a2e" if is_selected else CARD, corner_radius=14,
+                                       border_width=2 if is_selected else 0, border_color="#86efac")
                     row.pack(fill="x", padx=2, pady=3)
+                    if is_selected:
+                        ctk.CTkLabel(row, text="✓ выбран в генераторе", font=ctk.CTkFont(size=11),
+                                     text_color="#86efac").pack(side="right", padx=8)
 
                     name_col = ctk.CTkFrame(row, fg_color="transparent")
                     name_col.pack(side="left", fill="x", expand=True, padx=12, pady=6)
@@ -7566,6 +7666,7 @@ class LipsyncTwoModeApp(_BaseApp):
         def on_voice_picked(name, voice_id):
             voice_box.delete("1.0", "end")
             voice_box.insert("1.0", name)
+            self._panel_state.setdefault("voice_gen", {})["voice_id"] = voice_id
             save_fields()
 
         self.button(frame, "📋 Выбрать из списка моих голосов",
@@ -7576,6 +7677,12 @@ class LipsyncTwoModeApp(_BaseApp):
         # ── Text input ────────────────────────────────────────────────────
         self.label(frame, "Текст (один для обоих вариантов)", size=14, weight="bold").pack(
             anchor="w", padx=22)
+        restore_row = ctk.CTkFrame(frame, fg_color="#2a2d3e", corner_radius=8)
+        self.label(restore_row, "Текст очищен после клонирования.", size=12, color="#fcd34d").pack(
+            side="left", padx=10, pady=4)
+        restore_btn = ctk.CTkButton(restore_row, text="Вернуть", width=90, height=24, fg_color=BTN,
+                                    hover_color=BTN_HOVER, text_color=TEXT, corner_radius=8)
+        restore_btn.pack(side="left", pady=4)
         text_box = ctk.CTkTextbox(
             frame, height=180,
             fg_color="#ffffff", text_color="#111111",
@@ -7587,6 +7694,25 @@ class LipsyncTwoModeApp(_BaseApp):
         if saved.get("text"):
             text_box.insert("1.0", saved["text"])
         tk_text = text_box._textbox  # внутренний tk.Text для тегов/биндингов
+
+        def render_restore_notice():
+            backup = self._panel_state_get("voice_gen", "text_backup")
+            if backup and not restore_row.winfo_manager():
+                restore_row.pack(fill="x", padx=22, pady=(6, 0), before=text_box)
+            elif not backup and restore_row.winfo_manager():
+                restore_row.pack_forget()
+
+        def restore_text():
+            backup = self._panel_state_get("voice_gen", "text_backup")
+            if backup:
+                text_box.delete("1.0", "end")
+                text_box.insert("1.0", backup)
+            self._panel_state.setdefault("voice_gen", {}).pop("text_backup", None)
+            render_restore_notice()
+            save_fields()
+            _update_status()
+
+        restore_btn.configure(command=restore_text)
 
         # ── Счётчик символов ──────────────────────────────────────────────
         status_text_label = ctk.CTkLabel(
@@ -7782,13 +7908,18 @@ class LipsyncTwoModeApp(_BaseApp):
                 messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}", parent=self)
 
         def save_fields():
+            text = text_box.get("1.0", "end").rstrip("\n")
             self._panel_state_set(
                 "voice_gen",
                 voice=voice_box.get("1.0", "end").strip(),
-                text=text_box.get("1.0", "end").rstrip("\n"),
+                text=text,
                 model=model_var.get(),
                 lang=lang_var.get(),
             )
+            # В поле появился новый текст (набор, вставка, переводчик) — старый больше не предлагаем.
+            if text.strip() and self._panel_state_get("voice_gen", "text_backup"):
+                self._panel_state["voice_gen"].pop("text_backup", None)
+                render_restore_notice()
 
         def _generate_slot(slot, batch):
             voice_value = voice_box.get("1.0", "end").strip()
@@ -7964,7 +8095,9 @@ class LipsyncTwoModeApp(_BaseApp):
         model_var.trace_add("write", lambda *a: save_fields())
         lang_var.trace_add("write", lambda *a: save_fields())
         self._vg = {"voice_box": voice_box, "text_box": text_box, "save_fields": save_fields,
-                    "update_status": lambda: self.after(100, _update_status)}
+                    "update_status": lambda: self.after(100, _update_status),
+                    "render_restore_notice": render_restore_notice}
+        render_restore_notice()
         self._register_renderer("voice_gen", render_slots)
         if saved.get("text"):
             self.after(100, _update_status)
@@ -9528,6 +9661,8 @@ class LipsyncTwoModeApp(_BaseApp):
             CLOUDINARY_API_KEY     = self.cloudinary_api_key
             CLOUDINARY_API_SECRET  = self.cloudinary_api_secret
             self.main_voice_name = data.get("main_voice_name", "") or self.main_voice_name
+            self.main_voice_id = data.get("main_voice_id", "") or getattr(self, "main_voice_id", "")
+            self.clear_text_after_clone = bool(data.get("clear_text_after_clone", True))
             with _lock_of(self, "_expiry_lock"):
                 self.voice_expiry_list = list(data.get("voice_expiry_list", []))
             self.groq_api_key = data.get("groq_api_key", "") or self.groq_api_key
@@ -9586,6 +9721,8 @@ class LipsyncTwoModeApp(_BaseApp):
                 "cloudinary_api_key":    self.cloudinary_api_key,
                 "cloudinary_api_secret": self.cloudinary_api_secret,
                 "main_voice_name":       self.main_voice_name,
+                "main_voice_id":         getattr(self, "main_voice_id", ""),
+                "clear_text_after_clone": getattr(self, "clear_text_after_clone", True),
                 "voice_expiry_list":     _locked_copy(self, "_expiry_lock", "voice_expiry_list"),
                 "groq_api_key":          self.groq_api_key,
                 "groq_used_seconds":     _locked_copy(self, "_groq_lock", "groq_used_seconds"),
