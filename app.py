@@ -39,6 +39,7 @@ import uuid
 import copy
 import platform
 import collections
+import contextlib
 import requests
 import json
 from pathlib import Path
@@ -508,6 +509,17 @@ def known_secret_values(*extra):
     """Значения ключей из глобальных настроек (ключи пользователя — только в памяти и config)."""
     return [s for s in (SYNC_API_KEY, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, *extra)
             if isinstance(s, str) and s]
+
+
+def _lock_of(obj, name):
+    """Блокировка объекта или пустой контекст (подставные объекты в тестах её не имеют)."""
+    return getattr(obj, name, None) or contextlib.nullcontext()
+
+
+def _locked_copy(obj, lock_name, attr):
+    with _lock_of(obj, lock_name):
+        value = getattr(obj, attr)
+        return [dict(v) for v in value] if isinstance(value, list) else value
 
 
 # Журнал задач Sync (job_id, outputUrl, путь): приложение подставляет сюда свой обработчик.
@@ -3440,13 +3452,13 @@ def delete_elevenlabs_voice(voice_id, api_key):
     url = f"{ELEVEN_BASE_URL}/v1/voices/{voice_id}"
     headers = {"xi-api-key": api_key}
     res = requests.delete(url, headers=headers, timeout=30)
-    return res.status_code in [200, 204]
+    return res.status_code in [200, 204, 404]   # 404 — голоса уже нет, запись можно убрать
 
 
 def fetch_elevenlabs_balance(api_key) -> dict | None:
     try:
         headers = {"xi-api-key": api_key}
-        print(f"[balance] запрос с ключом {api_key[:8]}...")
+        print("[balance] запрос баланса ElevenLabs")
         res = requests.get(
             f"{ELEVEN_BASE_URL}/v1/user/subscription",
             headers=headers, timeout=10,
@@ -3703,9 +3715,11 @@ class LipsyncTwoModeApp(_BaseApp):
         self.cloudinary_api_secret = ""
         self.groq_api_key = ""
         self.groq_used_seconds = 0.0
+        self._groq_lock = threading.Lock()          # счётчик пишут потоки транскрибации
         self.preview_process = None
         self.preview_voice_id = None
         self.voice_expiry_list = []
+        self._expiry_lock = threading.RLock()       # список правят поток автоудаления и клонирование
         self._config_lock = threading.Lock()
         self._config_load_failed = False
         self.install_id = ""
@@ -6312,9 +6326,12 @@ class LipsyncTwoModeApp(_BaseApp):
         applied = {"task": None}
 
         def render_clone():
+            render_upload()
             task = tasks.latest("clone_extract")
             busy = bool(task and task["status"] in ("queued", "running"))
-            clone_btn_ref[0].configure(state="disabled" if busy else "normal")
+            uploading = bool(tasks.active(kind="clone_upload"))
+            clone_btn_ref[0].configure(state="disabled" if busy or uploading else "normal",
+                                       text="Загружаю…" if uploading else "🎙 Клонировать")
             if task is None:
                 return
             if busy:
@@ -6378,33 +6395,59 @@ class LipsyncTwoModeApp(_BaseApp):
             if not path:
                 messagebox.showerror("Ошибка", "Выбери аудио-сэмпл.", parent=self)
                 return
-            try:
-                result_label.configure(text="Загружаю в ElevenLabs...", text_color=MUTED)
-                self.update_idletasks()
-                voice_id = self.create_voice_from_sample(path, name, description)
-                _cleanup_extracted()
-                expires_at = time.time() + (10 * 60 * 60)
-                self.voice_expiry_list.append({
-                    "voice_id": voice_id,
-                    "name": name,
-                    "expires_at": expires_at,
-                })
-                self.save_config()
-                result_label.configure(
-                    text=f"✓ Голос «{name}» будет автоудалён через 10 часов",
-                    text_color="#fcd34d",
-                )
-                self.main_voice_name = name
-                self.main_voice_id = voice_id
-                messagebox.showinfo(
-                    "Готово",
-                    f"Голос «{name}» клонирован.\n\nvoice_id: {voice_id}",
-                    parent=self,
-                )
-                self.after(500, lambda n=name: self.show_voice_gen_panel(initial_voice=n))
-            except Exception as e:
-                result_label.configure(text=f"Ошибка: {e}", text_color="#fca5a5")
-                messagebox.showerror("Ошибка", str(e), parent=self)
+            if tasks.active(kind="clone_upload"):
+                return
+            # Загрузка в ElevenLabs — в фоне: окно не зависает, вкладки можно переключать.
+            task_id = tasks.create("clone_upload", "voice_clone", title=f"Клон «{name}»",
+                                   meta={"name": name}, status="running")
+            clone_state["announce"] = task_id
+            render_clone()
+
+            def worker():
+                try:
+                    voice_id = self.create_voice_from_sample(path, name, description)
+                    self._expiry_add({"voice_id": voice_id, "name": name,
+                                      "expires_at": time.time() + 10 * 60 * 60})
+                    self.save_config()
+                    self.main_voice_name = name
+                    self.main_voice_id = voice_id
+                    tasks.update(task_id, status="done", result={"voice_id": voice_id, "name": name})
+                except Exception as e:
+                    tasks.update(task_id, status="error", error=str(e))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        clone_state = {"announce": None}
+
+        def render_upload():
+            up = tasks.latest("clone_upload")
+            if up is None:
+                return
+            st = up["status"]
+            name = (up.get("result") or {}).get("name") or up["meta"].get("name", "")
+            if st in ("queued", "running"):
+                result_label.configure(text="Загружаю в ElevenLabs... (можно переключаться на другие вкладки)",
+                                       text_color=MUTED)
+            elif st == "done":
+                result_label.configure(text=f"✓ Голос «{name}» будет автоудалён через 10 часов",
+                                       text_color="#fcd34d")
+            elif st == "interrupted":
+                result_label.configure(text="Прервано: приложение закрыли во время загрузки. Проверь список "
+                                            "голосов — клон мог успеть создаться.", text_color="#fcd34d")
+            else:
+                result_label.configure(text=f"Ошибка: {up.get('error')}", text_color="#fca5a5")
+            if clone_state["announce"] == up["id"] and st in TASK_FINISHED:
+                clone_state["announce"] = None      # итог — один раз
+                if st == "done":
+                    _cleanup_extracted()
+                    voice_id = up["result"]["voice_id"]
+                    messagebox.showinfo("Готово", f"Голос «{name}» клонирован.\n\nvoice_id: {voice_id}",
+                                        parent=self)
+                    # Сразу к генерации — только если итог пришёл, пока вкладка открыта.
+                    if time.time() - up["updated"] < 5:
+                        self.after(500, lambda n=name: self.show_voice_gen_panel(initial_voice=n))
+                elif st == "error":
+                    messagebox.showerror("Ошибка", str(up.get("error")), parent=self)
 
         clone_btn = self.button(frame, "🎙 Клонировать", clone,
                                 color=BTN_OK, hover=BTN_OK_HOVER, width=200)
@@ -6849,7 +6892,7 @@ class LipsyncTwoModeApp(_BaseApp):
             def run():
                 try:
                     text, duration_sec = transcribe_with_groq(path, self.groq_api_key, self.log)
-                    self.groq_used_seconds += duration_sec
+                    self._groq_add_seconds(duration_sec)
                     self.save_config()
                     tasks.update(task_id, status="done", progress=1.0, result={"text": text})
                 except Exception as e:
@@ -6872,7 +6915,7 @@ class LipsyncTwoModeApp(_BaseApp):
             if not self.groq_api_key:
                 return
             limit_sec = 28800.0
-            used_sec = self.groq_used_seconds
+            used_sec = self._groq_seconds()
             remaining_sec = max(0.0, limit_sec - used_sec)
             remaining_hours = remaining_sec / 3600
             used_hours = used_sec / 3600
@@ -6905,7 +6948,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 text=t, text_color=c))
 
         def reset_counter():
-            self.groq_used_seconds = 0.0
+            self._groq_reset()
             self.save_config()
             _load_groq_limit()
 
@@ -7377,7 +7420,7 @@ class LipsyncTwoModeApp(_BaseApp):
                                      text_color=MUTED, anchor="w"
                                      ).pack(anchor="w", padx=0)
                     expiry_entry = next(
-                        (e for e in self.voice_expiry_list if e["voice_id"] == v["voice_id"]),
+                        (e for e in self._expiry_snapshot() if e["voice_id"] == v["voice_id"]),
                         None,
                     )
                     if expiry_entry:
@@ -8149,20 +8192,44 @@ class LipsyncTwoModeApp(_BaseApp):
                             entry.insert(0, r[key])
                     return
                 for entry, key in [(start_entry, "audio_start"), (end_entry, "audio_end")]:
-                    val = entry.get().strip()
+                    val = entry.get().strip().replace(",", ".")   # «2,5» с русской раскладки — тоже число
                     if val:
                         try:
                             float(val)
                             r[key] = val
+                            if entry.get().strip() != val:
+                                entry.delete(0, "end")
+                                entry.insert(0, val)
                         except ValueError:
                             entry.delete(0, "end")
                             r[key] = ""
                     else:
                         r[key] = ""
+                self._schedule_state_save()
+
+            def save_times_typing(*_, r=roll):
+                """При наборе: корректное число сохраняется сразу (переживёт переключение вкладок
+                и закрытие), недописанное («1,», «-») не стирается — строгая проверка на выходе из поля."""
+                if self._roll_is_locked(r, notify=False):
+                    return
+                changed = False
+                for entry, key in [(start_entry, "audio_start"), (end_entry, "audio_end")]:
+                    val = entry.get().strip().replace(",", ".")
+                    if val:
+                        try:
+                            float(val)
+                        except ValueError:
+                            continue
+                    if r.get(key, "") != val:
+                        r[key] = val
+                        changed = True
+                if changed:
+                    self._schedule_state_save()
 
             for e in (start_entry, end_entry):
                 e.bind("<FocusOut>", save_times)
                 e.bind("<Return>", save_times)
+                e.bind("<KeyRelease>", save_times_typing, add="+")
 
             video_text = "✅ Видео" if roll["video_single"] else "Выбрать видео"
             self.button(row2, video_text, lambda i=idx: self.choose_video(i, "single"),
@@ -8974,25 +9041,9 @@ class LipsyncTwoModeApp(_BaseApp):
                 for f in futures:
                     f.result()
 
-            if failed_videos:
-                error_message = "Очередь завершена, но были ошибки:\n\n"
-                for item in failed_videos:
-                    error_message += f"❌ {item['video_name']}\nПричина: {item['error']}\n\n"
-
-                def done_with_errors():
-                    messagebox.showwarning("Готово с ошибками", error_message)
-                    open_folder(batch_dir)
-
-                self.after(0, done_with_errors)
-            else:
-                def done_ok():
-                    messagebox.showinfo(
-                        "Готово",
-                        f"✅ Все ролики обработаны успешно.\n\nПапка:\n{batch_dir}"
-                    )
-                    open_folder(batch_dir)
-
-                self.after(0, done_ok)
+            failed_copy = list(failed_videos)
+            self.log(f"Очередь завершена: успешно {total - len(failed_copy)} из {total}, ошибок {len(failed_copy)}")
+            self.after(0, lambda: self._show_queue_summary(batch_dir, total, failed_copy))
 
         except Exception as e:
             err = str(e)
@@ -9002,6 +9053,42 @@ class LipsyncTwoModeApp(_BaseApp):
             self.is_processing = False
             self.after(0, lambda: self.start_btn.configure(state="normal", text="НАЧАТЬ ОЧЕРЕДЬ"))
             self.after(0, self._tick_queue_progress)  # финальное состояние в окне прогресса
+
+    def _show_queue_summary(self, batch_dir, total, failed):
+        """Итог очереди в немодальном окне: приложение остаётся доступным, папка открывается
+        только по кнопке."""
+        old = getattr(self, "_queue_summary_win", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+        ok = total - len(failed)
+        win = ctk.CTkToplevel(self)
+        win.title("Очередь завершена")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.geometry("560x420" if failed else "520x220")
+        title = ("✅ Все ролики обработаны успешно" if not failed
+                 else f"Готово с ошибками: успешно {ok} из {total}")
+        self.label(win, title, size=18, weight="bold",
+                   color="#86efac" if not failed else "#fcd34d").pack(anchor="w", padx=20, pady=(18, 6))
+        path_lbl = self.label(win, f"Папка: {batch_dir}", size=12, color=MUTED)
+        path_lbl.configure(wraplength=500)
+        path_lbl.pack(anchor="w", fill="x", padx=20)
+        if failed:
+            box = ctk.CTkTextbox(win, height=200, fg_color=PANEL, text_color=TEXT, font=ctk.CTkFont(size=12))
+            box.pack(fill="both", expand=True, padx=20, pady=(10, 0))
+            box.insert("1.0", "\n\n".join(f"❌ {f['video_name']}\nПричина: {f['error']}" for f in failed))
+            box.configure(state="disabled")
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=16, side="bottom")
+        self.button(row, "Закрыть", win.destroy, color=BTN, hover=BTN_HOVER, width=120).pack(side="right")
+        self.button(row, "Открыть папку", lambda: open_folder(batch_dir), color=BTN_OK, hover=BTN_OK_HOVER,
+                    width=160).pack(side="right", padx=8)
+        self._queue_summary_win = win
+        win.after(150, win.lift)
+        return win
 
     def set_roll_status(self, idx, status):
         def update():
@@ -9108,37 +9195,60 @@ class LipsyncTwoModeApp(_BaseApp):
             self.report_callback_exception(*sys.exc_info())
         self.after(120, self.poll_logs)
 
+    # ── Общие данные потоков: список автоудаления голосов и счётчик Groq ──
+    def _expiry_add(self, entry):
+        with self._expiry_lock:
+            self.voice_expiry_list.append(dict(entry))
+
+    def _expiry_remove(self, voice_id):
+        with self._expiry_lock:
+            self.voice_expiry_list[:] = [e for e in self.voice_expiry_list if e.get("voice_id") != voice_id]
+
+    def _expiry_snapshot(self):
+        return _locked_copy(self, "_expiry_lock", "voice_expiry_list")
+
+    def _groq_add_seconds(self, seconds):
+        with self._groq_lock:
+            self.groq_used_seconds += float(seconds or 0)
+
+    def _groq_seconds(self):
+        with self._groq_lock:
+            return self.groq_used_seconds
+
+    def _groq_reset(self):
+        with self._groq_lock:
+            self.groq_used_seconds = 0.0
+
     def _voice_expiry_watcher(self):
         while True:
             time.sleep(60)
-            now = time.time()
-            expired = [v for v in self.voice_expiry_list if v["expires_at"] <= now]
-            for v in expired:
-                try:
-                    if not self.api_key:
-                        continue
-                    deleted = delete_elevenlabs_voice(v["voice_id"], self.api_key)
-                    if deleted:
-                        self.log(f"Голос «{v['name']}» автоудалён (истёк срок)")
-                        self.voice_expiry_list.remove(v)
-                        self.save_config()
-                except Exception as e:
-                    self.log(f"Ошибка удаления голоса «{v['name']}»: {e}")
+            self._delete_expired_voices("автоудалён (истёк срок)")
 
-    def _cleanup_expired_voices_on_start(self):
-        if not self.api_key or not self.voice_expiry_list:
-            return
+    def _delete_expired_voices(self, reason):
+        """Удаляет просроченные клоны. Список читается копией под блокировкой: его параллельно
+        дополняет клонирование в другом потоке."""
         now = time.time()
-        expired = [v for v in self.voice_expiry_list if v["expires_at"] <= now]
+        expired = [v for v in self._expiry_snapshot() if v["expires_at"] <= now]
+        changed = False
         for v in expired:
             try:
-                delete_elevenlabs_voice(v["voice_id"], self.api_key)
-                self.voice_expiry_list.remove(v)
-                self.log(f"Голос «{v['name']}» удалён при старте (просрочен)")
-            except Exception:
-                pass
-        if expired:
+                if not self.api_key:
+                    continue
+                if delete_elevenlabs_voice(v["voice_id"], self.api_key):
+                    self.log(f"Голос «{v['name']}» {reason}")
+                    self._expiry_remove(v["voice_id"])
+                    changed = True
+            except Exception as e:
+                self.log(f"Ошибка удаления голоса «{v['name']}»: {e}")
+        if changed:
             self.save_config()
+
+    def _cleanup_expired_voices_on_start(self):
+        if not self.api_key or not self._expiry_snapshot():
+            return
+        # Сеть — в фоне: старт приложения не ждёт ответов ElevenLabs.
+        threading.Thread(target=self._delete_expired_voices, args=("удалён при старте (просрочен)",),
+                         daemon=True).start()
 
     def load_config(self):
         """Загружает API ключи и настройки из ~/.sheqelmotion.json."""
@@ -9161,9 +9271,11 @@ class LipsyncTwoModeApp(_BaseApp):
             CLOUDINARY_API_KEY     = self.cloudinary_api_key
             CLOUDINARY_API_SECRET  = self.cloudinary_api_secret
             self.main_voice_name = data.get("main_voice_name", "") or self.main_voice_name
-            self.voice_expiry_list = data.get("voice_expiry_list", [])
+            with _lock_of(self, "_expiry_lock"):
+                self.voice_expiry_list = list(data.get("voice_expiry_list", []))
             self.groq_api_key = data.get("groq_api_key", "") or self.groq_api_key
-            self.groq_used_seconds = float(data.get("groq_used_seconds", 0.0))
+            with _lock_of(self, "_groq_lock"):
+                self.groq_used_seconds = float(data.get("groq_used_seconds", 0.0))
             self.install_id = data.get("install_id", "") or self.install_id
             self.error_reports_enabled = bool(data.get("error_reports_enabled", True))
             self.error_reports_notice_shown = bool(data.get("error_reports_notice_shown", False))
@@ -9214,9 +9326,9 @@ class LipsyncTwoModeApp(_BaseApp):
                 "cloudinary_api_key":    self.cloudinary_api_key,
                 "cloudinary_api_secret": self.cloudinary_api_secret,
                 "main_voice_name":       self.main_voice_name,
-                "voice_expiry_list":     list(self.voice_expiry_list),
+                "voice_expiry_list":     _locked_copy(self, "_expiry_lock", "voice_expiry_list"),
                 "groq_api_key":          self.groq_api_key,
-                "groq_used_seconds":     self.groq_used_seconds,
+                "groq_used_seconds":     _locked_copy(self, "_groq_lock", "groq_used_seconds"),
                 "install_id":            self.install_id,
                 "error_reports_enabled": self.error_reports_enabled,
                 "error_reports_notice_shown": self.error_reports_notice_shown,
