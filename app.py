@@ -2629,6 +2629,10 @@ SYNC_PRICE_PER_FRAME = 0.00427        # по ответу estimate для sync-3
 SYNC_SEC_PER_VIDEO_SEC = (20, 30)     # время обработки sync-3 на секунду видео
 SYNC_QUEUE_OVERHEAD_SEC = (60, 120)   # ожидание в очереди Sync на каждую задачу
 COST_CONFIRM_DEFAULT_THRESHOLD = 20.0
+# Панель хода очереди внизу главного окна
+LOG_PANEL_MAX_LINES = 500
+QUEUE_PANEL_MODES = {"Показывать во время работы": "running", "Только итог": "summary", "Не показывать": "off"}
+QUEUE_PANEL_LABELS = {v: k for k, v in QUEUE_PANEL_MODES.items()}
 
 
 # Последняя цена за кадр из успешного ответа estimate (сохраняется в конфиге между сессиями).
@@ -3706,8 +3710,6 @@ class LipsyncTwoModeApp(_BaseApp):
         self._detected_browser = None
         self._browser_checked = False
         self.log_queue = queue.Queue()
-        self.log_window = None
-        self.log_box = None
         self.is_processing = False
         self.sync_key = SYNC_API_KEY
         self.cloudinary_cloud_name = ""
@@ -3728,6 +3730,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.error_reports_var = ctk.BooleanVar(value=True)
         self.cost_confirm_enabled = True
         self.cost_confirm_threshold = COST_CONFIRM_DEFAULT_THRESHOLD
+        self.queue_panel_mode = "running"
         self.cost_confirm_var = ctk.BooleanVar(value=True)
         self._estimates = {}
         self._estimate_lock = threading.Lock()
@@ -3740,7 +3743,14 @@ class LipsyncTwoModeApp(_BaseApp):
         self._scene_estimate_label = None
         self._queue_progress = {}
         self._progress_lock = threading.Lock()
-        self._progress_label = None
+        self._log_lines = collections.deque(maxlen=LOG_PANEL_MAX_LINES)   # [(номер, строка)]
+        self._log_seq = 0
+        self._queue_summary = None
+        self._queue_batch_dir = None
+        self._qp = None
+        self._qp_w = {}
+        self._qp_forced = False
+        self._qp_details_open = False
         # Этап 2: панели живут всё время работы, состояние — в менеджере задач и на диске.
         self.background_tasks = BackgroundTaskManager()
         self._panels = {}
@@ -4501,6 +4511,8 @@ class LipsyncTwoModeApp(_BaseApp):
             font=ctk.CTkFont(size=17, weight="bold"),
         )
         self.start_btn.pack(fill="x")
+        # Ход очереди — над нижней строкой; появляется только во время очереди и с её итогом.
+        self._build_queue_panel(right_section, before=bottom)
 
     def _show_container(self, name, factory):
         """Скрывает все панели, показывает панель name. Возвращает (контейнер, создан_ли_сейчас)."""
@@ -4837,6 +4849,8 @@ class LipsyncTwoModeApp(_BaseApp):
         return [
             ("switch", "Отправлять разработчику обезличенные отчёты об ошибках", self.error_reports_var,
              self._on_error_reports_toggle),
+            ("menu", "Ход очереди", list(QUEUE_PANEL_MODES), lambda: QUEUE_PANEL_LABELS[self.queue_panel_mode],
+             self._on_queue_panel_mode_change, lambda: "По умолчанию: показывать во время работы."),
             ("buttons", "Лог", [("Открыть лог", self.open_log_window, BTN),
                                 ("Показать файл лога в папке", self.reveal_log_file, BTN)]),
             ("buttons", "Сохранённые данные", [("Очистить сохранённые данные", self.clear_saved_data,
@@ -8840,8 +8854,8 @@ class LipsyncTwoModeApp(_BaseApp):
                         "source": est.get("source"), "start": None, "end": None, "state": ""}
                 for order, ((idx, roll), est) in enumerate(zip(valid, estimates), start=1)
             }
-        self.open_log_window()
         self.is_processing = True
+        self._qp_on_queue_start()
         self.start_btn.configure(state="disabled", text="ОБРАБАТЫВАЮ ОЧЕРЕДЬ...")
         thread = threading.Thread(target=self.queue_thread, args=(valid,), daemon=True)
         thread.start()
@@ -8851,28 +8865,8 @@ class LipsyncTwoModeApp(_BaseApp):
         with self._progress_lock:
             self._queue_progress.setdefault(order_num, {"title": f"Ролик {order_num}"}).update(fields)
 
-    def _progress_text(self):
-        now = time.time()
-        with self._progress_lock:
-            items = sorted((k, dict(v)) for k, v in self._queue_progress.items())
-        lines = []
-        for order, p in items:
-            expected = f"ожидается ≈ {format_minutes(p['range'])}" if p.get("range") else "оценка недоступна"
-            if p.get("start") is None:
-                lines.append(f"#{order:02d} {p['title']} — ждёт · {expected}")
-                continue
-            elapsed = (p.get("end") or now) - p["start"]
-            clock = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
-            if p.get("end"):
-                lines.append(f"#{order:02d} {p['title']} — {p.get('state', '')} за {clock} · {expected}")
-            else:
-                lines.append(f"#{order:02d} {p['title']} — идёт {clock} · {expected}")
-        return "\n".join(lines)
-
     def _tick_queue_progress(self):
-        lbl = self._progress_label
-        if lbl is not None and lbl.winfo_exists():
-            lbl.configure(text=self._progress_text())
+        self._render_queue_panel()
         if self.is_processing:
             self.after(1000, self._tick_queue_progress)
 
@@ -8980,6 +8974,7 @@ class LipsyncTwoModeApp(_BaseApp):
                     suffix += 1
 
             total = len(valid_rolls)
+            self._queue_batch_dir = batch_dir
             self.log("=" * 70)
             self.log(f"Папка партии: {batch_dir}")
             self.log(f"Роликов в очереди: {total}")
@@ -9030,7 +9025,8 @@ class LipsyncTwoModeApp(_BaseApp):
                     with failed_lock:
                         failed_videos.append({
                             "video_name": video_name,
-                            "error": error_text
+                            "error": error_text,
+                            "roll_id": roll.get("id"),   # для job_id Sync в «Подробнее»
                         })
 
             with ThreadPoolExecutor(max_workers=CONCURRENT_ROLLS) as executor:
@@ -9055,40 +9051,314 @@ class LipsyncTwoModeApp(_BaseApp):
             self.after(0, self._tick_queue_progress)  # финальное состояние в окне прогресса
 
     def _show_queue_summary(self, batch_dir, total, failed):
-        """Итог очереди в немодальном окне: приложение остаётся доступным, папка открывается
-        только по кнопке."""
-        old = getattr(self, "_queue_summary_win", None)
-        if old is not None:
-            try:
-                old.destroy()
-            except Exception:
-                pass
-        ok = total - len(failed)
-        win = ctk.CTkToplevel(self)
-        win.title("Очередь завершена")
-        win.configure(fg_color=BG)
-        win.transient(self)
-        win.geometry("560x420" if failed else "520x220")
-        title = ("✅ Все ролики обработаны успешно" if not failed
-                 else f"Готово с ошибками: успешно {ok} из {total}")
-        self.label(win, title, size=18, weight="bold",
-                   color="#86efac" if not failed else "#fcd34d").pack(anchor="w", padx=20, pady=(18, 6))
-        path_lbl = self.label(win, f"Папка: {batch_dir}", size=12, color=MUTED)
-        path_lbl.configure(wraplength=500)
-        path_lbl.pack(anchor="w", fill="x", padx=20)
-        if failed:
-            box = ctk.CTkTextbox(win, height=200, fg_color=PANEL, text_color=TEXT, font=ctk.CTkFont(size=12))
-            box.pack(fill="both", expand=True, padx=20, pady=(10, 0))
-            box.insert("1.0", "\n\n".join(f"❌ {f['video_name']}\nПричина: {f['error']}" for f in failed))
-            box.configure(state="disabled")
-        row = ctk.CTkFrame(win, fg_color="transparent")
-        row.pack(fill="x", padx=20, pady=16, side="bottom")
-        self.button(row, "Закрыть", win.destroy, color=BTN, hover=BTN_HOVER, width=120).pack(side="right")
-        self.button(row, "Открыть папку", lambda: open_folder(batch_dir), color=BTN_OK, hover=BTN_OK_HOVER,
-                    width=160).pack(side="right", padx=8)
-        self._queue_summary_win = win
-        win.after(150, win.lift)
-        return win
+        """Итог очереди — строкой в панели хода очереди. Не модально, папку сам не открывает,
+        остаётся, пока пользователь не закроет."""
+        self._queue_summary = {"batch_dir": batch_dir, "total": total, "failed": list(failed),
+                               "time": time.time()}
+        self._qp_details_open = False
+        self._qp_set_state(hidden=False)
+        self._render_queue_panel()
+
+    # ── Панель хода очереди (внизу главного окна) ────────────────────────
+    def _qp_state(self, key, default=None):
+        return self._panel_state_get("queue_panel", key, default)
+
+    def _build_queue_panel(self, parent, before):
+        """Создаётся один раз. Показ и скрытие — pack/pack_forget, данные — из памяти."""
+        self._qp_parent_before = before
+        qp = ctk.CTkFrame(parent, fg_color=PANEL, corner_radius=12)
+        self._qp = qp
+        head = ctk.CTkFrame(qp, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=6)
+        w = {"head": head}
+        w["title"] = self.label(head, "", size=12, weight="bold")
+        w["title"].pack(side="left")
+        w["bar"] = ctk.CTkProgressBar(head, width=140, height=6)
+        w["bar"].set(0)
+        w["bar"].pack(side="left", padx=10)
+        w["eta"] = self.label(head, "", size=12, color=MUTED)
+        w["eta"].pack(side="left")
+        small = dict(height=24, corner_radius=8, font=ctk.CTkFont(size=12), fg_color=BTN, hover_color=BTN_HOVER,
+                     text_color=TEXT)
+        w["close"] = ctk.CTkButton(head, text="✕", width=28, command=self._qp_close, **small)
+        w["close"].pack(side="right")
+        w["toggle"] = ctk.CTkButton(head, text="Развернуть", width=100, command=self._qp_toggle, **small)
+        w["toggle"].pack(side="right", padx=(6, 6))
+        w["folder"] = ctk.CTkButton(head, text="Открыть папку", width=120, command=self._qp_open_folder, **small)
+        w["details_btn"] = ctk.CTkButton(head, text="Подробнее", width=100, command=self._qp_toggle_details, **small)
+        mono = ctk.CTkFont(family="Courier New", size=12)
+        # Подробности итога: ошибки с причинами и job_id, текст копируется
+        w["details"] = ctk.CTkFrame(qp, fg_color="transparent")
+        w["details_box"] = ctk.CTkTextbox(w["details"], height=110, fg_color="#111111", text_color="#e5e5e5",
+                                          font=mono, corner_radius=8, wrap="word")
+        w["details_box"].pack(fill="x", padx=12)
+        ctk.CTkButton(w["details"], text="Копировать", width=110,
+                      command=lambda: self._qp_copy(w["details_box"]), **small).pack(anchor="e", padx=12, pady=(4, 6))
+        # Развёрнутая часть: строки роликов и лог
+        w["body"] = ctk.CTkFrame(qp, fg_color="transparent")
+        w["rolls"] = ctk.CTkTextbox(w["body"], height=60, fg_color=BG, text_color=TEXT, font=mono,
+                                    corner_radius=8, wrap="none")
+        w["rolls"].pack(fill="x", padx=12, pady=(0, 6))
+        w["log"] = ctk.CTkTextbox(w["body"], height=120, fg_color="#111111", text_color="#e5e5e5", font=mono,
+                                  corner_radius=8)
+        w["log"].pack(fill="both", expand=True, padx=12)
+        w["log"].bind("<Command-a>", lambda e: w["log"].tag_add("sel", "1.0", "end"))
+        btns = ctk.CTkFrame(w["body"], fg_color="transparent")
+        btns.pack(fill="x", padx=12, pady=6)
+        ctk.CTkButton(btns, text="Копировать лог", width=130, command=lambda: self._qp_copy(w["log"]),
+                      **small).pack(side="left")
+        ctk.CTkButton(btns, text="Очистить", width=90, command=self._qp_clear_log, **small).pack(side="left", padx=6)
+        w["folder2"] = ctk.CTkButton(btns, text="Открыть папку", width=120, command=self._qp_open_folder, **small)
+        w["folder2"].pack(side="left")
+        self._qp_w = w
+        self._qp_log_shown = 0      # сквозной номер последней строки лога, уже показанной в поле
+        self.bind("<Configure>", self._qp_on_resize, add="+")
+
+    # Видимость
+    def _qp_visible_wanted(self):
+        if self._qp_forced:
+            return True
+        if self._qp_state("hidden", False):
+            return False
+        mode = self.queue_panel_mode
+        if self.is_processing:
+            return mode == "running"
+        if self._queue_summary is not None:
+            return mode in ("running", "summary")
+        return False
+
+    def _qp_set_state(self, **fields):
+        self._panel_state_set("queue_panel", **fields)
+
+    def _qp_toggle(self):
+        self._qp_set_state(expanded=not self._qp_state("expanded", False))
+        self._render_queue_panel()
+
+    def _qp_close(self):
+        """Крестик: скрыть панель. Итог закрывается совсем; во время работы — скрыта до итога."""
+        self._qp_forced = False
+        if not self.is_processing:
+            self._queue_summary = None
+            self._qp_details_open = False
+        self._qp_set_state(hidden=True)
+        self._render_queue_panel()
+
+    def _qp_toggle_details(self):
+        self._qp_details_open = not self._qp_details_open
+        self._render_queue_panel()
+
+    def _qp_open_folder(self):
+        folder = (self._queue_summary or {}).get("batch_dir") or self._queue_batch_dir
+        if folder:
+            open_folder(folder)
+
+    def _qp_copy(self, box):
+        try:
+            text = box.get("1.0", "end").strip()
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except Exception:
+            pass
+
+    def _qp_clear_log(self):
+        self._log_lines.clear()
+        self._qp_log_shown = self._log_seq
+        self._qp_w["log"].delete("1.0", "end")
+
+    def _qp_on_resize(self, event):
+        if event.widget is self and self._qp_w and self._qp_state("expanded", False):
+            self._qp_fit_height()
+
+    def _qp_fit_height(self):
+        """Развёрнутая панель — не выше ~35% окна: при высоте 640 основное содержимое остаётся рабочим."""
+        total = max(self.winfo_height(), 400)
+        budget = int(total * 0.35) - 44 - 40
+        n = max(1, min(len(self._queue_progress), 6))
+        rolls_h = min(22 * n + 10, max(40, budget // 2))
+        self._qp_w["rolls"].configure(height=rolls_h)
+        self._qp_w["log"].configure(height=max(60, budget - rolls_h - 10))
+
+    # Данные
+    def _qp_rows(self):
+        now = time.time()
+        with self._progress_lock:
+            items = sorted((k, dict(v)) for k, v in self._queue_progress.items())
+        rows = []
+        for order, p in items:
+            expected = f"ожидается ≈ {format_minutes(p['range'])}" if p.get("range") else "оценка недоступна"
+            if p.get("start") is None:
+                icon, status = "⏳", f"ждёт · {expected}"
+            else:
+                elapsed = (p.get("end") or now) - p["start"]
+                clock = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
+                if p.get("end"):
+                    icon = "✗" if p.get("state") == "ошибка" else "✓"
+                    status = f"{p.get('state', '')} за {clock}"
+                else:
+                    icon, status = "▶", f"идёт {clock} · {expected}"
+            rows.append((order, icon, p.get("title", f"Ролик {order}"), status, p))
+        return rows
+
+    def _qp_progress(self):
+        """(готово, всего, идущие номера, доля, «ещё ≈ T» или '')."""
+        now = time.time()
+        rows = self._qp_rows()
+        total = len(rows)
+        done = sum(1 for r in rows if r[4].get("end"))
+        running = [r[0] for r in rows if r[4].get("start") and not r[4].get("end")]
+        frac, remaining = float(done), []
+        for _order, _icon, _title, _status, p in rows:
+            if p.get("end"):
+                continue
+            rng = p.get("range")
+            if not rng:
+                remaining = None          # у ролика нет оценки — общее «ещё ≈» не показываем
+                continue
+            if p.get("start"):
+                elapsed = now - p["start"]
+                frac += min(elapsed / max(sum(rng) / 2, 1), 0.95)
+                rng = (max(rng[0] - elapsed, 0), max(rng[1] - elapsed, 0))
+            if remaining is not None:
+                remaining.append(rng)
+        eta = ""
+        if remaining:
+            lo, hi = estimate_queue_time(remaining)
+            eta = f"ещё ≈ {format_minutes((lo, hi))}" if hi > 0 else ""
+        return done, total, running, (frac / total if total else 0.0), eta
+
+    # Рендер
+    def _render_queue_panel(self):
+        if not self._qp_w:
+            return
+        w = self._qp_w
+        if not self._qp_visible_wanted():
+            if self._qp.winfo_manager():
+                self._qp.pack_forget()
+            return
+        if not self._qp.winfo_manager():
+            self._qp.pack(fill="x", padx=20, pady=(4, 0), before=self._qp_parent_before)
+        expanded = bool(self._qp_state("expanded", False))
+        summary = self._queue_summary
+        if self.is_processing or (summary is None and self._queue_progress and not self._qp_forced):
+            done, total, running, frac, eta = self._qp_progress()
+            now_txt = (f" · идёт ролик {', '.join(str(r) for r in running)}" if running else "")
+            w["title"].configure(text=f"Очередь: {done} из {total}{now_txt}", text_color=TEXT)
+            w["bar"].set(frac)
+            w["eta"].configure(text=eta)
+        elif summary is not None:
+            failed = summary["failed"]
+            ok = summary["total"] - len(failed)
+            w["title"].configure(text=f"Готово {ok} из {summary['total']}"
+                                      + (f" · {len(failed)} с ошибкой" if failed else ""),
+                                 text_color="#fcd34d" if failed else "#86efac")
+            w["bar"].set(1.0)
+            w["eta"].configure(text="")
+        else:
+            w["title"].configure(text="Лог приложения", text_color=TEXT)
+            w["bar"].set(0)
+            w["eta"].configure(text="")
+        has_summary = summary is not None and not self.is_processing
+        folder = (summary or {}).get("batch_dir") or self._queue_batch_dir
+        for key, show, side_opts in (("folder", bool(folder) and has_summary, {"side": "right", "padx": (6, 0)}),
+                                     ("details_btn", has_summary, {"side": "right", "padx": (6, 0)})):
+            if show and not w[key].winfo_manager():
+                w[key].pack(before=w["toggle"], **side_opts)
+            elif not show and w[key].winfo_manager():
+                w[key].pack_forget()
+        w["details_btn"].configure(text="Скрыть подробности" if self._qp_details_open else "Подробнее")
+        w["close"].configure(text="✕")
+        # Подробности итога
+        if has_summary and self._qp_details_open:
+            text = self._qp_summary_text(summary)
+            if w["details_box"].get("1.0", "end").strip() != text.strip():
+                w["details_box"].configure(state="normal")
+                w["details_box"].delete("1.0", "end")
+                w["details_box"].insert("1.0", text)
+                w["details_box"].configure(state="disabled")
+            if not w["details"].winfo_manager():
+                w["details"].pack(fill="x", after=w["head"])
+        elif w["details"].winfo_manager():
+            w["details"].pack_forget()
+        # Развёрнутая часть
+        w["toggle"].configure(text="Свернуть" if expanded else "Развернуть")
+        if expanded:
+            if not w["body"].winfo_manager():
+                w["body"].pack(fill="both", expand=True)
+                self._qp_fit_height()
+                self._qp_sync_log(force=True)
+            lines = "\n".join(f"{icon} #{order:02d} {title} — {status}"
+                              for order, icon, title, status, _p in self._qp_rows())
+            if w["rolls"].get("1.0", "end").rstrip("\n") != lines:
+                w["rolls"].configure(state="normal")
+                w["rolls"].delete("1.0", "end")
+                w["rolls"].insert("1.0", lines or "Очередь не запускалась")
+                w["rolls"].configure(state="disabled")
+        elif w["body"].winfo_manager():
+            w["body"].pack_forget()
+        f = w["folder2"]
+        f.configure(state="normal" if folder else "disabled")
+
+    def _qp_summary_text(self, summary):
+        parts = [f"Папка: {summary['batch_dir']}"]
+        if not summary["failed"]:
+            parts.append("Все ролики обработаны успешно.")
+        with self._journal_lock:
+            journal = list(self._sync_journal)
+        for item in summary["failed"]:
+            lines = [f"✗ {item['video_name']}", f"  Причина: {item['error']}"]
+            rid = item.get("roll_id")
+            if rid is not None:
+                jobs = [v["job_id"] for v in sync_jobs_for_roll(journal, rid).values()
+                        if v.get("batch") == summary["batch_dir"]]
+                if jobs:
+                    lines.append(f"  job_id Sync: {', '.join(jobs)}")
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts)
+
+    def _qp_sync_log(self, force=False):
+        """Дописывает в поле лога новые строки из памяти (по сквозному номеру строки). Прокрутка
+        к концу — только если пользователь и так внизу, чтобы не сбивать чтение старых строк."""
+        box = self._qp_w.get("log") if self._qp_w else None
+        if box is None or (not box.winfo_manager() and not force):
+            return
+        lines = list(self._log_lines)                 # [(номер, текст)], последние LOG_PANEL_MAX_LINES
+        first = lines[0][0] if lines else self._log_seq + 1
+        if force or self._qp_log_shown < first - 1:   # пропущены строки, вытесненные из памяти
+            box.delete("1.0", "end")
+            if lines:
+                box.insert("end", "\n".join(text for _n, text in lines) + "\n")
+            self._qp_log_shown = self._log_seq
+            box.see("end")
+            return
+        new = [text for n, text in lines if n > self._qp_log_shown]
+        if not new:
+            return
+        at_bottom = box.yview()[1] >= 0.999
+        box.insert("end", "\n".join(new) + "\n")
+        excess = int(box.index("end-1c").split(".")[0]) - 1 - LOG_PANEL_MAX_LINES
+        if excess > 0:
+            box.delete("1.0", f"{excess + 1}.0")
+        self._qp_log_shown = self._log_seq
+        if at_bottom:
+            box.see("end")
+
+    def _qp_on_queue_start(self, batch_dir=None):
+        self._queue_summary = None
+        self._qp_details_open = False
+        self._queue_batch_dir = batch_dir
+        self._qp_set_state(hidden=False)   # новая очередь снова показывает панель (по настройке)
+        self._render_queue_panel()
+
+    def _on_queue_panel_mode_change(self, label):
+        self.queue_panel_mode = QUEUE_PANEL_MODES[label]
+        self.save_config()
+        self._render_queue_panel()
+
+    def open_log_window(self):
+        """«Открыть лог»: разворачивает панель хода очереди с логом (отдельного окна больше нет)."""
+        self._qp_forced = True
+        self._qp_set_state(hidden=False, expanded=True)
+        self._render_queue_panel()
 
     def set_roll_status(self, idx, status):
         def update():
@@ -9146,23 +9416,6 @@ class LipsyncTwoModeApp(_BaseApp):
         self._render_key_status()   # точки ключей, баланс, строки «Настроек»
         self._render_nav_active()
 
-    def open_log_window(self):
-        if self.log_window is not None and self.log_window.winfo_exists():
-            self.log_window.lift()
-            return
-        self.log_window = ctk.CTkToplevel(self)
-        self.log_window.title("Прогресс очереди")
-        self.log_window.geometry("940x640")
-        self.log_window.configure(fg_color=BG)
-        self._progress_label = ctk.CTkLabel(
-            self.log_window, text=self._progress_text(), justify="left", anchor="w",
-            text_color="#e5e5e5", font=ctk.CTkFont(family="Courier New", size=12))
-        self._progress_label.pack(fill="x", padx=18, pady=(18, 0))
-        self.log_box = ctk.CTkTextbox(self.log_window, fg_color="#111111", text_color="#e5e5e5", font=ctk.CTkFont(family="Courier New", size=12), corner_radius=10)
-        self.log_box.pack(fill="both", expand=True, padx=18, pady=18)
-        self.log_box.bind("<Command-a>", lambda e: self.log_box.tag_add("sel", "1.0", "end"))
-        self.log_box.bind("<Command-c>", lambda e: None)
-
     def log(self, msg):
         msg = str(msg)
         write_log_file(msg)
@@ -9178,11 +9431,15 @@ class LipsyncTwoModeApp(_BaseApp):
         try:
             while True:
                 msg = self.log_queue.get_nowait()
-                if self.log_box is not None and self.log_box.winfo_exists():
-                    self.log_box.insert("end", msg + "\n")
-                    self.log_box.see("end")
+                for line in str(msg).splitlines() or [""]:
+                    self._log_seq += 1
+                    self._log_lines.append((self._log_seq, line))
         except queue.Empty:
             pass
+        try:
+            self._qp_sync_log()      # копится всегда; в поле — только если панель развёрнута
+        except Exception:
+            self.report_callback_exception(*sys.exc_info())
         try:
             self._process_task_changes()
             if self._compress_dirty:
@@ -9291,6 +9548,9 @@ class LipsyncTwoModeApp(_BaseApp):
             # Без явного выбора — Sync для всех (в том числе при настроенном Cloudinary).
             # Явный выбор Cloudinary сохраняется; откат на Cloudinary при ошибке загрузки — как раньше.
             self.sync_storage = self._sync_storage_choice or "sync"
+            self.queue_panel_mode = data.get("queue_panel_mode", "running")
+            if self.queue_panel_mode not in QUEUE_PANEL_MODES.values():
+                self.queue_panel_mode = "running"
             self.sync_fps_mode = data.get("sync_fps_mode", "source")
             if self.sync_fps_mode not in SYNC_FPS_MODES.values():
                 self.sync_fps_mode = "source"
@@ -9334,6 +9594,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 "error_reports_notice_shown": self.error_reports_notice_shown,
                 "cost_confirm_enabled":  self.cost_confirm_enabled,
                 "cost_confirm_threshold": self.cost_confirm_threshold,
+                "queue_panel_mode":      getattr(self, "queue_panel_mode", "running"),
                 "sync_price_per_frame":  sync_price_state["per_frame"],
                 "sync_fps_mode":         self.sync_fps_mode,
                 "sync_storage":          self._sync_storage_choice,
