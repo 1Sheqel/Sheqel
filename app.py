@@ -2470,6 +2470,25 @@ def cleanup_compress_tmp(path):
     return False
 
 
+# ── Клонирование: voice_id из ответа ElevenLabs ─────────────────────────────
+_VOICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+def voice_id_from_clone_response(obj):
+    """voice_id из ответа клонирования: словарь REST API ({"voice_id": …}), объект SDK с полем
+    voice_id или уже готовая строка. Иначе ValueError."""
+    if isinstance(obj, str):
+        value = obj
+    elif isinstance(obj, dict):
+        value = obj.get("voice_id") or obj.get("voiceId")
+    else:
+        value = getattr(obj, "voice_id", None) or getattr(obj, "voiceId", None)
+    value = str(value).strip() if value else ""
+    if not _VOICE_ID_RE.match(value):
+        raise ValueError("нет корректного voice_id")
+    return value
+
+
 # ── Лицо говорящего: options.active_speaker_detection для Sync ─────────────
 FACE_MODES = {
     "По умолчанию": "default",
@@ -3766,6 +3785,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self._journal_dirty = False
         self._sync_fetch_widgets = None
         self._sync_fetch_pending = set()
+        self._vg = None                  # виджеты вкладки генерации; None, пока вкладка не построена
         self._clone_pending = set()      # задачи клонирования, итог которых ещё не применён
         self._clone_cleanup = None       # очистка извлечённого аудио (из вкладки клонирования)
         self._notice_w = {}
@@ -5921,44 +5941,105 @@ class LipsyncTwoModeApp(_BaseApp):
 
     def _on_clone_finished(self, task):
         """Главный поток. Успех: голос в генератор (в данных — даже если вкладки ещё нет), текст
-        очищается (по настройке). Ошибка или прерывание: ничего не меняется."""
+        очищается (по настройке) — только если голос подставился. Ошибка или прерывание: ничего не меняется."""
         if task["status"] != "done":
             return
-        name, voice_id = task["result"]["name"], task["result"]["voice_id"]
-        self._apply_cloned_voice(name, voice_id)
+        result = task.get("result") or {}
+        name = result.get("name") or task.get("meta", {}).get("name") or ""
+        try:
+            voice_id = voice_id_from_clone_response(result.get("voice_id") or result)
+            applied = self._apply_cloned_voice(name, voice_id)
+        except Exception as e:
+            voice_id = str(result.get("voice_id") or "")
+            applied = False
+            self.log(f"Клон готов, но подставить его в генератор не удалось: {type(e).__name__}")
+            error_reporter.report("app._on_clone_finished", exc=e)
+            messagebox.showwarning("Клонирование", f"Голос «{name}» создан, но подставить его в генератор "
+                                   "не удалось. Текст генерации не тронут — выбери голос вручную: "
+                                   "«Выбрать из списка моих голосов».", parent=self)
         if self._clone_cleanup is not None:
             try:
                 self._clone_cleanup()
             except Exception:
                 pass
         if self._active_panel == "voice_clone":
-            messagebox.showinfo("Готово", f"Голос «{name}» клонирован.\n\nvoice_id: {voice_id}", parent=self)
+            if applied:
+                messagebox.showinfo("Готово", f"Голос «{name}» клонирован.\n\nvoice_id: {voice_id}", parent=self)
             self.after(300, self.show_voice_gen_panel)
-        else:
+        elif applied:
             self._show_notice(f"Голос «{name}» готов", "Открыть генерацию", self.show_voice_gen_panel)
+        else:
+            self._show_notice(f"Голос «{name}» создан — выбери его в генерации вручную", "Открыть генерацию",
+                              self.show_voice_gen_panel)
 
     def _apply_cloned_voice(self, name, voice_id):
-        self.main_voice_name = name
-        self.main_voice_id = voice_id
+        """Шаг 1 — голос (данные и поле, если вкладка уже есть). Шаг 2 — только если шаг 1 удался:
+        очистка текста с резервом «Вернуть». Ошибка на любом шаге не роняет приложение и не теряет текст.
+        Возвращает True, если голос подставлен."""
         state = self._panel_state.setdefault("voice_gen", {})
-        state["voice"] = name
-        state["voice_id"] = voice_id
+        prev_state = {k: state.get(k) for k in ("voice", "voice_id")}
+        prev_main = (self.main_voice_name, self.main_voice_id)
+        vg = getattr(self, "_vg", None)
+        try:
+            if not name:
+                raise ValueError("нет имени голоса")
+            voice_id = voice_id_from_clone_response(voice_id)
+            if vg and vg["voice_box"].winfo_exists():
+                vg["voice_box"].delete("1.0", "end")
+                vg["voice_box"].insert("1.0", name)
+            state["voice"], state["voice_id"] = name, voice_id
+            self.main_voice_name, self.main_voice_id = name, voice_id
+        except Exception as e:
+            for k, v in prev_state.items():          # голос — как был; текст не трогаем
+                if v is None:
+                    state.pop(k, None)
+                else:
+                    state[k] = v
+            self.main_voice_name, self.main_voice_id = prev_main
+            if vg and vg["voice_box"].winfo_exists() and prev_state.get("voice") is not None:
+                try:
+                    vg["voice_box"].delete("1.0", "end")
+                    vg["voice_box"].insert("1.0", prev_state["voice"])
+                except Exception:
+                    pass
+            self.log(f"Подставить клон в генератор не удалось ({type(e).__name__}) — голос и текст не тронуты")
+            error_reporter.report("app._apply_cloned_voice", exc=e)
+            messagebox.showwarning("Клонирование", f"Голос «{name}» создан, но подставить его в генератор не "
+                                   "удалось. Текст генерации не тронут — выбери голос вручную: "
+                                   "«Выбрать из списка моих голосов».", parent=self)
+            self._schedule_state_save()
+            return False
+
         cleared = False
-        if self.clear_text_after_clone and (state.get("text") or "").strip():
-            state["text_backup"] = state["text"]     # «Вернуть» — и после перезапуска
-            state["text"] = ""
-            cleared = True
+        widget = vg["text_box"] if vg and vg["text_box"].winfo_exists() else None
+        current = widget.get("1.0", "end").rstrip("\n") if widget is not None else (state.get("text") or "")
+        if self.clear_text_after_clone and current.strip():
+            try:
+                state["text_backup"] = current       # «Вернуть» — и после перезапуска
+                state["text"] = ""
+                if widget is not None:
+                    widget.delete("1.0", "end")
+                    vg["update_status"]()
+                cleared = True
+            except Exception as e:
+                state["text"] = current               # текст — как был
+                state.pop("text_backup", None)
+                if widget is not None:
+                    try:
+                        if not widget.get("1.0", "end").strip():
+                            widget.insert("1.0", current)
+                    except Exception:
+                        pass
+                self.log(f"Очистить текст после клонирования не удалось ({type(e).__name__}) — текст оставлен")
+        try:
+            if vg and vg["voice_box"].winfo_exists():
+                vg["render_restore_notice"]()
+        except Exception:
+            pass
         self._panel_state_set("voice_gen")
         self.save_config()
-        vg = self._vg
-        if vg and vg["voice_box"].winfo_exists():
-            vg["voice_box"].delete("1.0", "end")
-            vg["voice_box"].insert("1.0", name)
-            if cleared:
-                vg["text_box"].delete("1.0", "end")
-                vg["update_status"]()
-            vg["render_restore_notice"]()
         self.log(f"Клон «{name}» подставлен в генератор" + (", текст очищен (можно вернуть)" if cleared else ""))
+        return True
 
     def _build_notice_bar(self, parent, before):
         bar = ctk.CTkFrame(parent, fg_color="#1f3a2e", corner_radius=12)
@@ -6253,11 +6334,10 @@ class LipsyncTwoModeApp(_BaseApp):
             except ValueError:
                 raise RuntimeError(f"{res.status_code}: {res.text[:300]}")
 
-        payload = res.json()
-        voice_id = payload.get("voice_id") or payload.get("voiceId")
-        if not voice_id:
-            raise RuntimeError(f"ElevenLabs не вернул voice_id: {payload}")
-        return voice_id
+        try:
+            return voice_id_from_clone_response(res.json())
+        except ValueError:
+            raise RuntimeError("ElevenLabs не вернул voice_id в ответе на клонирование")
     
     def show_voice_clone_panel(self):
         if not self.api_key:
