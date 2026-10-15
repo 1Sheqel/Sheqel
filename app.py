@@ -5,6 +5,8 @@ import subprocess
 import sys
 
 def _ensure_deps():
+    if "--selftest" in sys.argv:
+        return    # самопроверка обновления: без сети и без установки пакетов
     packages = [
         ("requests",       "requests==2.34.2"),
         ("customtkinter",  "customtkinter==5.2.2"),
@@ -372,6 +374,254 @@ def secure_private_files():
             secure_path(p)
     if os.path.isdir(APP_DATA_DIR):
         secure_path(APP_DATA_DIR, is_dir=True)
+
+
+# ── Клонирование: voice_id из ответа ElevenLabs ─────────────────────────────
+_VOICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+def voice_id_from_clone_response(obj):
+    """voice_id из ответа клонирования: словарь REST API ({"voice_id": …}), объект SDK с полем
+    voice_id или уже готовая строка. Иначе ValueError."""
+    if isinstance(obj, str):
+        value = obj
+    elif isinstance(obj, dict):
+        value = obj.get("voice_id") or obj.get("voiceId")
+    else:
+        value = getattr(obj, "voice_id", None) or getattr(obj, "voiceId", None)
+    value = str(value).strip() if value else ""
+    if not _VOICE_ID_RE.match(value):
+        raise ValueError("нет корректного voice_id")
+    return value
+
+
+# ── Защищённое обновление: sha256 обязателен, самопроверка, замок одного экземпляра ──────────
+UPDATE_APP_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/app.py"
+UPDATE_SHA_RETRIES = 3            # повторов при несовпадении sha256 (кэш GitHub ещё отдаёт старый файл)
+UPDATE_RETRY_PAUSE_SEC = 60
+UPDATE_DOWNLOAD_TIMEOUT_SEC = 60
+UPDATE_SELFTEST_TIMEOUT_SEC = 60
+SELFTEST_MARKER = "SHEQEL_SELFTEST_OK"
+AFTER_UPDATE_WAIT_SEC = 15
+UPDATE_TMP_NAME = "app.py.new"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class UpdateError(RuntimeError):
+    """kind: no_sha | download | sha | selftest | version | replace."""
+
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+
+
+def platform_is_windows():
+    return sys.platform == "win32"
+
+
+def _no_window_kwargs():
+    return {"creationflags": 0x08000000} if platform_is_windows() else {}   # CREATE_NO_WINDOW
+
+
+def download_update_file(url, dest, timeout=UPDATE_DOWNLOAD_TIMEOUT_SEC):
+    """Скачивает файл целиком в dest и возвращает его sha256. Любой сбой — UpdateError('download')."""
+    h = hashlib.sha256()
+    try:
+        with requests.get(url, timeout=timeout, stream=True,
+                          headers={"Cache-Control": "no-cache", "Pragma": "no-cache"}) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(64 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        h.update(chunk)
+    except Exception as e:
+        raise UpdateError("download", f"Не удалось скачать обновление: {_strip_urls(e)}")
+    return h.hexdigest()
+
+
+def run_update_selftest(path, expected_version, timeout=UPDATE_SELFTEST_TIMEOUT_SEC, python=None):
+    """Запускает скачанный файл отдельным процессом с --selftest: без окна, сети, отчётов и записи файлов.
+    Нужна метка SELFTEST_MARKER с версией, равной версии из манифеста."""
+    try:
+        res = subprocess.run([python or sys.executable, path, "--selftest"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=timeout, cwd=os.path.dirname(path),
+                             env=dict(os.environ, SHEQEL_SELFTEST="1"), **_no_window_kwargs())
+    except subprocess.TimeoutExpired:
+        raise UpdateError("selftest", f"Новая версия не прошла самопроверку: не ответила за {timeout} с.")
+    m = re.search(SELFTEST_MARKER + r" version=(\S+)", res.stdout or "")
+    if res.returncode != 0 or not m:
+        missing = re.search(r"No module named '([^']+)'", res.stderr or "")
+        if missing:
+            raise UpdateError("selftest", f"Новой версии нужен пакет «{missing.group(1)}», а он не установлен. "
+                                          "Обновление не применено.")
+        last = (res.stderr or res.stdout or "").strip().splitlines()[-1:] or ["нет вывода"]
+        raise UpdateError("selftest", "Новая версия не прошла самопроверку — обновление не применено "
+                                      f"(код {res.returncode}: {sanitize_for_report(last[0])[:160]}).")
+    if m.group(1) != expected_version:
+        raise UpdateError("version", f"Версия в скачанном файле ({m.group(1)}) не совпадает с объявленной "
+                                     f"({expected_version}). Обновление не применено.")
+    return m.group(1)
+
+
+def install_verified_update(app_dir, expected_sha256, latest_version, url=None, on_status=None,
+                            retries=None, pause=None, sleep=time.sleep):
+    """Скачать → sha256 (с повторами против кэша) → самопроверка → замена app.py.
+    Временный файл удаляется при любом исходе (finally). Возвращает путь к app.py."""
+    on_status = on_status or (lambda text: None)
+    url = url or UPDATE_APP_URL
+    retries = UPDATE_SHA_RETRIES if retries is None else retries
+    pause = UPDATE_RETRY_PAUSE_SEC if pause is None else pause
+    if not isinstance(expected_sha256, str) or not _SHA256_RE.match(expected_sha256.strip().lower()):
+        raise UpdateError("no_sha", "В манифесте обновления нет контрольной суммы sha256 — обновление отклонено "
+                                    "ради безопасности. Сообщи разработчику.")
+    expected_sha256 = expected_sha256.strip().lower()
+    app_path = os.path.join(app_dir, "app.py")
+    tmp = os.path.join(app_dir, UPDATE_TMP_NAME)
+    try:
+        for attempt in range(retries + 1):
+            on_status("Скачиваю обновление..." if attempt == 0 else f"Повтор {attempt} из {retries}: скачиваю...")
+            got = download_update_file(f"{url}?t={time.time_ns()}", tmp)   # ?t= — мимо кэша
+            if got == expected_sha256:
+                break
+            if attempt < retries:
+                on_status(f"Обновление ещё публикуется, повтори через несколько минут. "
+                          f"Пробую снова через {pause:g} с (повтор {attempt + 1} из {retries})...")
+                sleep(pause)
+        else:
+            raise UpdateError("sha", "Скачанный файл не совпадает с контрольной суммой даже после повторов — "
+                                     "он повреждён или подменён. Обновление не применено.")
+        on_status("Проверяю новую версию...")
+        run_update_selftest(tmp, latest_version)
+        on_status("Применяю обновление...")
+        try:
+            if os.path.exists(app_path):
+                shutil.copy2(app_path, app_path + ".bak")
+            os.replace(tmp, app_path)
+            with open(os.path.join(app_dir, ".just_updated"), "w", encoding="utf-8") as f:
+                f.write(latest_version)
+        except OSError as e:
+            raise UpdateError("replace", f"Не удалось заменить файл программы: {e}")
+        return app_path
+    finally:
+        for leftover in (tmp, tmp + ".part"):
+            try:
+                if os.path.exists(leftover):
+                    os.remove(leftover)
+            except OSError:
+                pass
+
+
+def run_selftest():
+    """python app.py --selftest: модуль загрузился, main и APP_VERSION на месте. Без окна, сети и записи."""
+    problems = []
+    if not callable(globals().get("main")):
+        problems.append("нет main()")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", str(globals().get("APP_VERSION", ""))):
+        problems.append("нет APP_VERSION")
+    if "LipsyncTwoModeApp" not in globals():
+        problems.append("нет окна приложения")
+    if problems:
+        print("SHEQEL_SELFTEST_FAIL " + "; ".join(problems), flush=True)
+        return 1
+    print(f"{SELFTEST_MARKER} version={APP_VERSION}", flush=True)
+    return 0
+
+
+# Замок «один экземпляр»: две копии не пишут конфиг и state.json одновременно.
+def instance_lock_path():
+    return os.path.join(APP_DATA_DIR, "instance.lock")
+
+
+def pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if platform_is_windows():
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            code = ctypes.c_ulong()
+            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return code.value == 259                                         # STILL_ACTIVE
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def read_instance_lock():
+    try:
+        with open(instance_lock_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def acquire_instance_lock(wait_sec=0.0, sleep=time.sleep):
+    """(True, None) — замок наш. (False, данные замка) — работает другая копия.
+    Устаревший замок (процесса нет) или наш собственный (тот же PID после os.execv) забирается."""
+    path = instance_lock_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    secure_path(os.path.dirname(path), is_dir=True)
+    deadline = time.time() + max(0.0, wait_sec)
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "time": time.time(), "version": APP_VERSION}, f)
+            return True, None
+        except FileExistsError:
+            info = read_instance_lock()
+            if not info or info.get("pid") == os.getpid() or not pid_alive(info.get("pid")):
+                try:
+                    os.remove(path)          # устаревший или наш — забираем
+                except OSError:
+                    pass
+                continue
+            if time.time() < deadline:
+                sleep(0.3)
+                continue
+            return False, info
+
+
+def release_instance_lock():
+    info = read_instance_lock()
+    if info and info.get("pid") == os.getpid():
+        try:
+            os.remove(instance_lock_path())
+        except OSError:
+            pass
+
+
+def notify_already_running(info, after_update=False):
+    text = ("SheqelMotion уже открыт" + (f" (процесс {info.get('pid')})" if info else "") + ".\n\n"
+            + ("Предыдущая копия ещё не закрылась после обновления. Закрой её и запусти программу снова."
+               if after_update else "Переключись на открытое окно — вторая копия не запускается, чтобы "
+                                    "не испортить настройки и очередь."))
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning("SheqelMotion", text, parent=root)
+        root.destroy()
+    except Exception:
+        print(text, file=sys.stderr)
+
+
 _EXPECTED_ERROR_RE = re.compile(
     r"(?i)(?:\b(?:error|ошибка|status|статус|http)\b[^\n]{0,25}?\b(?:401|402|429)\b"
     r"|\b(?:401|402|429)\b\s*(?:client error|unauthorized|payment required|too many requests)"
@@ -2660,25 +2910,6 @@ def cleanup_compress_tmp(path):
     return False
 
 
-# ── Клонирование: voice_id из ответа ElevenLabs ─────────────────────────────
-_VOICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
-
-
-def voice_id_from_clone_response(obj):
-    """voice_id из ответа клонирования: словарь REST API ({"voice_id": …}), объект SDK с полем
-    voice_id или уже готовая строка. Иначе ValueError."""
-    if isinstance(obj, str):
-        value = obj
-    elif isinstance(obj, dict):
-        value = obj.get("voice_id") or obj.get("voiceId")
-    else:
-        value = getattr(obj, "voice_id", None) or getattr(obj, "voiceId", None)
-    value = str(value).strip() if value else ""
-    if not _VOICE_ID_RE.match(value):
-        raise ValueError("нет корректного voice_id")
-    return value
-
-
 # ── Лицо говорящего: options.active_speaker_detection для Sync ─────────────
 FACE_MODES = {
     "По умолчанию": "default",
@@ -4401,6 +4632,7 @@ class LipsyncTwoModeApp(_BaseApp):
         if self._state_save_job is not None:
             self.after_cancel(self._state_save_job)
         self._save_state_now()
+        release_instance_lock()
         self.destroy()
 
     def _parse_version(self, v):
@@ -4444,7 +4676,7 @@ class LipsyncTwoModeApp(_BaseApp):
     def _show_update_dialog(self, latest_version, notes, is_forced, expected_sha256=""):
         win = ctk.CTkToplevel(self)
         win.title("Доступно обновление")
-        win.geometry("560x500")
+        win.geometry("560x520")
         win.configure(fg_color=BG)
         win.transient(self)
         win.after(100, win.grab_set)
@@ -4461,28 +4693,72 @@ class LipsyncTwoModeApp(_BaseApp):
 
         self.label(frame, "Что нового:", size=13, weight="bold").pack(anchor="w", padx=20)
         notes_box = ctk.CTkTextbox(frame, fg_color="#1a1a1a", text_color="#e5e5e5",
-                                   border_width=0, height=140,
+                                   border_width=0, height=130,
                                    font=ctk.CTkFont(size=12), wrap="word")
         notes_box.pack(fill="both", expand=True, padx=20, pady=(6, 10))
         notes_box.insert("1.0", notes or "—")
         notes_box.configure(state="disabled")
 
         progress_label = self.label(frame, "", size=12, color=MUTED)
-        progress_label.pack(anchor="w", padx=20, pady=(0, 6))
+        progress_label.configure(wraplength=480)
+        progress_label.pack(anchor="w", fill="x", padx=20, pady=(0, 6))
+        error_label = self.label(frame, "", size=11, color="#fca5a5")
+        error_label.configure(wraplength=480)
 
         btn_row = ctk.CTkFrame(frame, fg_color=PANEL)
         btn_row.pack(fill="x", padx=20, pady=(0, 16))
+        failures = {"n": 0}
+
+        def set_status(text):
+            # Вызывается из фонового потока — виджеты трогает только главный поток.
+            self.after(0, lambda: progress_label.winfo_exists() and progress_label.configure(text=text))
+
+        def on_failed(err):
+            failures["n"] += 1
+            update_btn.configure(state="normal")
+            progress_label.configure(text="")
+            messagebox.showerror("Ошибка обновления", str(err), parent=win)
+            if is_forced and failures["n"] >= 2 and not later_btn_ref:
+                # Обязательное обновление дважды не удалось — даём выйти, чтобы не заблокировать программу.
+                error_label.configure(text=f"Не удалось обновиться дважды подряд: {err}")
+                error_label.pack(anchor="w", fill="x", padx=20, pady=(0, 6), before=btn_row)
+                later = self.button(btn_row, "Закрыть, обновлю позже", win.destroy,
+                                    color=BTN, hover=BTN_HOVER, width=220)
+                later.pack(side="right", padx=(8, 0))
+                later_btn_ref.append(later)
+                win.protocol("WM_DELETE_WINDOW", win.destroy)
 
         def do_update():
+            if getattr(sys, "frozen", False):
+                messagebox.showinfo("Обновление", f"Доступна версия {latest_version}.\n\n"
+                                    "Автообновление недоступно в .exe/.app сборке.\n"
+                                    "Скачай новый файл вручную с GitHub и замени текущий.", parent=win)
+                win.destroy()
+                return
+            if self.is_processing:
+                messagebox.showwarning("Обновление", "Идёт очередь роликов. Дождись её окончания и обнови.",
+                                       parent=win)
+                return
             update_btn.configure(state="disabled")
+            app_dir = app_base_dir()
+
             def run():
                 try:
-                    self._download_and_replace(latest_version, expected_sha256, progress_label, win)
+                    app_path = install_verified_update(app_dir, expected_sha256, latest_version,
+                                                       on_status=set_status)
+                except UpdateError as e:
+                    self.log(f"Обновление не применено ({e.kind}): {e}")
+                    self.after(0, lambda err=e: on_failed(err))
+                    return
                 except Exception as e:
-                    self.after(0, lambda: messagebox.showerror("Ошибка обновления", str(e), parent=win))
-                    self.after(0, lambda: update_btn.configure(state="normal"))
+                    self.after(0, lambda err=e: on_failed(err))
+                    return
+                set_status("Перезапускаюсь...")
+                self.after(300, lambda: self._restart_after_update(app_path))   # только главный поток
+
             threading.Thread(target=run, daemon=True).start()
 
+        later_btn_ref = []
         if not is_forced:
             self.button(btn_row, "Позже", win.destroy,
                         color=BTN, hover=BTN_HOVER, width=120).pack(side="right", padx=(8, 0))
@@ -4495,123 +4771,42 @@ class LipsyncTwoModeApp(_BaseApp):
             self.label(frame, "⚠ Это обязательное обновление.",
                        size=11, color="#fca5a5").pack(anchor="w", padx=20, pady=(0, 6))
             win.protocol("WM_DELETE_WINDOW", lambda: None)
+        self._update_dialog = win
+        return win
 
-    def _download_and_replace(self, new_version, expected_sha256, progress_label, parent_win):
-        """Качает app.py, проверяет целостность и подпись, заменяет, перезапускает."""
-        if getattr(sys, "frozen", False):
-            messagebox.showinfo(
-                "Обновление",
-                f"Доступна версия {new_version}.\n\n"
-                "Автообновление недоступно в .exe/.app сборке.\n"
-                "Скачай новый файл вручную с GitHub и замени текущий.",
-                parent=parent_win,
-            )
-            parent_win.destroy()
-            return
-
-        raw_url = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/app.py"
-
-        # 1. Скачиваем во временный файл
-        progress_label.configure(text="Скачиваю обновление...")
-        parent_win.update()
-        app_dir = Path(app_base_dir())
-        temp_path = str(app_dir / "app.py.new")
+    def _restart_after_update(self, app_path):
+        """Главный поток. Сохранить состояние, отпустить замок, запустить новую версию с --after-update."""
         try:
-            with requests.get(raw_url, timeout=60, stream=True) as r:
-                r.raise_for_status()
-                with open(temp_path, "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        f.write(chunk)
-        except Exception as e:
-            raise RuntimeError(f"Не удалось скачать: {e}")
-
-        # 2. Проверяем SHA256 (защита от подмены/повреждения файла)
-        if expected_sha256:
-            progress_label.configure(text="Проверяю целостность файла...")
-            parent_win.update()
-            with open(temp_path, "rb") as f:
-                actual_sha256 = hashlib.sha256(f.read()).hexdigest()
-            if actual_sha256 != expected_sha256:
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"SHA256 не совпадает — файл мог быть повреждён или подменён.\n"
-                    f"Ожидалось: {expected_sha256[:24]}…\n"
-                    f"Получено:  {actual_sha256[:24]}…"
-                )
-
-        # 3. Проверяем что это валидный Python
-        progress_label.configure(text="Проверяю синтаксис...")
-        parent_win.update()
-        try:
-            with open(temp_path, "r", encoding="utf-8") as f:
-                new_code = f.read()
-            compile(new_code, temp_path, "exec")
-        except SyntaxError as e:
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-            raise RuntimeError(f"Скачанный код содержит синтаксическую ошибку:\n{e}")
-
-        # 4. Проверяем версию в самом коде
-        m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', new_code)
-        if m:
-            actual = m.group(1)
-            if self._parse_version(actual) <= self._parse_version(APP_VERSION):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"Скачанный код не новее текущего "
-                    f"(в файле: {actual}, у тебя: {APP_VERSION})."
-                )
-
-        # 5. Заменяем app.py
-        progress_label.configure(text="Применяю обновление...")
-        parent_win.update()
-        app_path = str(app_dir / "app.py")
-        backup_path = str(app_dir / "app.py.bak")
-        try:
-            if os.path.exists(app_path):
-                shutil.copy2(app_path, backup_path)
-            os.replace(temp_path, app_path)
-        except Exception as e:
-            raise RuntimeError(f"Не удалось заменить файл: {e}")
-
-        # 6. Записываем флаг «только что обновились»
-        flag_path = str(app_dir / ".just_updated")
-        try:
-            with open(flag_path, "w", encoding="utf-8") as f:
-                f.write(new_version)
-        except Exception:
-            pass
-
-        # 7. Перезапускаем приложение
-        progress_label.configure(text="Перезапускаюсь...")
-        parent_win.update()
-        time.sleep(1)
-
-        try:
-            # Останавливаем тек. preview
             self.stop_preview()
         except Exception:
             pass
-
-        python_exe = sys.executable
-        if sys.platform == "win32":
-            subprocess.Popen([python_exe, app_path])
-            self.destroy()
-            sys.exit(0)
         try:
-            os.execv(python_exe, [python_exe, app_path])
-        except Exception:
-            subprocess.Popen([python_exe, app_path])
+            self._compress_stop_all_on_close()
+            if self._state_save_job is not None:
+                self.after_cancel(self._state_save_job)
+            self._save_state_now()
+        except Exception as e:
+            write_log_file(f"Перед перезапуском не удалось сохранить состояние: {e}")
+        release_instance_lock()
+        write_log_file("Перезапуск после обновления")
+        python_exe = sys.executable
+        args = [app_path, "--after-update"]
+        if platform_is_windows():
+            # pythonw — без окна консоли; новый процесс ждёт, пока этот завершится (замок).
+            pyw = os.path.join(os.path.dirname(python_exe), "pythonw.exe")
+            exe = pyw if os.path.exists(pyw) else python_exe
+            subprocess.Popen([exe] + args, cwd=os.path.dirname(app_path),
+                             creationflags=0x00000008 | 0x00000200)   # DETACHED_PROCESS | NEW_PROCESS_GROUP
             self.destroy()
-            sys.exit(0)
+            os._exit(0)
+            return
+        try:
+            os.execv(python_exe, [python_exe] + args)
+        except Exception as e:
+            write_log_file(f"os.execv не удался ({e}), запускаю новый процесс")
+            subprocess.Popen([python_exe] + args, cwd=os.path.dirname(app_path))
+            self.destroy()
+            os._exit(0)
 
     def _check_just_updated(self):
         """Если на прошлом старте было обновление — показываем toast."""
@@ -10312,7 +10507,18 @@ class LipsyncTwoModeApp(_BaseApp):
 
 
 def main():
+    if "--selftest" in sys.argv:
+        sys.exit(run_selftest())            # проверка скачанного обновления: без окна, сети и записи файлов
+    after_update = "--after-update" in sys.argv
+    # Одна копия: вторая не запускается; после обновления ждём, пока старая закроется (до 15 с).
+    ok, info = acquire_instance_lock(wait_sec=AFTER_UPDATE_WAIT_SEC if after_update else 0)
+    if not ok:
+        notify_already_running(info, after_update)
+        return
+    import atexit
+    atexit.register(release_instance_lock)
     rotate_log_file()
+    secure_private_files()   # права уже существующих файлов: 0600, папка ~/.sheqelmotion — 0700
     threading.excepthook = _thread_excepthook
     write_log_file(f"===== Запуск SheqelMotion Studio {APP_VERSION} =====")
     app = LipsyncTwoModeApp()
