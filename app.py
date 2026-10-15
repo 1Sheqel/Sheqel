@@ -1302,6 +1302,15 @@ def parse_start_end_text(full_text):
     return start_text, end_text, len(separators)
 
 
+def eleven_voice_settings(model_id):
+    """Eleven v4 — только stability и similarity_boost (style, speed и speaker_boost не отправляем).
+    v3 — как раньше, со style и speaker_boost."""
+    settings = {"stability": 0.55, "similarity_boost": 1.0}
+    if model_id != ELEVEN_TTS_MODEL_ID:
+        settings.update({"style": 0.45, "use_speaker_boost": True})
+    return settings
+
+
 def text_to_speech_mp3(text, voice_id, output_mp3, log, model_id=None, language_code=None):
     """
     model_id: str | None — ELEVEN_TTS_MODEL_ID (v4) по умолчанию, либо ELEVEN_TTS_MODEL_ID_V3
@@ -1313,12 +1322,7 @@ def text_to_speech_mp3(text, voice_id, output_mp3, log, model_id=None, language_
     data = {
         "text": text,
         "model_id": model_id,
-        "voice_settings": {
-            "stability": 0.55,
-            "similarity_boost": 1.0,
-            "style": 0.45,
-            "use_speaker_boost": True,
-        },
+        "voice_settings": eleven_voice_settings(model_id),
     }
     if language_code:
         data["language_code"] = language_code
