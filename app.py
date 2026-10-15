@@ -1650,6 +1650,16 @@ SYNC_ASSET_EXPIRY_MARGIN_SEC = 60
 CLOUDINARY_FALLBACK_MAX_BYTES = 100 * 1024 * 1024
 SYNC_STORAGE_MODES = {"Sync (рекомендуется)": "sync", "Cloudinary": "cloudinary"}
 SYNC_STORAGE_LABELS = {v: k for k, v in SYNC_STORAGE_MODES.items()}
+
+
+def default_sync_storage(has_cloudinary):
+    """Без явного выбора: Cloudinary, если он настроен (как в 1.3.0), иначе Sync."""
+    return "cloudinary" if has_cloudinary else "sync"
+
+
+def effective_sync_storage(choice, has_cloudinary):
+    """Явный выбор пользователя всегда сохраняется; без него — умолчание."""
+    return choice if choice in SYNC_STORAGE_MODES.values() else default_sync_storage(has_cloudinary)
 _SYNC_CONTENT_TYPES = {
     ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
     ".mkv": "video/x-matroska", ".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
@@ -4611,6 +4621,18 @@ class LipsyncTwoModeApp(_BaseApp):
             self._saved_sync_price = price
             self.save_config()
 
+    def _has_cloudinary_keys(self):
+        return bool(self.cloudinary_cloud_name and self.cloudinary_api_key and self.cloudinary_api_secret)
+
+    def _apply_sync_storage_default(self):
+        self.sync_storage = effective_sync_storage(self._sync_storage_choice, self._has_cloudinary_keys())
+
+    def _sync_storage_hint(self):
+        default = SYNC_STORAGE_LABELS[default_sync_storage(self._has_cloudinary_keys())]
+        why = "Cloudinary настроен" if self._has_cloudinary_keys() else "Cloudinary не настроен"
+        return (f"По умолчанию сейчас: {default} ({why}). "
+                + ("Выбрано вами." if self._sync_storage_choice else "Сейчас действует умолчание."))
+
     def _on_sync_storage_change(self, label):
         self._sync_storage_choice = SYNC_STORAGE_MODES[label]
         self.sync_storage = self._sync_storage_choice
@@ -5484,8 +5506,7 @@ class LipsyncTwoModeApp(_BaseApp):
         return [
             ("menu", "Хранилище файлов для Sync", list(SYNC_STORAGE_MODES),
              lambda: SYNC_STORAGE_LABELS[self.sync_storage], self._on_sync_storage_change,
-             lambda: "По умолчанию: Sync. " + ("Выбрано вами." if self._sync_storage_choice
-                                               else "Сейчас действует умолчание.")),
+             self._sync_storage_hint),
             ("menu", "Частота кадров для Sync", list(SYNC_FPS_MODES),
              lambda: SYNC_FPS_LABELS[self.sync_fps_mode], self._on_sync_fps_change),
             ("switch", "Показывать окно стоимости перед запуском", self.cost_confirm_var,
@@ -6910,6 +6931,7 @@ class LipsyncTwoModeApp(_BaseApp):
             CLOUDINARY_CLOUD_NAME  = cloud
             CLOUDINARY_API_KEY     = key
             CLOUDINARY_API_SECRET  = secret
+            self._apply_sync_storage_default()      # без явного выбора — теперь Cloudinary
             self.save_config()
             self.update_status()
             result_label.configure(text="✓ Ключи сохранены", text_color="#86efac")
@@ -10467,11 +10489,9 @@ class LipsyncTwoModeApp(_BaseApp):
                 sync_price_state["per_frame"] = float(data["sync_price_per_frame"])
             choice = data.get("sync_storage")
             self._sync_storage_choice = choice if choice in SYNC_STORAGE_MODES.values() else None
-            has_cloudinary = bool(self.cloudinary_cloud_name and self.cloudinary_api_key
-                                  and self.cloudinary_api_secret)
-            # Без явного выбора — Sync для всех (в том числе при настроенном Cloudinary).
-            # Явный выбор Cloudinary сохраняется; откат на Cloudinary при ошибке загрузки — как раньше.
-            self.sync_storage = self._sync_storage_choice or "sync"
+            # Без явного выбора: Cloudinary, если он настроен (как в 1.3.0), иначе Sync.
+            # Явный выбор сохраняется; откат на Cloudinary при ошибке загрузки — как раньше.
+            self._apply_sync_storage_default()
             self.queue_panel_mode = data.get("queue_panel_mode", "running")
             if self.queue_panel_mode not in QUEUE_PANEL_MODES.values():
                 self.queue_panel_mode = "running"

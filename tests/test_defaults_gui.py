@@ -1,4 +1,4 @@
-"""Умолчания в «Настройках»: хранилище Sync без явного выбора, порог 20 $. Четыре комбинации конфига
+"""Умолчания в «Настройках»: хранилище без явного выбора (Cloudinary, если настроен, иначе Sync), порог 20 $. Четыре комбинации конфига
 и сохранение после перезапуска. argv: режим (A|B|C|D|persist1|persist2)."""
 import sys, os, json, time, shutil, threading, traceback
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.abspath(__file__))))
@@ -11,7 +11,7 @@ MODE = sys.argv[1]
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCR = os.path.join(os.path.join(__import__("tempfile").gettempdir(), "sheqel_tests"), "defgui", "persist" if MODE.startswith("persist") else MODE)
 COMBOS = {  # Cloudinary настроен?, явный выбор
-    "A": (False, None), "B": (True, None), "C": (True, "cloudinary"), "D": (False, "cloudinary"),
+    "A": (False, None), "B": (True, None), "C": (True, "sync"), "D": (False, "cloudinary"),
     "persist1": (True, None),
 }
 if MODE != "persist2":
@@ -61,7 +61,7 @@ def view():
                    and set(m.cget("values")) == set(app.SYNC_STORAGE_MODES))
     entry = next(x for x in walk(sp) if isinstance(x, ctk.CTkEntry))
     texts = [x.cget("text") for x in walk(sp) if isinstance(x, ctk.CTkLabel)]
-    hint = next((t for t in texts if t.startswith("По умолчанию: Sync")), "")
+    hint = next((t for t in texts if t.startswith("По умолчанию сейчас:")), "")
     thr_hint = next((t for t in texts if t.startswith("По умолчанию: 20")), "")
     return storage, entry, hint, thr_hint
 
@@ -73,10 +73,12 @@ def run():
     storage, entry, hint, thr_hint = view()
     if MODE in ("A", "B", "C", "D"):
         has_cl, choice = COMBOS[MODE]
-        exp_label = app.SYNC_STORAGE_LABELS["cloudinary" if choice == "cloudinary" else "sync"]
+        exp_label = app.SYNC_STORAGE_LABELS[choice or ("cloudinary" if has_cl else "sync")]
+        exp_default = app.SYNC_STORAGE_LABELS["cloudinary" if has_cl else "sync"]
         exp_hint = "Выбрано вами." if choice else "Сейчас действует умолчание."
         check(f"Cloudinary {'есть' if has_cl else 'нет'}, явный выбор {choice or 'нет'} → «{exp_label}», подсказка «{exp_hint}»",
-              storage.get() == exp_label and hint.endswith(exp_hint), f"меню «{storage.get()}», подсказка «{hint}»")
+              storage.get() == exp_label and hint.endswith(exp_hint)
+              and hint.startswith(f"По умолчанию сейчас: {exp_default}"), f"меню «{storage.get()}», подсказка «{hint}»")
         check("порог без значения в конфиге → 20, подсказка «По умолчанию: 20 $»",
               entry.get() == "20" and w.cost_confirm_threshold == 20.0 and thr_hint == "По умолчанию: 20 $", entry.get())
         if MODE == "B":
@@ -89,19 +91,19 @@ def run():
             ImageGrab.grab(bbox=(x, y, x + w.winfo_width(), y + w.winfo_height())).save(
                 os.path.join(__import__("tempfile").gettempdir(), "settings_defaults.png"))
     elif MODE == "persist1":
-        check("до выбора: Sync по умолчанию при настроенном Cloudinary", storage.get() == app.SYNC_STORAGE_LABELS["sync"]
+        check("до выбора: Cloudinary по умолчанию при настроенном Cloudinary", storage.get() == app.SYNC_STORAGE_LABELS["cloudinary"]
               and hint.endswith("Сейчас действует умолчание."))
-        storage._command(app.SYNC_STORAGE_LABELS["cloudinary"])
+        storage._command(app.SYNC_STORAGE_LABELS["sync"])
         entry.delete(0, "end"); entry.insert(0, "12"); entry._entry.focus_force(); w.update()
         entry._entry.event_generate("<Return>", when="tail"); yield 0.4
         storage, entry, hint, thr_hint = view()
-        check("явный выбор Cloudinary и порог 12: подсказка сразу «Выбрано вами.»",
+        check("явный выбор Sync и порог 12: подсказка сразу «Выбрано вами.»",
               hint.endswith("Выбрано вами.") and w.cost_confirm_threshold == 12.0)
     else:
         cfg = json.load(open(app.CONFIG_PATH))
-        check("после перезапуска: явный Cloudinary и порог 12 сохранились",
-              storage.get() == app.SYNC_STORAGE_LABELS["cloudinary"] and hint.endswith("Выбрано вами.")
-              and entry.get() == "12" and cfg.get("sync_storage") == "cloudinary" and cfg.get("cost_confirm_threshold") == 12.0)
+        check("после перезапуска: явный Sync (при настроенном Cloudinary) и порог 12 сохранились",
+              storage.get() == app.SYNC_STORAGE_LABELS["sync"] and hint.endswith("Выбрано вами.")
+              and entry.get() == "12" and cfg.get("sync_storage") == "sync" and cfg.get("cost_confirm_threshold") == 12.0)
     check("исключений нет", not errors, (errors[:1] or [""])[0][-300:])
     w._on_close()
 
