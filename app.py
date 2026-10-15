@@ -61,7 +61,7 @@ UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/ver
 
 # Отчёты об ошибках разработчику. Пустой URL — отправка выключена.
 # Секретов здесь нет и быть не должно: репозиторий публичный, токен бота живёт в relay-воркере.
-ERROR_REPORT_URL = ""
+ERROR_REPORT_URL = "https://rapid-sky-367b.creos-1.workers.dev"
 ERROR_REPORT_TIMEOUT_SEC = 5
 ERROR_REPORT_DEDUP_SEC = 60 * 60
 ERROR_REPORT_DAILY_LIMIT = 20
@@ -73,16 +73,21 @@ LOG_FILE_PATH = str(Path.home() / "SheqelMotion.log")
 LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
 _log_file_lock = threading.Lock()
 _recent_log_lines = collections.deque(maxlen=200)
+_log_secured_path = None
 
 
 def write_log_file(msg):
     msg = str(msg)
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+    global _log_secured_path
     with _log_file_lock:
         _recent_log_lines.extend(msg.splitlines() or [""])
         try:
             with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
                 f.write(line)
+            if _log_secured_path != LOG_FILE_PATH:      # лог — только для владельца (0600)
+                secure_path(LOG_FILE_PATH)
+                _log_secured_path = LOG_FILE_PATH
         except OSError:
             pass  # сбой записи лога не должен ронять приложение
 
@@ -96,6 +101,7 @@ def rotate_log_file():
     try:
         if os.path.getsize(LOG_FILE_PATH) > LOG_FILE_MAX_BYTES:
             os.replace(LOG_FILE_PATH, LOG_FILE_PATH + ".1")
+            secure_path(LOG_FILE_PATH + ".1")
     except OSError:
         pass
 
@@ -132,6 +138,9 @@ _SANITIZE_RULES = [
     (re.compile(r"[^\s\"'<>]*\\[^\s\"'<>]*"), "<path>"),
     (re.compile(r"[^\s\"'<>/]*/[^\s\"'<>/]*/[^\s\"'<>]*"), "<path>"),
     (re.compile(r"(?i)([\"'])[^\"'\n]*\." + _MEDIA_EXT + r"(?:\s*\+\s*[^\"'\n]*)?\1"), r"\1<file>\1"),
+    # Имя файла с пробелами («Клиент Иванов промо.mp4»): до шести слов перед медиа-расширением.
+    (re.compile(r"(?i)(?:[^\s/\\\"'«»<>{}\[\],:;|→]+[ _\-]+){1,6}[^\s/\\\"'«»<>{}\[\],:;|→]*\."
+                + _MEDIA_EXT + r"\b"), "<file>"),
     (re.compile(r"(?i)[^\s/\\\"'«»<>(){}\[\],:]+\." + _MEDIA_EXT + r"\b"), "<file>"),
     (re.compile(r"«[^»]*»"), "«…»"),
     (re.compile(r"\b\d{12,}\b"), "<num>"),
@@ -183,6 +192,186 @@ def sanitize_for_report(text):
     return text
 
 
+# ── Отчёт об ошибке: только коды, тип и этап; хвост лога — только строки известных форматов ──
+REPORT_MESSAGE_LIMIT = 200
+# Ошибки внешних сервисов: тело ответа и текст запроса (сценарий, перевод, транскрипт) не уходят никогда.
+_REPORT_SERVICES = (
+    ("ElevenLabs", re.compile(r"(?i)elevenlabs|xi-api|text_to_speech|voices/add|create_voice")),
+    ("Groq", re.compile(r"(?i)groq|transcri|translat")),
+    ("Sync", re.compile(r"(?i)\bsync\b|sync\.so|lipsync|apply_lipsync|upload_to_sync|fetch_roll_from_sync")),
+    ("yt-dlp", re.compile(r"(?i)yt[-_]?dlp|youtube|download_from_url|\bERROR: \[")),
+    ("ffmpeg", re.compile(r"(?i)ffmpeg|ffprobe|non-zero exit status")),
+    ("Cloudinary", re.compile(r"(?i)cloudinary")),
+)
+_REPORT_STAGES = (
+    (re.compile(r"(?i)до создания задачи"), "до создания задачи"),
+    (re.compile(r"(?i)после создания задачи"), "после создания задачи"),
+    (re.compile(r"(?i)регистрац|register"), "регистрация файла"),
+    (re.compile(r"(?i)загрузк|upload|assets"), "загрузка файла"),
+    (re.compile(r"(?i)скачив|download|результат не удалось сохранить"), "скачивание"),
+    (re.compile(r"(?i)status|статус|опрос"), "статус задачи"),
+    (re.compile(r"(?i)\btts\b|text_to_speech|генерац\w* голос"), "генерация голоса"),
+    (re.compile(r"(?i)voices/add|клонир"), "клонирование"),
+    (re.compile(r"(?i)transcri|транскриб"), "транскрибация"),
+    (re.compile(r"(?i)translat|перевод"), "перевод"),
+    (re.compile(r"(?i)estimate|оценк"), "оценка"),
+    (re.compile(r"(?i)create|создан"), "создание задачи"),
+)
+_REPORT_CODE_RULES = (
+    # HTTP-статус рядом со словом-маркером или в стандартной фразе requests
+    (re.compile(r"(?i)(?<!exit )(?:error|ошибка|status|статус|http|code|код|response|ответ)\D{0,20}?\b([1-5]\d\d)\b"),
+     "HTTP {}"),
+    (re.compile(r"\b([45]\d\d) (?:Client|Server) Error"), "HTTP {}"),
+    # коды из JSON/«ключ=значение»: только идентификаторы латиницей, свободный текст не проходит
+    (re.compile(r"(?i)[\"']?\b(status|code|error_code|errorCode|error_type|type)\b[\"']?\s*[:=]\s*[\"']?"
+                r"([A-Za-z][A-Za-z0-9]*(?:[_.\-][A-Za-z0-9]+)+|[A-Z][A-Z0-9_]{2,40})(?![\w\-])"), "{}={}"),
+    (re.compile(r"\b(FAILED|REJECTED|COMPLETED|PENDING|PROCESSING|CANCELL?ED)\b"), "{}"),
+    (re.compile(r"(?i)exit status (-?\d+)"), "exit status {}"),
+    (re.compile(r"\b([A-Z][A-Za-z]+(?:Error|Exception|Timeout|Refused|Reset))\b"), "{}"),
+    (re.compile(r"(?i)\b(timed out|timeout|connection (?:reset|refused|aborted)|unauthori[sz]ed|forbidden|"
+                r"not found|payment required|too many requests|rate limit\w*|quota \w+|invalid api key|"
+                r"video unavailable|private video|unsupported url|members[- ]only|sign in to confirm your age|"
+                r"not available in your country|no space left on device|permission denied)\b"), "{}"),
+)
+_QUOTED_RE = re.compile(r"«[^»]*»|\"[^\"]*\"|“[^”]*”|'[^'\n]{2,}'")
+_JSON_RE = re.compile(r"\{.*\}", re.S)
+_FREE_TEXT_TAIL_RE = re.compile(r"(?i)\b(text|message|detail|details|prompt|input|content|transcript|translation|"
+                                r"reason|msg|текст|сообщение|причина)\s*[:=].*$")
+
+
+def report_error_codes(text):
+    codes = []
+    for rx, fmt in _REPORT_CODE_RULES:
+        for m in rx.finditer(text):
+            value = fmt.format(*m.groups()) if m.groups() else m.group(0)
+            if value not in codes:
+                codes.append(value)
+    return codes[:8]
+
+
+# Для этих ошибок имена в кавычках — это имена классов, атрибутов и модулей кода, а не данные
+# пользователя: оставляем их, если они похожи на идентификатор ('dict' object has no attribute 'voice_id').
+REPORT_IDENT_ERRORS = ("AttributeError", "NameError", "ImportError", "ModuleNotFoundError")
+_QUOTED_IDENT_RE = re.compile(r"(['\"])([A-Za-z_][A-Za-z0-9_.]*)\1")
+
+
+def report_safe_message(message, where="", limit=REPORT_MESSAGE_LIMIT, exc_type=""):
+    """Текст ошибки для отчёта. Внешние сервисы: «сервис: этап — коды», без тела ответа и текста
+    запроса. Свои ошибки: первая строка без кавычек, JSON и хвостов «text: …», через санитайзер."""
+    text = str(message or "")
+    probe = f"{where}\n{text}"
+    # Ошибки кода (AttributeError и т.п.) — не ответы сервисов, даже если в тексте есть имя сервиса.
+    service = (None if str(exc_type) in REPORT_IDENT_ERRORS
+               else next((name for name, rx in _REPORT_SERVICES if rx.search(probe)), None))
+    if service:
+        # Этап — по месту ошибки и первой строке; тело ответа (JSON) и «exit status» не учитываются.
+        head = text.strip().splitlines()[0] if text.strip() else ""
+        head = re.sub(r"(?i)exit status -?\d+", "", _JSON_RE.sub("", head))
+        stage_probe = f"{where}\n{head}"
+        stage = next((label for rx, label in _REPORT_STAGES if rx.search(stage_probe)), "")
+        codes = report_error_codes(text)
+        out = service + (f": {stage}" if stage else "") + (f" — {', '.join(codes)}" if codes else " — без кода")
+        return sanitize_for_report(out)[:limit]
+    first = text.strip().splitlines()[0] if text.strip() else ""
+    kept = []
+    if str(exc_type) in REPORT_IDENT_ERRORS:
+        def keep(m):
+            kept.append(m.group(0))
+            return f"QIDENT{len(kept) - 1}Q"
+        first = _QUOTED_IDENT_RE.sub(keep, first)
+    first = _JSON_RE.sub("{…}", first)
+    first = _QUOTED_RE.sub("«…»", first)
+    first = _FREE_TEXT_TAIL_RE.sub(lambda m: m.group(1) + ": …", first)
+    out = sanitize_for_report(first)
+    for i, original in enumerate(kept):
+        out = out.replace(f"QIDENT{i}Q", original)
+    return out[:limit]
+
+
+# Хвост лога: только строки известных форматов, и от строки остаётся лишь распознанная часть.
+_LOG_TAIL_FORMATS = [re.compile(p) for p in (
+    r"^Sync status: [A-Z_]+",
+    r"^Sync job \S+ (?:COMPLETED|FAILED|REJECTED)",
+    r"^Sync job: \S+",
+    r"^Sync create response: \d{3}",
+    r"^Sync status error(?: после повторов)?: \d{3}",
+    r"^Повтор опроса \d+/\d+: статус-эндпоинт снова вернул \d{3}",
+    r"^Отправляю в Sync\.\.\. попытка \d+/\d+",
+    r"^Создаю задачу Sync",
+    r"^Задача уже была создана первым запросом",
+    r"^Sync ошибка на попытке \d+",
+    r"^Пауза \d+ секунд перед повтором",
+    r"^Verification: [^:]{0,80}",
+    r"^Оценка (?:части|ролика): [\d\s.,·≈$a-zа-я()–-]{0,120}",
+    r"^Стоимость job \S+: оценка \$[\d.]+, факт ≈ \$[\d.]+",
+    r"^\[TIMING\] [^:]{0,40}: [\d.]+ сек",
+    r"^\[TIMING\] Текст: \d+ символов, модель: [\w.-]+",
+    r"^Генерирую аудио ElevenLabs",
+    r"^Ролик \d+ / очередь \d+",
+    r"^Режим: (?:1 видео|Начало \+ Конец)",
+    r"^Lipsync (?:start|end)\.\.\.",
+    r"^Роликов в очереди: \d+",
+    r"^Параллельность: \d+",
+    r"^Очередь завершена: успешно \d+ из \d+, ошибок \d+",
+    r"^Хранилище для Sync: \w+",
+    r"^(?:Загружаю (?:видео|аудио) в Sync: [\d.]+ МБ|(?:Видео|Аудио) в Sync: asset)",
+    r"^Sync: удалён asset",
+    r"^yt-dlp (?:устарел|обновлён)",
+    r"^Сжатие: (?:запуск, файлов \d+|ошибка)",
+)]
+_LOG_PREFIX_RE = re.compile(r"^(\[#\d+\]\s*)")
+
+
+def report_log_tail(lines):
+    """Строки лога для отчёта: только известные форматы (статусы, коды, оценки, этапы).
+    Строки с текстом сценария, перевода, транскрипта, именами и ответами API не берутся."""
+    out, skipped = [], 0
+    for raw in lines:
+        line = str(raw).strip()
+        m = _LOG_PREFIX_RE.match(line)
+        prefix = m.group(1) if m else ""
+        rest = line[len(prefix):]
+        hit = next((rx.match(rest) for rx in _LOG_TAIL_FORMATS if rx.match(rest)), None)
+        if hit is None:
+            skipped += 1
+            continue
+        out.append(sanitize_for_report(prefix + hit.group(0))[:MAX_REPORT_LOG_LINE])
+    if skipped:
+        out.append(f"(строк лога не включено: {skipped})")
+    return out
+
+
+MAX_REPORT_LOG_LINE = 300
+
+
+# ── Права доступа к личным файлам: 0600 для файлов, 0700 для папки ──────────
+def secure_path(path, is_dir=False):
+    """Mac/Linux: только владелец. Windows: файлы в профиле пользователя по умолчанию закрыты
+    ACL от других учётных записей, chmod там не работает — ничего не делаем."""
+    if os.name != "posix" or not path:
+        return
+    try:
+        os.chmod(path, 0o700 if is_dir else 0o600)
+    except OSError:
+        pass
+
+
+def open_private(path, mode="w", encoding="utf-8"):
+    """Открыть файл на запись так, чтобы он сразу создавался с правами 0600 (атомарная запись)."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if "a" in mode else os.O_TRUNC)
+    fd = os.open(path, flags, 0o600)
+    secure_path(path)     # если файл уже был с другими правами
+    return os.fdopen(fd, mode, encoding=encoding)
+
+
+def secure_private_files():
+    """При запуске: привести права уже существующих файлов (конфиг, состояние, лог, точки лица)."""
+    for p in (CONFIG_PATH, STATE_PATH, LOG_FILE_PATH, LOG_FILE_PATH + ".1", FACE_POINTS_PATH,
+              ERROR_REPORT_STATE_PATH):
+        if os.path.exists(p):
+            secure_path(p)
+    if os.path.isdir(APP_DATA_DIR):
+        secure_path(APP_DATA_DIR, is_dir=True)
 _EXPECTED_ERROR_RE = re.compile(
     r"(?i)(?:\b(?:error|ошибка|status|статус|http)\b[^\n]{0,25}?\b(?:401|402|429)\b"
     r"|\b(?:401|402|429)\b\s*(?:client error|unauthorized|payment required|too many requests)"
@@ -248,8 +437,8 @@ class ErrorReporter:
             "python": platform.python_version(),
             "where": where,
             "exc_type": exc_type,
-            "message": sanitize_for_report(message)[:600],
-            "log_tail": [sanitize_for_report(l)[:300] for l in recent_log_lines(ERROR_REPORT_LOG_LINES)],
+            "message": report_safe_message(message, where, exc_type=exc_type),
+            "log_tail": report_log_tail(recent_log_lines(ERROR_REPORT_LOG_LINES * 4))[-ERROR_REPORT_LOG_LINES:],
             "job_id": safe_job,
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -307,7 +496,7 @@ class ErrorReporter:
         self._mem_state = dict(state)
         try:
             tmp = ERROR_REPORT_STATE_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            with open_private(tmp) as f:
                 json.dump(state, f)
             os.replace(tmp, ERROR_REPORT_STATE_PATH)
         except OSError:
@@ -454,8 +643,9 @@ class AppStateStore:
     def save(self, data):
         with self._lock:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            secure_path(os.path.dirname(self.path), is_dir=True)   # ~/.sheqelmotion — 0700
             tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            with open_private(tmp) as f:                            # state.json — 0600
                 json.dump(data, f, ensure_ascii=False, indent=1)
                 f.flush()
                 os.fsync(f.fileno())
@@ -2523,7 +2713,7 @@ def save_face_point(point):
         data = load_face_points()
         data[point["video_key"]] = point
         tmp = FACE_POINTS_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open_private(tmp) as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
         os.replace(tmp, FACE_POINTS_PATH)
 
@@ -3921,6 +4111,8 @@ class LipsyncTwoModeApp(_BaseApp):
         self.error_reports_var = ctk.BooleanVar(value=True)
         self.clear_text_after_clone = True
         self.clear_text_after_clone_var = ctk.BooleanVar(value=True)
+        self.spellcheck_online = True            # LanguageTool: текст генератора уходит на languagetool.org
+        self.spellcheck_online_var = ctk.BooleanVar(value=True)
         self.cost_confirm_enabled = True
         self.cost_confirm_threshold = COST_CONFIRM_DEFAULT_THRESHOLD
         self.queue_panel_mode = "running"
@@ -3994,6 +4186,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self._init_error_reporting()
         self.cost_confirm_var.set(self.cost_confirm_enabled)
         self.clear_text_after_clone_var.set(self.clear_text_after_clone)
+        self.spellcheck_online_var.set(self.spellcheck_online)
         self._saved_sync_price = sync_price_state["per_frame"]
         self._restore_state()
         self._apply_nav_collapsed()
@@ -4170,14 +4363,15 @@ class LipsyncTwoModeApp(_BaseApp):
     def _show_error_report_notice(self):
         messagebox.showinfo(
             "Отчёты об ошибках",
-            "Если в программе произойдёт сбой, разработчику автоматически уйдёт короткий "
-            "обезличенный отчёт — чтобы быстрее найти и исправить ошибку.\n\n"
-            "Отправляется: случайный номер установки (не связан с тобой), версия программы, "
-            "ОС и версия Python, где и какая ошибка произошла, последние строки технического "
-            "лога и номер задачи Sync.\n\n"
-            "Не отправляется никогда: API-ключи, тексты скриптов, переводов и транскриптов, "
-            "голоса и их названия, имена файлов, пути и ссылки.\n\n"
-            "Отключить: переключатель «Отчёты об ошибках» в разделе ⚙️ НАСТРОЙКИ слева.",
+            "При сбое программа отправит разработчику короткий обезличенный отчёт.\n\n"
+            "Отправляется: версия программы, ОС, тип ошибки и место в коде, код ответа сервиса, "
+            "очищенные строки технического лога (статусы и коды) и случайный номер установки.\n\n"
+            "Не отправляется: API-ключи, тексты сценариев, переводов и транскриптов, имена голосов "
+            "и роликов, пути и файлы.\n\n"
+            "Отключить: Настройки → Приложение → «Отправлять разработчику обезличенные отчёты». "
+            "Там же — «Показать пример отчёта».\n\n"
+            "Проверка орфографии в генераторе голоса отправляет текст на languagetool.org; "
+            "её можно выключить там же.",
             parent=self,
         )
         self.error_reports_notice_shown = True
@@ -5053,6 +5247,10 @@ class LipsyncTwoModeApp(_BaseApp):
              self._on_error_reports_toggle),
             ("switch", "После клонирования очищать текст генерации", self.clear_text_after_clone_var,
              self._on_clear_after_clone_toggle),
+            ("switch", "Проверка орфографии (текст отправляется на languagetool.org)", self.spellcheck_online_var,
+             self._on_spellcheck_toggle),
+            ("buttons", "Отчёты об ошибках", [("Показать пример отчёта", self.show_report_example, BTN),
+                                              ("Отправить тестовый отчёт", self.send_test_report, BTN)]),
             ("menu", "Ход очереди", list(QUEUE_PANEL_MODES), lambda: QUEUE_PANEL_LABELS[self.queue_panel_mode],
              self._on_queue_panel_mode_change, lambda: "По умолчанию: показывать во время работы."),
             ("buttons", "Лог", [("Открыть лог", self.open_log_window, BTN),
@@ -6107,6 +6305,73 @@ class LipsyncTwoModeApp(_BaseApp):
             messagebox.showwarning("Результат из Sync", text, parent=self)
 
     # ── Итог клонирования: голос в генератор, очистка текста ─────────────
+    def _on_spellcheck_toggle(self):
+        self.spellcheck_online = bool(self.spellcheck_online_var.get())
+        self.save_config()
+        self.log(f"Проверка орфографии онлайн: {'включена' if self.spellcheck_online else 'выключена'}")
+
+    # ── Прозрачность отчётов: пример и тестовая отправка ─────────────────
+    REPORT_EXAMPLE_ERROR = ('ElevenLabs TTS error: 400\n{"detail":{"status":"invalid_text",'
+                            '"message":"text: здесь был бы текст вашего сценария"}}')
+
+    def report_example_payload(self):
+        """Ровно то, что ушло бы при такой ошибке сейчас: с вашим текущим логом, после санитайзера."""
+        return error_reporter.build_payload("app.text_to_speech_mp3:0", "RuntimeError", self.REPORT_EXAMPLE_ERROR)
+
+    def show_report_example(self):
+        payload = self.report_example_payload()
+        win = ctk.CTkToplevel(self)
+        win.title("Пример отчёта об ошибке")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.geometry("640x560")
+        state = "включена" if self.error_reports_enabled else "выключена"
+        info = self.label(win, "Так выглядит отчёт, который уйдёт разработчику при сбое генерации голоса — "
+                               f"с вашим текущим логом, после очистки. Отправка сейчас {state}. "
+                               "Текст сценария из ответа сервиса в отчёт не попадает.", size=12, color=MUTED)
+        info.configure(wraplength=600)
+        info.pack(anchor="w", fill="x", padx=16, pady=(14, 6))
+        box = ctk.CTkTextbox(win, fg_color="#111111", text_color="#e5e5e5",
+                             font=ctk.CTkFont(family="Courier New", size=12))
+        box.pack(fill="both", expand=True, padx=16)
+        box.insert("1.0", json.dumps(payload, ensure_ascii=False, indent=2))
+        box.configure(state="disabled")
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=12)
+        self.button(row, "Закрыть", win.destroy, color=BTN, hover=BTN_HOVER, width=110).pack(side="right")
+        self.button(row, "Копировать", lambda: (self.clipboard_clear(),
+                                                self.clipboard_append(box.get("1.0", "end").strip())),
+                    color=BTN, hover=BTN_HOVER, width=120).pack(side="right", padx=8)
+        self._report_example_win = win
+        return win
+
+    def test_report_payload(self):
+        payload = error_reporter.build_payload("app.settings_test", "TestReport",
+                                               "Тестовый отчёт из «Настроек»: проверка связи")
+        payload["message"] = "[ТЕСТ] " + payload["message"]
+        payload["log_tail"] = []          # тест — без хвоста лога
+        return payload
+
+    def send_test_report(self):
+        if not ERROR_REPORT_URL:
+            messagebox.showerror("Тестовый отчёт", "Адрес воркера не задан — отправлять некуда.", parent=self)
+            return
+        payload = self.test_report_payload()
+
+        def work():
+            try:
+                res = requests.post(ERROR_REPORT_URL, json=payload, timeout=ERROR_REPORT_TIMEOUT_SEC)
+                ok = 200 <= res.status_code < 300
+                text = (f"Отправлено (HTTP {res.status_code})." if ok
+                        else f"Ошибка: воркер ответил HTTP {res.status_code}.")
+            except Exception as e:
+                ok, text = False, f"Ошибка: {type(e).__name__} — нет связи с воркером."
+            write_log_file(f"Тестовый отчёт: {text}")
+            self.after(0, lambda: (messagebox.showinfo if ok else messagebox.showerror)(
+                "Тестовый отчёт", text, parent=self))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _on_clear_after_clone_toggle(self):
         self.clear_text_after_clone = bool(self.clear_text_after_clone_var.get())
         self.save_config()
@@ -8335,6 +8600,9 @@ class LipsyncTwoModeApp(_BaseApp):
             spell_timer["id"] = frame.after(800, _run_spell_check)
 
         def _run_spell_check():
+            if not self.spellcheck_online:      # выключено в «Настройках»: на languagetool.org ничего не уходит
+                tk_text.tag_remove("spell_error", "1.0", "end")
+                return
             text = text_box.get("1.0", "end")
             def run():
                 matches = check_spelling(text)
@@ -9929,6 +10197,7 @@ class LipsyncTwoModeApp(_BaseApp):
             self.main_voice_name = data.get("main_voice_name", "") or self.main_voice_name
             self.main_voice_id = data.get("main_voice_id", "") or getattr(self, "main_voice_id", "")
             self.clear_text_after_clone = bool(data.get("clear_text_after_clone", True))
+            self.spellcheck_online = bool(data.get("spellcheck_online", True))
             with _lock_of(self, "_expiry_lock"):
                 self.voice_expiry_list = list(data.get("voice_expiry_list", []))
             self.groq_api_key = data.get("groq_api_key", "") or self.groq_api_key
@@ -9989,6 +10258,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 "main_voice_name":       self.main_voice_name,
                 "main_voice_id":         getattr(self, "main_voice_id", ""),
                 "clear_text_after_clone": getattr(self, "clear_text_after_clone", True),
+                "spellcheck_online":     getattr(self, "spellcheck_online", True),
                 "voice_expiry_list":     _locked_copy(self, "_expiry_lock", "voice_expiry_list"),
                 "groq_api_key":          self.groq_api_key,
                 "groq_used_seconds":     _locked_copy(self, "_groq_lock", "groq_used_seconds"),
@@ -10004,11 +10274,12 @@ class LipsyncTwoModeApp(_BaseApp):
             }
             with self._config_lock:
                 tmp_path = CONFIG_PATH + ".tmp"
-                with open(tmp_path, "w", encoding="utf-8") as f:
+                with open_private(tmp_path) as f:          # сразу 0600: в файле ключи
                     json.dump(data, f, ensure_ascii=False, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp_path, CONFIG_PATH)
+                secure_path(CONFIG_PATH)
         except Exception as e:
             self.log(f"Не удалось сохранить конфиг: {e}")
 
