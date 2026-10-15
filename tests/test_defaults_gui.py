@@ -24,8 +24,8 @@ if MODE != "persist2":
     has_cl, choice = COMBOS[MODE]
     cfg["sync_storage"] = choice
     if has_cl:
-        cfg.update(cloudinary_cloud_name="demo-cloud", cloudinary_api_key="123456789012345",
-                   cloudinary_api_secret="fake-secret-for-test")
+        cfg.update(cloudinary_cloud_name="demo-cloud", cloudinary_api_key="123456" + "789012345",
+                   cloudinary_api_secret="-".join(("fake", "secret", "for", "test")))   # вымышленные, из частей
     json.dump(cfg, open(os.path.join(SCR, "config.json"), "w"), ensure_ascii=False, indent=2)
 app.CONFIG_PATH = os.path.join(SCR, "config.json")
 app.STATE_PATH = os.path.join(SCR, "data", "state.json")

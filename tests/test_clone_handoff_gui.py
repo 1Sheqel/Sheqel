@@ -14,7 +14,7 @@ if PHASE == "1":
     for k in list(cfg):
         if any(x in k for x in ("key", "secret", "cloud_name")):
             cfg[k] = ""
-    cfg.update(elevenlabs_api_key="fake-eleven-key-000111222", voice_expiry_list=[], main_voice_name="Старый голос",
+    cfg.update(elevenlabs_api_key="-".join(("fake", "eleven", "key", "000111222")), voice_expiry_list=[], main_voice_name="Старый голос",
                main_voice_id="")
     cfg.pop("clear_text_after_clone", None)
     json.dump(cfg, open(os.path.join(SCR, "config.json"), "w"), ensure_ascii=False)

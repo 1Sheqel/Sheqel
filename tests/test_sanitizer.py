@@ -4,26 +4,40 @@ sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.dirname(_
 import app
 
 S = app.sanitize_for_report
+
+# Ключи и токены здесь вымышленные и собираются из частей при запуске: в исходнике нет ни одной
+# цельной строки, похожей на ключ (иначе её ловят сканеры секретов, в том числе GitHub).
+def _j(*parts):
+    return "".join(parts)
+FAKE_SK = _j("s", "k_", "0f" * 24)                                   # вид ключа ElevenLabs
+FAKE_GSK = _j("g", "sk_", "AbCdEf", "123456", "GhIjKl", "789MnOp")    # вид ключа Groq
+FAKE_CL_KEY = _j("873498", "273498234")
+FAKE_CL_SECRET = _j("Ab3dEf_", "Gh1jKl2", "MnOpQr4", "StUvWx")
+FAKE_PUBLIC_ID = _j("a1b2c3d4e5", "f6g7h8i9j0")
+FAKE_UUID = _j("4f1c2b3a-9d8e-", "4c7b-a6f5-", "0e1d2c3b4a59")
+FAKE_SIG = _j("deadbeef", "cafe1234")
+FAKE_VOICE_1 = _j("21m00Tcm4T", "lvDq8ikWAM")
+FAKE_VOICE_2 = _j("JBFqnCBsd6", "RMkjVDRZzb")
 CASES = [
     # (исходная строка, что должно исчезнуть, что должно остаться)
-    ("xi-api-key: " + "sk_" + "0f" * 24,
-     ["sk_3f9a"], ["<key>"]),
-    ("Authorization: Bearer gsk_AbCdEf123456GhIjKl789MnOp",
-     ["gsk_", "AbCdEf123456"], ["<key>"]),
-    ("cloudinary.config(api_key=873498273498234, api_secret=Ab3dEf_Gh1jKl2MnOpQr4StUvWx)",
-     ["873498273498234", "Ab3dEf_Gh1jKl2MnOpQr4StUvWx"], []),
-    ("  → https://res.cloudinary.com/dxyz123/video/upload/v1728740000/a1b2c3d4e5f6g7h8i9j0.mp4",
-     ["cloudinary.com", "a1b2c3d4e5f6g7h8i9j0", ".mp4"], ["<url>"]),
+    ("xi-api-key: " + FAKE_SK,
+     [FAKE_SK, FAKE_SK[:10]], ["<key>"]),
+    ("Authorization: Bearer " + FAKE_GSK,
+     [FAKE_GSK[:4], FAKE_GSK[4:16]], ["<key>"]),
+    ("cloudinary.config(api_key=" + FAKE_CL_KEY + ", api_secret=" + FAKE_CL_SECRET + ")",
+     [FAKE_CL_KEY, FAKE_CL_SECRET], []),
+    ("  → https://res.cloudinary.com/dxyz123/video/upload/v1728740000/" + FAKE_PUBLIC_ID + ".mp4",
+     ["cloudinary.com", FAKE_PUBLIC_ID, ".mp4"], ["<url>"]),
     ("Загружаю 01_Моё_видео_sync_input.mp4 (3.2 MB) на Cloudinary...",
      ["Моё_видео", ".mp4"], ["Загружаю"]),
-    ("Cloudinary: удалён a1b2c3d4e5f6g7h8i9j0",
-     ["a1b2c3d4e5f6g7h8i9j0"], ["Cloudinary: удалён"]),
-    ('{"id":"4f1c2b3a-9d8e-4c7b-a6f5-0e1d2c3b4a59","status":"PENDING","input":[{"type":"video",'
+    ("Cloudinary: удалён " + FAKE_PUBLIC_ID,
+     [FAKE_PUBLIC_ID], ["Cloudinary: удалён"]),
+    ('{"id":"' + FAKE_UUID + '","status":"PENDING","input":[{"type":"video",'
      '"url":"https://res.cloudinary.com/x/video/upload/v1/abc.mp4"}],"outputFileName":"01_promo_ivan"}',
-     ["cloudinary", "promo_ivan", "4f1c2b3a-9d8e"], ['"status":"PENDING"', '"outputFileName":"…"']),
-    ("Sync job 4f1c2b3a-9d8e-4c7b-a6f5-0e1d2c3b4a59 COMPLETED, outputUrl: "
-     "https://sync-output.s3.amazonaws.com/abc/result.mp4?X-Amz-Signature=deadbeefcafe1234",
-     ["amazonaws", "X-Amz-Signature", "deadbeef"], ["COMPLETED, outputUrl: <url>"]),
+     ["cloudinary", "promo_ivan", FAKE_UUID[:13]], ['"status":"PENDING"', '"outputFileName":"…"']),
+    ("Sync job " + FAKE_UUID + " COMPLETED, outputUrl: "
+     "https://sync-output.s3.amazonaws.com/abc/result.mp4?X-Amz-Signature=" + FAKE_SIG,
+     ["amazonaws", "X-Amz-Signature", FAKE_SIG[:8]], ["COMPLETED, outputUrl: <url>"]),
     ("Sync failed: {'id': 'abc-123', 'status': 'FAILED', 'error': 'input video URL is inaccessible', "
      "'errorCode': 'media_url_inaccessible', 'outputFileName': 'ivan_secret'}",
      ["ivan_secret"], ["input video URL is inaccessible", "media_url_inaccessible"]),
@@ -41,14 +55,14 @@ CASES = [
     ("Скачано: https://www.youtube.com/watch?v=dQw4w9WgXcQ → /Users/ivan/Desktop/SheqelMotion_Downloads/x.mp4",
      ["youtube.com", "dQw4w9WgXcQ", "ivan"], ["Скачано:"]),
     ('ElevenLabs TTS error: 404\n{"detail":{"status":"voice_not_found","message":'
-     '"A voice with the voice_id 21m00Tcm4TlvDq8ikWAM was not found."}}',
-     ["21m00Tcm4TlvDq8ikWAM"], ["ElevenLabs TTS error: 404", "voice_not_found"]),
+     '"A voice with the voice_id ' + FAKE_VOICE_1 + ' was not found."}}',
+     [FAKE_VOICE_1], ["ElevenLabs TTS error: 404", "voice_not_found"]),
     ('  File "/Users/ivan/SheqelM/app.py", line 812, in apply_lipsync_sync',
      ["ivan"], ["line 812, in apply_lipsync_sync"]),
     (r'  File "C:\Users\Иван\Downloads\SheqelM\app.py", line 812, in apply_lipsync_sync',
      ["Иван"], ["line 812, in apply_lipsync_sync"]),
-    ("Использую голос аккаунта: Roger - Laid-Back, Casual, Resonant (voice_id: JBFqnCBsd6RMkjVDRZzb)",
-     ["JBFqnCBsd6RMkjVDRZzb"], []),
+    ("Использую голос аккаунта: Roger - Laid-Back, Casual, Resonant (voice_id: " + FAKE_VOICE_2 + ")",
+     [FAKE_VOICE_2], []),
 ]
 # Полезные строки должны пройти без изменений
 UNCHANGED = [
