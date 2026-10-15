@@ -3019,16 +3019,158 @@ def _ytdlp_ffmpeg_opts():
     return None
 
 
+# ── Куки браузеров для yt-dlp: какие браузеры есть, порядок, понятные ошибки ──────────────
+COOKIE_BROWSER_ORDER = ["firefox", "chrome", "brave", "edge", "safari", "chromium"]   # Safari — последним из основных
+COOKIE_BROWSER_LABELS = {"firefox": "Firefox", "chrome": "Chrome", "brave": "Brave", "edge": "Edge",
+                         "safari": "Safari", "chromium": "Chromium"}
+# Где лежит профиль или база куки. Пути относительно домашней папки (Mac, Linux) или переменных
+# окружения Windows. Отсутствующий браузер в режиме «Авто» пропускается молча.
+COOKIE_BROWSER_PATHS = {
+    "darwin": {
+        "firefox": ["~/Library/Application Support/Firefox/Profiles"],
+        "chrome": ["~/Library/Application Support/Google/Chrome"],
+        "brave": ["~/Library/Application Support/BraveSoftware/Brave-Browser"],
+        "edge": ["~/Library/Application Support/Microsoft Edge"],
+        "safari": ["~/Library/Containers/com.apple.Safari", "~/Library/Safari", "~/Library/Cookies"],
+        "chromium": ["~/Library/Application Support/Chromium"],
+    },
+    "win32": {
+        "firefox": ["%APPDATA%/Mozilla/Firefox/Profiles"],
+        "chrome": ["%LOCALAPPDATA%/Google/Chrome/User Data"],
+        "brave": ["%LOCALAPPDATA%/BraveSoftware/Brave-Browser/User Data"],
+        "edge": ["%LOCALAPPDATA%/Microsoft/Edge/User Data"],
+        "chromium": ["%LOCALAPPDATA%/Chromium/User Data"],
+    },
+    "linux": {
+        "firefox": ["~/.mozilla/firefox", "~/snap/firefox/common/.mozilla/firefox"],
+        "chrome": ["~/.config/google-chrome"],
+        "brave": ["~/.config/BraveSoftware/Brave-Browser"],
+        "edge": ["~/.config/microsoft-edge"],
+        "chromium": ["~/.config/chromium", "~/snap/chromium/common/chromium"],
+    },
+}
+
+
+def _platform_key(platform_name=None):
+    p = platform_name or sys.platform
+    return "darwin" if p == "darwin" else "win32" if p == "win32" else "linux"
+
+
+def browser_profile_paths(browser, platform_name=None, home=None, env=None):
+    home = home or str(Path.home())
+    env = env if env is not None else os.environ
+    out = []
+    for raw in COOKIE_BROWSER_PATHS[_platform_key(platform_name)].get(browser, []):
+        path = raw.replace("~", home, 1) if raw.startswith("~") else raw
+        missing = False
+        for var in re.findall(r"%([A-Z_]+)%", path):
+            if not env.get(var):
+                missing = True
+            path = path.replace(f"%{var}%", env.get(var, ""))
+        if not missing:
+            out.append(os.path.normpath(path))
+    return out
+
+
+# Признак, что в профиле реально есть база куки (папка браузера бывает и без неё).
+_COOKIE_DB_GLOBS = {
+    "firefox": ["*/cookies.sqlite"],
+    "chrome": ["*/Cookies", "*/Network/Cookies"], "brave": ["*/Cookies", "*/Network/Cookies"],
+    "edge": ["*/Cookies", "*/Network/Cookies"], "chromium": ["*/Cookies", "*/Network/Cookies"],
+}
+
+
+def browser_profile_exists(browser, platform_name=None, home=None, env=None):
+    """Есть ли у браузера профиль с базой куки. Safari — по папке: сама база закрыта системой
+    без Полного доступа к диску, это проверит yt-dlp и даст понятную ошибку."""
+    import glob
+    for root in browser_profile_paths(browser, platform_name, home, env):
+        if not os.path.isdir(root):
+            continue
+        patterns = _COOKIE_DB_GLOBS.get(browser)
+        if not patterns:
+            return True
+        if any(glob.glob(os.path.join(glob.escape(root), pat)) for pat in patterns):
+            return True
+    return False
+
+
+def cookie_browser_candidates(platform_name=None, home=None, env=None):
+    """Браузеры для режима «Авто» в нужном порядке — только те, чей профиль есть на этом компьютере."""
+    return [b for b in COOKIE_BROWSER_ORDER if browser_profile_exists(b, platform_name, home, env)]
+
+
 def _browser_priority_order():
-    """Порядок перебора браузеров для авто-режима cookies.
-    На Windows Firefox — первым: он не подвержен DPAPI-багу шифрования
-    cookies в Chrome/Chromium/Edge 127+ (известный нерешённый баг yt-dlp)."""
-    if sys.platform == "darwin":
-        return ["chrome", "firefox", "safari", "edge", "brave", "chromium"]
-    elif sys.platform == "win32":
-        return ["firefox", "chrome", "edge", "brave", "chromium"]
+    """Совместимость: порядок перебора, только установленные браузеры."""
+    return cookie_browser_candidates()
+
+
+_BOT_CHECK_RE = re.compile(r"(?i)sign in to confirm you(?:'|’)?re not a bot")
+_NO_COOKIE_DB_RE = re.compile(r"(?i)could not find (\w+) cookies database")
+_SAFARI_PERM_RE = re.compile(r"(?i)(operation not permitted|permission denied|errno 1\b).{0,200}"
+                             r"(safari|binarycookies)|(safari|binarycookies).{0,200}(operation not permitted|permission denied)")
+_FATAL_VIDEO_RE = re.compile(r"(?i)video unavailable|private video|this video (?:is|has been) (?:not available|"
+                             r"unavailable|private|removed)|unsupported url|http error 404|members[- ]only|"
+                             r"not available in your country|sign in to confirm your age")
+
+
+def classify_download_error(text, dpapi=False):
+    """bot_check | no_cookie_db | safari_permission | dpapi | video | other."""
+    text = str(text)
+    if dpapi or _DPAPI_ERROR_HINT in text.lower():
+        return "dpapi"
+    if _BOT_CHECK_RE.search(text):
+        return "bot_check"
+    if _NO_COOKIE_DB_RE.search(text):
+        return "no_cookie_db"
+    if _SAFARI_PERM_RE.search(text):
+        return "safari_permission"
+    if _FATAL_VIDEO_RE.search(text):
+        return "video"
+    return "other"
+
+
+SAFARI_DISK_ACCESS_HINT = ("Нужен Полный доступ к диску для приложения, из которого запущена программа "
+                           "(Системные настройки → Конфиденциальность и безопасность → Полный доступ к диску), "
+                           "потом перезапустите программу. Или выберите другой браузер.")
+
+
+def friendly_download_error(kind, browser=None, raw=""):
+    name = COOKIE_BROWSER_LABELS.get(browser or "", browser or "браузер")
+    if kind == "bot_check":
+        return ("YouTube просит войти. Откройте youtube.com в выбранном браузере и войдите в аккаунт, "
+                "потом повторите. Если включён VPN, отключите его.")
+    if kind == "no_cookie_db":
+        return f"В браузере {name} не найден профиль. Выберите другой браузер."
+    if kind == "safari_permission":
+        return SAFARI_DISK_ACCESS_HINT
+    if kind == "dpapi":
+        return ("Не удалось прочитать куки из браузера (известный баг Chrome на Windows). "
+                "Выберите Firefox или файл cookies.txt.")
+    text = re.sub(r"^ERROR:\s*", "", str(raw).strip().splitlines()[0] if str(raw).strip() else "")
+    return text[:300] or "Не удалось скачать."
+
+
+def summarize_cookie_failures(failures):
+    """Итог «Авто», когда не сработал ни один браузер. failures: [(браузер, вид, сырой текст)]."""
+    kinds = [k for _b, k, _r in failures]
+    if "bot_check" in kinds:
+        return friendly_download_error("bot_check")
+    if "video" in kinds:
+        b, k, raw = next(f for f in failures if f[1] == "video")
+        return friendly_download_error(k, b, raw)
+    parts = []
+    for b, k, raw in failures:
+        name = COOKIE_BROWSER_LABELS.get(b, b)
+        reason = {"no_cookie_db": "профиль не найден", "safari_permission": "нужен Полный доступ к диску",
+                  "dpapi": "куки не расшифровать (баг Chrome на Windows)"}.get(k) or friendly_download_error(k, b, raw)[:80]
+        parts.append(f"{name} — {reason}")
+    text = "Не удалось взять куки ни из одного браузера: " + "; ".join(parts) + "."
+    if "safari_permission" in kinds:
+        text += " " + SAFARI_DISK_ACCESS_HINT
     else:
-        return ["firefox", "chrome", "chromium", "brave", "edge"]
+        text += " Выберите браузер, в котором вы вошли в YouTube, или файл cookies.txt."
+    return text
 
 
 def find_best_browser_with_google():
@@ -3036,7 +3178,7 @@ def find_best_browser_with_google():
     Ищет браузер где выполнен вход в Google аккаунт.
     Возвращает название браузера для yt-dlp или None.
     """
-    for browser in _browser_priority_order():
+    for browser in cookie_browser_candidates():
         try:
             import yt_dlp
             ydl_opts = {
@@ -3058,10 +3200,18 @@ def find_best_browser_with_google():
 
 
 AUTO_BROWSER = "__AUTO__"
+
+
+def open_full_disk_access_settings():
+    """macOS: раздел «Полный доступ к диску» в Системных настройках (нужен для куки Safari)."""
+    try:
+        subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"])
+    except Exception:
+        pass
 _DPAPI_ERROR_HINT = "decrypt with dpapi"
 
 
-def download_from_url(url, output_dir, mode, denoise, log, browser=None, cookies_file=None):
+def download_from_url(url, output_dir, mode, denoise, log, browser=None, cookies_file=None, on_cookies=None):
     """
     Скачивает видео или аудио через yt-dlp в максимальном качестве.
     mode: 'video' | 'audio'
@@ -3070,7 +3220,9 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None, cookies
              перебор браузеров по приоритету (см. _browser_priority_order),
              с переходом к следующему при ошибке (напр. DPAPI на Windows)
     cookies_file: str | None — путь к cookies.txt; приоритет над browser
+    on_cookies: callable(str) | None — сообщает, откуда реально взяты куки («Firefox», «cookies.txt», «без куки»)
     """
+    on_cookies = on_cookies or (lambda label: None)
     homebrew_dirs = ["/opt/homebrew/bin", "/usr/local/bin"]
     for d in homebrew_dirs:
         if os.path.exists(d) and d not in os.environ.get("PATH", ""):
@@ -3221,54 +3373,74 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None, cookies
                 pass
             return video_out, audio_out
 
-    def _friendly_error(exc, dpapi):
-        if dpapi:
-            return (
-                "Не удалось прочитать куки из браузера (известный баг Chrome на Windows). "
-                "Попробуйте выбрать Firefox или загрузить файл cookies.txt в настройках."
-            )
-        return str(exc)
+    def _fail(exc, browser_name):
+        """Сырой текст — в лог, наружу — понятное сообщение."""
+        raw = str(exc)
+        kind = classify_download_error(raw, dpapi_seen["v"])
+        write_log_file(f"yt-dlp: ошибка ({browser_name or 'без куки'}): {raw}")
+        return kind, raw
 
     # ── cookies.txt — приоритет над cookies-from-browser ────────────────────
     if cookies_file:
         common = {**base_common, "cookiefile": cookies_file}
         try:
-            return _attempt(common)
+            result = _attempt(common)
+            on_cookies("cookies.txt")
+            return result
         except Exception as e:
-            dpapi = dpapi_seen["v"] or (_DPAPI_ERROR_HINT in str(e).lower())
-            raise RuntimeError(_friendly_error(e, dpapi)) from e
+            kind, raw = _fail(e, "cookies.txt")
+            raise RuntimeError(friendly_download_error(kind, None, raw)) from e
 
-    # ── Авто: перебор браузеров по приоритету, следующий при ошибке ─────────
+    # ── Авто: только установленные браузеры, следующий при ошибке куки или «войдите» ──
     if browser == AUTO_BROWSER:
-        candidates = _browser_priority_order()
-        last_err = None
-        any_dpapi = False
+        candidates = cookie_browser_candidates()
+        if not candidates:
+            log("Браузеров с профилем не найдено — скачиваю без куки")
+            try:
+                result = _attempt(base_common)
+                on_cookies("без куки")
+                return result
+            except Exception as e:
+                kind, raw = _fail(e, None)
+                raise RuntimeError(friendly_download_error(kind, None, raw)) from e
+        failures = []
         for i, b in enumerate(candidates, start=1):
             dpapi_seen["v"] = False
             common = {**base_common, "cookiesfrombrowser": (b,)}
+            name = COOKIE_BROWSER_LABELS.get(b, b)
             try:
-                log(f"Пробую cookies из браузера: {b.capitalize()} ({i}/{len(candidates)})...")
-                return _attempt(common)
+                log(f"Пробую куки из браузера: {name} ({i}/{len(candidates)})...")
+                result = _attempt(common)
+                on_cookies(name)
+                return result
             except Exception as e:
-                last_err = e
-                dpapi = dpapi_seen["v"] or (_DPAPI_ERROR_HINT in str(e).lower())
-                any_dpapi = any_dpapi or dpapi
-                reason = "не удалось расшифровать cookies (DPAPI)" if dpapi else str(e)[:150]
-                log(f"⚠ {b.capitalize()} не сработал: {reason} — пробую следующий браузер")
-                continue
-        raise RuntimeError(_friendly_error(last_err, any_dpapi))
+                kind, raw = _fail(e, name)
+                failures.append((b, kind, raw))
+                if kind == "video":          # видео недоступно — другой браузер не поможет
+                    raise RuntimeError(friendly_download_error(kind, b, raw)) from e
+                log(f"⚠ {name}: {friendly_download_error(kind, b, raw)[:120]} — пробую следующий браузер")
+        raise RuntimeError(summarize_cookie_failures(failures))
 
     # ── Конкретный браузер, выбранный вручную ────────────────────────────────
     if browser:
         common = {**base_common, "cookiesfrombrowser": (browser.lower(),)}
+        name = COOKIE_BROWSER_LABELS.get(browser.lower(), browser)
         try:
-            return _attempt(common)
+            result = _attempt(common)
+            on_cookies(name)
+            return result
         except Exception as e:
-            dpapi = dpapi_seen["v"] or (_DPAPI_ERROR_HINT in str(e).lower())
-            raise RuntimeError(_friendly_error(e, dpapi)) from e
+            kind, raw = _fail(e, name)
+            raise RuntimeError(friendly_download_error(kind, browser.lower(), raw)) from e
 
     # ── Без cookies ───────────────────────────────────────────────────────
-    return _attempt(base_common)
+    try:
+        result = _attempt(base_common)
+        on_cookies("без куки")
+        return result
+    except Exception as e:
+        kind, raw = _fail(e, None)
+        raise RuntimeError(friendly_download_error(kind, None, raw)) from e
 
 
 def _separate_vocals(input_path, output_path, log):
@@ -6668,6 +6840,7 @@ class LipsyncTwoModeApp(_BaseApp):
         # ── Cookies браузера ───────────────────────────────────────────────
         browser_status_label = self.label(outer, "🔍 Определяю браузер...", size=12, color=MUTED)
         browser_status_label.pack(anchor="w", padx=20, pady=(0, 4))
+        cookies_used_lbl = self.label(outer, "", size=12, color=MUTED)   # какой браузер реально дал куки
 
         cookies_row = ctk.CTkFrame(outer, fg_color="transparent")
         cookies_row.pack(fill="x", padx=20, pady=(0, 4))
@@ -6865,18 +7038,21 @@ class LipsyncTwoModeApp(_BaseApp):
                         tasks.update(task_id, **update)
 
                 tasks.update(task_id, status="running", progress=0.0)
+                used = {"cookies": None}
                 try:
                     browser_choice, cookies_file_choice = get_browser_for_download()
                     main_file, extra_file = download_from_url(
                         url, output_dir, mode, denoise, log,
-                        browser=browser_choice, cookies_file=cookies_file_choice)
+                        browser=browser_choice, cookies_file=cookies_file_choice,
+                        on_cookies=lambda label: used.update(cookies=label))
                     show_name = Path(main_file).name
                     if extra_file:
                         show_name += " + " + Path(extra_file).name
                     self.log(f"Скачано: {url} → {main_file}" +
                              (f" + {extra_file}" if extra_file else ""))
                     tasks.update(task_id, status="done", progress=1.0,
-                                 result={"files": [f for f in (main_file, extra_file) if f], "name": show_name})
+                                 result={"files": [f for f in (main_file, extra_file) if f], "name": show_name,
+                                         "cookies": used["cookies"]})
                 except Exception as e:
                     self.log(f"Ошибка скачивания {url}: {e}")
                     error_reporter.report("app.download_from_url", exc=e)
@@ -6951,17 +7127,22 @@ class LipsyncTwoModeApp(_BaseApp):
                 if status == "done":
                     name = (task.get("result") or {}).get("name") or task["title"]
                     files = (task.get("result") or {}).get("files") or []
+                    used = (task.get("result") or {}).get("cookies")
+                    shown = (name[:60] + "…") if len(name) > 60 else name
                     w["status"].configure(text="✓", text_color="#86efac")
-                    w["name"].configure(text=(name[:70] + "…") if len(name) > 70 else name, text_color=TEXT)
+                    w["name"].configure(text=shown + (f" · куки: {used}" if used else ""), text_color=TEXT)
                     w["pbar"].set(1.0)
                     w["pbar"].configure(progress_color="#86efac")
                     if files:
                         w["open"].configure(state="normal",
                                             command=lambda f=files[0]: open_folder(str(Path(f).parent)))
                 elif status == "error":
+                    err = str(task.get("error"))
                     w["status"].configure(text="✗", text_color="#fca5a5")
-                    w["name"].configure(text=f"Ошибка: {str(task.get('error'))[:80]}", text_color="#fca5a5")
+                    w["name"].configure(text=f"Ошибка: {err[:160]}", text_color="#fca5a5", wraplength=420)
                     w["pbar"].configure(progress_color="#fca5a5")
+                    if "Полный доступ к диску" in err and sys.platform == "darwin":
+                        w["open"].configure(state="normal", text="Доступ к диску", command=open_full_disk_access_settings)
                 elif status in ("cancelled", "interrupted"):
                     note = "Остановлено" if status == "cancelled" else "Прервано: приложение закрыли"
                     w["status"].configure(text="✕", text_color="#fca5a5")
@@ -6970,6 +7151,11 @@ class LipsyncTwoModeApp(_BaseApp):
                     if task.get("message"):
                         w["name"].configure(text=task["message"])
                     w["pbar"].set(task.get("progress") or 0)
+            last_used = next(((x.get("result") or {}).get("cookies") for x in reversed(items)
+                              if x["status"] == "done" and (x.get("result") or {}).get("cookies")), None)
+            cookies_used_lbl.configure(text=f"Куки последней загрузки: {last_used}" if last_used else "")
+            if last_used and not cookies_used_lbl.winfo_manager():
+                cookies_used_lbl.pack(anchor="w", padx=20, pady=(0, 4), after=browser_status_label)
             batch = self._panel_state_get("downloader", "batch")
             current = [x for x in items if x["meta"].get("batch") == batch] if batch else []
             active = [x for x in current if x["status"] not in TASK_FINISHED]
