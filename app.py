@@ -572,9 +572,39 @@ def read_instance_lock():
         return None
 
 
+INSTANCE_LOCK_MAX_AGE_SEC = 24 * 3600   # замок старше суток не верим — копия, скорее всего, давно упала
+
+
+def _instance_lock_stale(info, now=None):
+    """Замок можно забрать: данных нет, PID наш (после os.execv), замку больше суток, процесса нет
+    или проверить процесс не удалось (исключение в pid_alive — лучше запуститься, чем не открыться)."""
+    if not info or info.get("pid") == os.getpid():
+        return True
+    try:
+        if (now or time.time()) - float(info.get("time") or 0) > INSTANCE_LOCK_MAX_AGE_SEC:
+            return True
+    except (TypeError, ValueError):
+        return True
+    try:
+        return not pid_alive(info.get("pid"))
+    except Exception:
+        return True
+
+
+def take_instance_lock():
+    """«Это ошибка, запустить всё равно» — замок переписывается на нас."""
+    path = instance_lock_path()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    with open_private(path) as f:
+        json.dump({"pid": os.getpid(), "time": time.time(), "version": APP_VERSION}, f)
+
+
 def acquire_instance_lock(wait_sec=0.0, sleep=time.sleep):
     """(True, None) — замок наш. (False, данные замка) — работает другая копия.
-    Устаревший замок (процесса нет) или наш собственный (тот же PID после os.execv) забирается."""
+    Устаревший замок (процесса нет, старше суток, проверка упала) или наш собственный забирается."""
     path = instance_lock_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     secure_path(os.path.dirname(path), is_dir=True)
@@ -587,7 +617,7 @@ def acquire_instance_lock(wait_sec=0.0, sleep=time.sleep):
             return True, None
         except FileExistsError:
             info = read_instance_lock()
-            if not info or info.get("pid") == os.getpid() or not pid_alive(info.get("pid")):
+            if _instance_lock_stale(info):
                 try:
                     os.remove(path)          # устаревший или наш — забираем
                 except OSError:
@@ -608,18 +638,43 @@ def release_instance_lock():
             pass
 
 
-def notify_already_running(info, after_update=False):
+RUN_ANYWAY_LABEL = "Это ошибка, запустить всё равно"
+
+
+def _ask_run_anyway(text):
+    """Окно «уже открыт» с кнопками «Закрыть» и «Это ошибка, запустить всё равно». True — запускаем."""
+    choice = {"run": False}
+    root = tk.Tk()
+    root.title("SheqelMotion")
+    root.resizable(False, False)
+    tk.Label(root, text=text, justify="left", wraplength=420, padx=20, pady=16).pack()
+    row = tk.Frame(root, padx=16, pady=12)
+    row.pack(fill="x")
+    def run_anyway():
+        choice["run"] = True
+        root.destroy()
+    tk.Button(row, text="Закрыть", width=12, command=root.destroy).pack(side="right")
+    tk.Button(row, text=RUN_ANYWAY_LABEL, command=run_anyway).pack(side="right", padx=(0, 8))
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(200, lambda: root.attributes("-topmost", False))
+    root.mainloop()
+    return choice["run"]
+
+
+def notify_already_running(info, after_update=False, ask=None):
+    """Сообщение «уже открыт». True — пользователь выбрал «Это ошибка, запустить всё равно»."""
     text = ("SheqelMotion уже открыт" + (f" (процесс {info.get('pid')})" if info else "") + ".\n\n"
             + ("Предыдущая копия ещё не закрылась после обновления. Закрой её и запусти программу снова."
                if after_update else "Переключись на открытое окно — вторая копия не запускается, чтобы "
-                                    "не испортить настройки и очередь."))
+                                    "не испортить настройки и очередь.")
+            + "\n\nЕсли окна SheqelMotion нигде нет — нажми «" + RUN_ANYWAY_LABEL + "».")
     try:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showwarning("SheqelMotion", text, parent=root)
-        root.destroy()
+        return bool((ask or _ask_run_anyway)(text))
     except Exception:
         print(text, file=sys.stderr)
+        return False
 
 
 _EXPECTED_ERROR_RE = re.compile(
@@ -10517,8 +10572,9 @@ def main():
     # Одна копия: вторая не запускается; после обновления ждём, пока старая закроется (до 15 с).
     ok, info = acquire_instance_lock(wait_sec=AFTER_UPDATE_WAIT_SEC if after_update else 0)
     if not ok:
-        notify_already_running(info, after_update)
-        return
+        if not notify_already_running(info, after_update):
+            return
+        take_instance_lock()                # «Это ошибка, запустить всё равно»
     import atexit
     atexit.register(release_instance_lock)
     rotate_log_file()
