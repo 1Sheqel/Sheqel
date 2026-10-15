@@ -30,3 +30,6 @@ sheqelmotion_previews/
 app.py.bak
 app_before_*.py
 test_report.txt
+
+# рабочие папки тестов
+tests/*/
