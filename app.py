@@ -11103,6 +11103,17 @@ class LipsyncTwoModeApp(_BaseApp):
         self._sync_fetch_widgets = None
         if roll["status"] == "Прервано":
             self._build_sync_fetch_row(hdr, roll)
+        last = roll.get("last_result") or {}
+        last_files = [f for f in last.get("files") or [] if f]
+        if last_files:
+            row = ctk.CTkFrame(hdr, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=(0, 8))
+            caption = "Результат" if roll["status"] == "Готово" else "Прошлый результат"
+            when = time.strftime("%d.%m %H:%M", time.localtime(float(last.get("time") or 0)))
+            self.label(row, f"{caption} ({when}): " + ", ".join(Path(f).name for f in last_files),
+                       size=12, color=MUTED).pack(side="left")
+            self.button(row, "Показать в папке", lambda f=last_files[0]: self._qp_file_action(reveal_in_file_manager, f),
+                        color=BTN, hover=BTN_HOVER, width=140).pack(side="right")
 
         # ── Mode ──────────────────────────────────────────────────────────
         mode_row = ctk.CTkFrame(hdr, fg_color="transparent")
@@ -11184,6 +11195,7 @@ class LipsyncTwoModeApp(_BaseApp):
                         if r[key]:
                             entry.insert(0, r[key])
                     return
+                before = (r.get("audio_start", ""), r.get("audio_end", ""))
                 for entry, key in [(start_entry, "audio_start"), (end_entry, "audio_end")]:
                     val = entry.get().strip().replace(",", ".")   # «2,5» с русской раскладки — тоже число
                     if val:
@@ -11198,6 +11210,8 @@ class LipsyncTwoModeApp(_BaseApp):
                             r[key] = ""
                     else:
                         r[key] = ""
+                if (r.get("audio_start", ""), r.get("audio_end", "")) != before:
+                    self._mark_roll_changed(r)
                 self._schedule_state_save()
 
             def save_times_typing(*_, r=roll):
@@ -11217,6 +11231,7 @@ class LipsyncTwoModeApp(_BaseApp):
                         r[key] = val
                         changed = True
                 if changed:
+                    self._mark_roll_changed(r)
                     self._schedule_state_save()
 
             for e in (start_entry, end_entry):
@@ -11501,6 +11516,22 @@ class LipsyncTwoModeApp(_BaseApp):
         self.refresh_rolls()
 
 
+
+    def _set_roll_last_result(self, roll_id, result):
+        """Путь готового файла остаётся у сцены и после правки (статус снова «Ожидает»)."""
+        roll = next((r for r in self.rolls if r["id"] == roll_id), None)
+        if roll is not None:
+            roll["last_result"] = result
+            self._schedule_state_save()
+            if self._active_panel == "scene" and roll_id == self.selected_roll_id:
+                self.render_scene_detail()
+
+    def _mark_roll_changed(self, roll):
+        """Изменились данные сцены: готовая или с ошибкой снова «Ожидает» (прошлый результат — в last_result)."""
+        if roll.get("status") in ("Готово", "Ошибка"):
+            roll["status"] = "Ожидает"
+            self.render_scene_list()
+            self.update_status()
 
     def rerun_roll(self, roll_id):
         """«Запустить заново»: готовая сцена снова попадёт в очередь (статус «Ожидает»)."""
@@ -12226,6 +12257,8 @@ class LipsyncTwoModeApp(_BaseApp):
             files = self._process_single_roll(nn, idx, roll, self._queue_batch_dir, prefixed_log) or []
             self.set_roll_status_by_id(roll_id, "Готово")
             self._mark_roll_progress(seq, end=time.time(), state="готово", files=list(files))
+            result = {"files": list(files), "batch_dir": self._queue_batch_dir, "time": time.time()}
+            self.after(0, lambda: self._set_roll_last_result(roll_id, result))
         except Exception as e:
             self._mark_roll_progress(seq, end=time.time(), state="ошибка")
             if roll["mode"] == "1 видео":
