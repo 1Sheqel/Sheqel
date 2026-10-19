@@ -2207,12 +2207,15 @@ class SyncGenerationGate:
             self.learned = n
             self._cond.notify_all()
 
-    def acquire(self, log=None):
+    def acquire(self, log=None, on_wait=None):
         with self._cond:
             told = False
             while self.limit and self.active >= self.limit:
-                if log and not told:
-                    log(f"Жду свободного места в Sync (одновременно не больше {self.limit})")
+                if not told:
+                    if log:
+                        log(f"Жду свободного места в Sync (одновременно не больше {self.limit})")
+                    if on_wait:
+                        on_wait(self.limit)
                     told = True
                 self._cond.wait(1.0)
             self.active += 1
@@ -2226,6 +2229,11 @@ class SyncGenerationGate:
 
 sync_gen_gate = SyncGenerationGate()
 sync_concurrency_hook = None        # приложение сохраняет узнанный лимит в config
+sync_wait_hook = None               # (journal_ctx, текст | None): строка «жду место в Sync» в панели хода
+
+
+def sync_wait_text(limit=None):
+    return f"Sync: лимит одновременных генераций {limit}, жду" if limit else "Sync: лимит одновременных генераций, жду"
 _sync_sleep = time.sleep            # пауза ожидания места (подменяется в тестах)
 
 
@@ -2386,9 +2394,19 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log, options=None, estima
     request_options = {"sync_mode": SYNC_SYNC_MODE, **(options or {})}
     gate = {"held": False}
 
+    def wait_note(text):
+        if sync_wait_hook:
+            try:
+                sync_wait_hook(journal_ctx or {}, text)
+            except Exception:
+                pass
+
     def gate_take():
         if not gate["held"]:
-            sync_gen_gate.acquire(log)
+            waited = []
+            sync_gen_gate.acquire(log, on_wait=lambda lim: (waited.append(1), wait_note(sync_wait_text(lim))))
+            if waited:
+                wait_note(None)
             gate["held"] = True
 
     def gate_drop():
@@ -2464,7 +2482,9 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log, options=None, estima
                             + (f" — {limit_n}" if limit_n else "") + f". Жду {wait:g} с; попытка не тратится, "
                             "тот же Idempotency-Key")
                         gate_drop()
+                        wait_note(sync_wait_text(limit_n or sync_gen_gate.limit))
                         _sync_sleep(wait)
+                        wait_note(None)
                         limit_waited += wait
                         gate_take()
                         continue
@@ -5620,9 +5640,10 @@ class LipsyncTwoModeApp(_BaseApp):
         self._saved_sync_price = sync_price_state["per_frame"]
         self._restore_state()
         self._apply_nav_collapsed()
-        global sync_job_hook, sync_concurrency_hook
+        global sync_job_hook, sync_concurrency_hook, sync_wait_hook
         sync_job_hook = self._on_sync_journal_event
         sync_concurrency_hook = self._on_sync_concurrency_learned
+        sync_wait_hook = self._on_sync_wait
         self.update_status()
         self.after(3000, lambda: self.check_for_updates(silent=True))
         self.after(500, self._check_just_updated)
@@ -5755,9 +5776,26 @@ class LipsyncTwoModeApp(_BaseApp):
 
     def _on_sync_concurrency_learned(self, n):
         """Поток очереди: Sync ответил 429 «concurrency limit of N» — запоминаем N на сутки."""
+        first = self.sync_concurrency_learned != n
         self.sync_concurrency_learned, self.sync_concurrency_learned_at = n, time.time()
         self.log(f"Sync: лимит одновременных генераций — {n}; очередь подстраивается")
         self.after(0, self.save_config)
+        if first:
+            self.after(0, lambda: self._show_notice(
+                f"Sync ограничивает одновременные генерации: {n}. Очередь отправляет не больше {n}, "
+                "остальные ролики ждут — ничего не теряется и не оплачивается дважды.",
+                "Настройки", self.show_settings_panel))
+
+    def _on_sync_wait(self, ctx, text):
+        """Поток очереди: ролик ждёт места в Sync (text) или дождался (None) — строка в панели хода."""
+        roll_id, part = (ctx or {}).get("roll_id"), (ctx or {}).get("part")
+        with self._progress_lock:
+            for p in self._queue_progress.values():
+                if p.get("roll_id") == roll_id and p.get("start") and not p.get("end"):
+                    if text:
+                        p["wait"] = text
+                    else:
+                        p.pop("wait", None)
 
     def _on_sync_concurrency_change(self, label):
         self.sync_concurrency_mode = SYNC_CONCURRENCY_CHOICES.get(label)
@@ -12631,6 +12669,8 @@ class LipsyncTwoModeApp(_BaseApp):
                 if p.get("end"):
                     icon = "✗" if p.get("state") == "ошибка" else "✓"
                     status = f"{p.get('state', '')} за {clock}"
+                elif p.get("wait"):
+                    icon, status = "⏸", f"{p['wait']} · {clock}"
                 else:
                     icon, status = "▶", f"идёт {clock} · {expected}"
             rows.append((order, icon, p.get("title", f"Ролик {order}"), status, p))
@@ -12680,6 +12720,9 @@ class LipsyncTwoModeApp(_BaseApp):
             done, total, running, frac, eta = self._qp_progress()
             now_txt = (f" · идёт ролик {', '.join(str(r) for r in running)}" if running else "")
             note = f" · {self._queue_note}" if self._queue_note else ""
+            waiting = next((r[4]["wait"] for r in self._qp_rows() if r[4].get("wait")), "")
+            if waiting:
+                note += f" · {waiting}"
             w["title"].configure(text=f"Очередь: {done} из {total}{now_txt}{note}", text_color=TEXT)
             w["bar"].set(frac)
             w["eta"].configure(text=eta)

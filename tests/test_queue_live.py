@@ -48,6 +48,10 @@ def fake_process(nn, idx, roll, batch_dir, log):
         RUN["max"] = max(RUN["max"], RUN["active"])
         RUN["started"].append((roll["id"], nn, batch_dir))
     try:
+        if roll["video_single"] == "/wt.mp4":           # ждёт места в Sync — как в apply_lipsync_sync
+            app.sync_wait_hook({"roll_id": roll["id"], "part": "single"}, app.sync_wait_text(1))
+            time.sleep(1.2)
+            app.sync_wait_hook({"roll_id": roll["id"], "part": "single"}, None)
         time.sleep(RUN["dur"].get(roll["id"], 0.4))
         out = os.path.join(batch_dir, f"{nn:02d}_{roll['video_single'].strip('/').split('.')[0]}.mp4")
         open(out, "wb").write(b"\0" * 64)
@@ -196,10 +200,26 @@ def phase1():
     back = [r for r in ks if by_id(r["id"])["status"] == "Ожидает"]
     check("11. «Остановить после текущего»: начатые доработали, остальные снова «Ожидает»",
           len(done) == 2 and len(back) == 2 and w._queue_summary["total"] == 2, f"{len(done)}/{len(back)}")
+    # Ожидание места в Sync: строка ролика и заголовок панели, уведомление при первом лимите
+    w._on_sync_concurrency_learned(1); yield 0.2
+    notice = w._notice_w["label"].cget("text") if w._notice_w else ""
+    check("14. первый узнанный лимит → уведомление внизу окна", notice.startswith(
+        "Sync ограничивает одновременные генерации: 1."), notice)
+    wt = new_roll("wt", 0.2)
+    w.start_queue(); yield lambda: w.is_processing; yield 0.6
+    w._qp_set_state(expanded=True, hidden=False); w._render_queue_panel(); yield 0.1
+    title = w._qp_w["title"].cget("text")
+    row_texts = [x.cget("text") for x in walk(w._qp_w["rolls"]) if isinstance(x, ctk.CTkLabel)]
+    check("15. панель хода: «Sync: лимит одновременных генераций 1, жду» в заголовке и в строке ролика",
+          "Sync: лимит одновременных генераций 1, жду" in title
+          and any("⏸" in t and "Sync: лимит одновременных генераций 1, жду" in t for t in row_texts), title)
+    yield idle; yield 0.2
+    w._render_queue_panel()
+    check("15b. дождался — строка «жду» снята", "жду" not in w._qp_w["title"].cget("text"))
     # Перезапуск посреди очереди: один в обработке, один ждёт — закрываем окно
     RUN["dur"].clear()
     p1, p2, p3 = new_roll("p1", 30), new_roll("p2", 30), new_roll("p3", 30)
-    for r in back:
+    for r in back + [wt]:
         r["status"] = "Готово"
     w.start_queue(); yield lambda: w.is_processing; yield 0.5
     check("12. перед закрытием: два в обработке, один «В очереди»",

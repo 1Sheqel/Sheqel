@@ -86,6 +86,8 @@ def fake_wait(sec):
 app._sync_sleep = fake_wait
 learned = []
 app.sync_concurrency_hook = learned.append
+notes = []
+app.sync_wait_hook = lambda ctx, text: notes.append(text)
 D = tempfile.mkdtemp()
 
 
@@ -116,14 +118,16 @@ check("2d. пауза max(retryAfterSeconds, 20): 30 и 30 с", waits == [30, 30
 check("2e. ассеты удалены один раз — после готового результата, не после 429",
       deleted == ["asset-v-a.mp4", "asset-a-a.wav"], str(deleted))
 check("2f. узнан лимит 5 (из текста ответа)", learned == [5, 5] and app.sync_gen_gate.learned == 5)
-waits.clear(); deleted.clear(); learned.clear()
+check("2h. строка для панели: «Sync: лимит одновременных генераций 5, жду», потом снимается",
+      notes == ["Sync: лимит одновременных генераций 5, жду", None] * 2, str(notes))
+waits.clear(); deleted.clear(); learned.clear(); notes.clear()
 FakeSession.server = srv = FakeSync(limit=5, retry_after=5, forced_429=1)
 run("b", [])
 check("2g. retryAfterSeconds 5 → пауза 20 с (не меньше)", waits == [20], str(waits))
 
 # ── 3. Лимит N=1 при 3 роликах ──
 app.sync_gen_gate.configure()             # авто, лимит ещё не известен
-waits.clear(); learned.clear()
+waits.clear(); learned.clear(); notes.clear()
 FakeSession.server = srv = FakeSync(limit=1, retry_after=30, polls_to_complete=8)
 errs = []
 def worker(i):
@@ -142,6 +146,8 @@ check("3b. в Sync одновременно не больше 1 генераци
 check("3c. лимит 1 узнан и сохранён; ворота дальше не пускают второй запрос",
       app.sync_gen_gate.learned == 1 and 1 in learned and srv.count_429 <= 2, f"429: {srv.count_429}")
 check("3d. ворота пусты после работы", app.sync_gen_gate.active == 0)
+check("3e. ожидание у ворот тоже видно: «…генераций 1, жду» и снимается",
+      "Sync: лимит одновременных генераций 1, жду" in notes and notes.count(None) >= 1)
 
 # ── 4. Оценка времени очереди учитывает лимит ──
 times = [(100, 100)] * 3
