@@ -5533,6 +5533,17 @@ class LipsyncTwoModeApp(_BaseApp):
         self._queue_summary = None
         self._queue_batch_dir = None
         self._qp = None
+        # Живая очередь: всё ниже — под _queue_lock (добавление из главного потока, выдача — рабочим потокам).
+        self._queue_lock = threading.RLock()
+        self._queue_pending = []         # номера строк хода очереди, ждущие рабочего потока
+        self._queue_accepting = False    # можно добавлять в текущую партию
+        self._queue_stop = False         # «Остановить после текущего»
+        self._queue_workers = 0
+        self._queue_next_nn = 1          # NN_ в именах файлов — по порядку старта, продолжается при добавлении
+        self._queue_next_seq = 1
+        self._queue_last_start = 0.0
+        self._queue_failed = []
+        self._queue_costing = False      # идёт расчёт стоимости — кнопку не трогаем
         self._qp_w = {}
         self._qp_forced = False
         self._qp_details_open = False
@@ -6410,6 +6421,7 @@ class LipsyncTwoModeApp(_BaseApp):
             "next_roll_id": self.next_roll_id,
             "selected_roll_id": self.selected_roll_id,
             "panels": self._panel_state,
+            "queue_active_batch": self._queue_batch_dir if self.is_processing else None,
             "tasks": self.background_tasks.snapshot(),
             "sync_journal": journal,
         }
@@ -6430,13 +6442,19 @@ class LipsyncTwoModeApp(_BaseApp):
         if self._state_store.load_error:
             self.log(f"Состояние прошлой сессии не прочитано: {self._state_store.load_error}")
         rolls = data.get("rolls")
-        interrupted = []
+        interrupted, requeued = [], []
+        journal = data.get("sync_journal") if isinstance(data.get("sync_journal"), list) else []
+        active_batch = data.get("queue_active_batch")
         if isinstance(rolls, list) and rolls:
             for roll in rolls:
                 roll.setdefault("face_mode", "default")
                 roll.setdefault("face_points", {})
                 status = str(roll.get("status", ""))
-                if status.startswith("Обработка") or status == "В очереди":
+                if status == ROLL_QUEUED and not any(
+                        v.get("batch") == active_batch for v in sync_jobs_for_roll(journal, roll.get("id")).values()):
+                    roll["status"] = "Ожидает"       # до Sync не дошёл — оплаты не было, просто запустить снова
+                    requeued.append(roll)
+                elif status.startswith("Обработка") or status == ROLL_QUEUED:
                     roll["status"] = "Прервано"
                     interrupted.append(roll)
             self.rolls = rolls
@@ -6459,6 +6477,8 @@ class LipsyncTwoModeApp(_BaseApp):
         if rolls or data.get("tasks"):
             self.log(f"Восстановлено из прошлой сессии: роликов {len(rolls or [])}, "
                      f"задач {len(data.get('tasks') or [])}, записей журнала Sync {len(self._sync_journal)}")
+        if requeued:
+            self.log(f"Сцены, ждавшие очереди при закрытии, снова «Ожидает»: {len(requeued)} (в Sync не отправлялись)")
         if interrupted:
             titles = ", ".join(self.get_roll_title(self.rolls.index(r), r) for r in interrupted)
             self.log(f"Ролики, которые обрабатывались при закрытии, помечены «Прервано»: {titles}. "
@@ -10911,10 +10931,17 @@ class LipsyncTwoModeApp(_BaseApp):
         self.update_status()
 
     def clear_rolls(self):
-        if self.is_processing:
-            messagebox.showwarning("Очередь", "Нельзя очищать во время обработки.")
+        """«Очистить всё»: во время работы очереди остаются сцены «В очереди» и «Обработка»."""
+        kept = [r for r in self.rolls if roll_in_queue(r)]
+        self.rolls = kept
+        if kept:
+            self.log(f"Очищено; оставлены сцены в очереди: {len(kept)}")
+            if self.selected_roll_id not in {r["id"] for r in kept}:
+                self.selected_roll_id = kept[0]["id"]
+            self.render_scene_list()
+            self.render_scene_detail()
+            self.update_status()
             return
-        self.rolls = []
         self.add_roll()
 
     def render_rolls(self):
@@ -11043,6 +11070,9 @@ class LipsyncTwoModeApp(_BaseApp):
         if roll["status"] == "Готово":
             self.button(title_row, "Запустить заново", lambda rid=roll["id"]: self.rerun_roll(rid),
                         color=BTN, hover=BTN_HOVER, width=150).pack(side="right", padx=(0, 10))
+        elif roll["status"] == ROLL_QUEUED:
+            self.button(title_row, "Убрать из очереди", lambda rid=roll["id"]: self._queue_remove_roll(rid),
+                        color=BTN, hover=BTN_HOVER, width=160).pack(side="right", padx=(0, 10))
 
         self._sync_fetch_widgets = None
         if roll["status"] == "Прервано":
@@ -11458,9 +11488,9 @@ class LipsyncTwoModeApp(_BaseApp):
         self.update_status()
 
     def remove_roll_by_id(self, roll_id):
-        if self.is_processing:
-            messagebox.showwarning("Очередь", "Нельзя удалять во время обработки.")
-            return
+        roll = next((r for r in self.rolls if r["id"] == roll_id), None)
+        if roll is not None and self._roll_is_locked(roll):
+            return                       # в очереди или в обработке — удалять нельзя
 
         removed_idx = next(
             (i for i, r in enumerate(self.rolls) if r["id"] == roll_id), None)
@@ -11652,8 +11682,10 @@ class LipsyncTwoModeApp(_BaseApp):
         return valid, errors, skipped_done
 
     def start_queue(self):
-        if self.is_processing:
-            messagebox.showinfo("Очередь", "Очередь уже обрабатывается.")
+        """«НАЧАТЬ ОЧЕРЕДЬ» или во время работы «ДОБАВИТЬ В ОЧЕРЕДЬ (N)» — те же проверки и окно стоимости,
+        только для новых сцен."""
+        if self.is_processing and self._queue_stop:
+            messagebox.showinfo("Очередь", "Очередь останавливается — добавь сцены после остановки.", parent=self)
             return
         valid, errors, skipped_done = self.queue_candidates()
         if errors:
@@ -11684,6 +11716,7 @@ class LipsyncTwoModeApp(_BaseApp):
 
     def _confirm_queue_cost(self, valid, skipped=0):
         """Оценка перед запуском. Любая ошибка расчёта очередь не блокирует — строка «оценка недоступна»."""
+        self._queue_costing = True
         self.start_btn.configure(state="disabled", text="СЧИТАЮ СТОИМОСТЬ…")
         rolls = list(valid)
 
@@ -11726,14 +11759,16 @@ class LipsyncTwoModeApp(_BaseApp):
             self.after(0, lambda: decide(estimates, warnings))
 
         def split_failed(problems):
-            self.start_btn.configure(state="normal", text="НАЧАТЬ ОЧЕРЕДЬ")
+            self._queue_costing = False
+            self._refresh_start_btn()
             self.log("Очередь не запущена: разделение на 2 части по паузам не удалось")
             messagebox.showerror("Разделение на 2 части",
                                  "Очередь не запущена, в Sync ничего не отправлено.\n\n" + "\n".join(problems),
                                  parent=self)
 
         def decide(estimates, warnings):
-            self.start_btn.configure(state="normal", text="НАЧАТЬ ОЧЕРЕДЬ")
+            self._queue_costing = False
+            self._refresh_start_btn()
             self._persist_sync_price()
             for w in warnings:
                 self.log(f"⚠ {w}")
@@ -11834,22 +11869,137 @@ class LipsyncTwoModeApp(_BaseApp):
             side="right", padx=(0, 8))
 
     def _launch_queue(self, valid, estimates):
+        """Старт очереди или, если она уже идёт, добавление сцен в ту же партию."""
         if self.is_processing:
+            self._enqueue_live(valid, estimates)
             return
-        with self._progress_lock:
-            self._queue_progress = {
-                order: {"title": self.get_roll_title(idx, roll),
-                        "range": None if est.get("error") else est["time"],
-                        "cost": None if est.get("error") else est["cost"],
-                        "source": est.get("source"), "start": None, "end": None, "state": ""}
-                for order, ((idx, roll), est) in enumerate(zip(valid, estimates), start=1)
-            }
+        with self._queue_lock:
+            with self._progress_lock:
+                self._queue_progress = {}
+            self._queue_pending = []
+            self._queue_accepting, self._queue_stop = True, False
+            self._queue_workers = 0
+            self._queue_next_nn, self._queue_next_seq = 1, 1
+            self._queue_last_start = 0.0
+            self._queue_failed = []
+            self._queue_batch_dir = None
+            self._add_queue_items(valid, estimates)
         self.is_processing = True
         self._qp_on_queue_start()
-        self.start_btn.configure(state="disabled", text="ОБРАБАТЫВАЮ ОЧЕРЕДЬ...")
-        thread = threading.Thread(target=self.queue_thread, args=(valid,), daemon=True)
-        thread.start()
+        self._refresh_start_btn()
+        self.render_scene_list()
+        threading.Thread(target=self.queue_thread, daemon=True).start()
         self._tick_queue_progress()
+
+    def _add_queue_items(self, valid, estimates):
+        """Под _queue_lock, главный поток: строки хода очереди и «В очереди» у сцен."""
+        for (idx, roll), est in zip(valid, estimates):
+            seq = self._queue_next_seq
+            self._queue_next_seq += 1
+            with self._progress_lock:
+                self._queue_progress[seq] = {
+                    "title": self.get_roll_title(idx, roll), "roll_id": roll["id"], "nn": None, "files": [],
+                    "range": None if est.get("error") else est["time"],
+                    "cost": None if est.get("error") else est["cost"],
+                    "source": est.get("source"), "start": None, "end": None, "state": ""}
+            self._queue_pending.append(seq)
+            roll["status"] = ROLL_QUEUED
+
+    def _enqueue_live(self, valid, estimates):
+        """«ДОБАВИТЬ В ОЧЕРЕДЬ»: те же потоки, та же папка, нумерация продолжается. Если очередь как раз
+        закончилась (последний поток уже вышел) — добавленные сцены запускаются новой партией."""
+        with self._queue_lock:
+            accepted = self._queue_accepting and not self._queue_stop
+            if accepted:
+                self._add_queue_items(valid, estimates)
+                self._queue_spawn_workers()
+        if accepted:
+            self.log(f"Добавлено в очередь: {len(valid)} — в ту же папку партии, нумерация продолжается")
+            self.render_scene_list()
+            self.render_scene_detail()
+            self._refresh_start_btn()
+            self._render_queue_panel()
+            return
+        self.log("Очередь завершается — добавленные сцены запустятся новой партией сразу после неё")
+
+        def retry():
+            if self.is_processing:
+                self.after(200, retry)
+            else:
+                self._launch_queue(valid, estimates)
+        retry()
+
+    def _queue_spawn_workers(self):
+        """Под _queue_lock: потоков не больше CONCURRENT_ROLLS и не больше, чем ждущих сцен."""
+        if self._queue_batch_dir is None:
+            return                                      # папка партии ещё создаётся — потоки запустит она
+        need = min(CONCURRENT_ROLLS - self._queue_workers, len(self._queue_pending))
+        for _ in range(max(0, need)):
+            self._queue_workers += 1
+            threading.Thread(target=self._queue_worker, daemon=True).start()
+
+    def _queue_request_stop(self):
+        """«Остановить после текущего»: идущие доработают, ждущие вернутся в «Ожидает»."""
+        with self._queue_lock:
+            if not self.is_processing or self._queue_stop:
+                return
+            self._queue_stop = True
+            removed = list(self._queue_pending)
+            self._queue_pending = []
+            with self._progress_lock:
+                ids = [self._queue_progress.pop(seq, {}).get("roll_id") for seq in removed]
+        for r in self.rolls:
+            if r["id"] in ids:
+                r["status"] = "Ожидает"
+        self.log(f"Остановка после текущих роликов: из очереди снято {len(removed)}")
+        self.render_scene_list()
+        self.render_scene_detail()
+        self._refresh_start_btn()
+        self._render_queue_panel()
+
+    def _queue_remove_roll(self, roll_id):
+        """«Убрать из очереди» — только для ждущей сцены. True — убрана."""
+        with self._queue_lock:
+            with self._progress_lock:
+                seq = next((q for q in self._queue_pending
+                            if self._queue_progress.get(q, {}).get("roll_id") == roll_id), None)
+                if seq is None:
+                    return False
+                self._queue_pending.remove(seq)
+                self._queue_progress.pop(seq, None)
+        roll = next((r for r in self.rolls if r["id"] == roll_id), None)
+        if roll is not None:
+            roll["status"] = "Ожидает"
+        self.log("Сцена убрана из очереди — снова «Ожидает»")
+        self.render_scene_list()
+        self.render_scene_detail()
+        self._refresh_start_btn()
+        self._render_queue_panel()
+        return True
+
+    def _refresh_start_btn(self):
+        """Кнопка внизу: «НАЧАТЬ ОЧЕРЕДЬ» или во время работы «ДОБАВИТЬ В ОЧЕРЕДЬ (N)»."""
+        if not hasattr(self, "start_btn") or self._queue_costing:
+            return
+        if self.is_processing:
+            n = len(self.validate_rolls()[0])
+            self.start_btn.configure(text=f"ДОБАВИТЬ В ОЧЕРЕДЬ ({n})",
+                                     state="normal" if n and not self._queue_stop else "disabled")
+        else:
+            self.start_btn.configure(text="НАЧАТЬ ОЧЕРЕДЬ", state="normal")
+
+    def set_roll_status_by_id(self, roll_id, status):
+        """Из потока очереди: статус по id (позиции в списке могут сдвинуться — удаление других сцен)."""
+        def update():
+            roll = next((r for r in self.rolls if r["id"] == roll_id), None)
+            if roll is None:
+                return
+            roll["status"] = status
+            self.render_scene_list()
+            if self._active_panel == "scene" and roll["id"] == self.selected_roll_id:
+                self.render_scene_detail()
+            self.update_status()
+        self.after(0, update)
 
     def _mark_roll_progress(self, order_num, **fields):
         with self._progress_lock:
@@ -11910,6 +12060,7 @@ class LipsyncTwoModeApp(_BaseApp):
                             storage=self.sync_storage,
                             journal_ctx={"roll_id": roll.get("id"), "part": "single", "batch": batch_dir})
             log(f"ГОТОВО: {out}")
+            outputs = [out]
         else:
             start_text, end_text, sep_count = parse_start_end_text(roll["text"])
             part_start, part_end = split_start_end_by_silence(
@@ -11937,19 +12088,19 @@ class LipsyncTwoModeApp(_BaseApp):
                             journal_ctx={"roll_id": roll.get("id"), "part": "end", "batch": batch_dir})
             log(f"ГОТОВО: {out_start}")
             log(f"ГОТОВО: {out_end}")
+            outputs = [out_start, out_end]
 
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
-            pass    
+            pass
+        return outputs
 
-    def queue_thread(self, valid_rolls):
+    def queue_thread(self):
+        """Создаёт папку партии и запускает рабочие потоки; итог подводит последний вышедший поток."""
         try:
-            failed_videos = []
-            failed_lock = threading.Lock()
             base_output = str(Path(desktop_dir()) / "Lipsync_Queue_Output")
             ensure_dir(base_output)
-
             batch_name = time.strftime("%d-%m-%Y_%H-%M-%S")
             batch_dir = str(Path(base_output) / batch_name)
             suffix = 2
@@ -11962,83 +12113,118 @@ class LipsyncTwoModeApp(_BaseApp):
                 except FileExistsError:
                     batch_dir = str(Path(base_output) / f"{batch_name}_{suffix}")
                     suffix += 1
-
-            total = len(valid_rolls)
-            self._queue_batch_dir = batch_dir
             self.log("=" * 70)
             self.log(f"Папка партии: {batch_dir}")
-            self.log(f"Роликов в очереди: {total}")
-            self.log(f"Параллельность: {CONCURRENT_ROLLS} ролика одновременно")
-            self.log(f"Стартовая задержка между запусками: {PAUSE_BETWEEN_ROLLS_SEC} сек")
-            self.log("=" * 70)
-
-            def process_one(order_num, idx, roll):
-                prefix = f"[#{order_num:02d}]"
-
-                def prefixed_log(msg):
-                    self.log(f"{prefix} {msg}")
-
-                # Стагер старта: тред N стартует через N*PAUSE сек — предотвращает
-                # одновременный удар по Sync API несколькими потоками
-                stagger = (order_num - 1) * PAUSE_BETWEEN_ROLLS_SEC
-                if stagger > 0:
-                    prefixed_log(f"Жду {stagger} сек перед стартом...")
-                    time.sleep(stagger)
-
-                self._mark_roll_progress(order_num, start=time.time(), end=None)
-                with self._progress_lock:
-                    planned = dict(self._queue_progress.get(order_num, {}))
-                if planned.get("cost") is not None:
-                    prefixed_log(f"Оценка ролика: ≈ ${planned['cost']:.2f} "
-                                 f"({format_estimate_source(planned.get('source'))}), "
-                                 f"время ≈ {format_minutes(planned['range'])}")
-                else:
-                    prefixed_log("Оценка ролика недоступна")
-                try:
-                    self.set_roll_status(idx, f"Обработка {order_num}/{total}")
-                    self._process_single_roll(order_num, idx, roll, batch_dir, prefixed_log)
-                    self.set_roll_status(idx, "Готово")
-                    self._mark_roll_progress(order_num, end=time.time(), state="готово")
-                except Exception as e:
-                    self._mark_roll_progress(order_num, end=time.time(), state="ошибка")
-                    if roll["mode"] == "1 видео":
-                        video_name = Path(roll.get("video_single", "")).name or f"ролик {idx + 1}"
-                    else:
-                        s = Path(roll.get("video_start", "")).name
-                        en = Path(roll.get("video_end", "")).name
-                        video_name = f"{s} + {en}" if (s and en) else f"ролик {idx + 1}"
-
-                    error_text = str(e)
-                    prefixed_log(f"❌ ОШИБКА в '{video_name}': {error_text}")
-                    self.set_roll_status(idx, "Ошибка")
-
-                    with failed_lock:
-                        failed_videos.append({
-                            "video_name": video_name,
-                            "error": error_text,
-                            "roll_id": roll.get("id"),   # для job_id Sync в «Подробнее»
-                        })
-
-            with ThreadPoolExecutor(max_workers=CONCURRENT_ROLLS) as executor:
-                futures = [
-                    executor.submit(process_one, order_num, idx, roll)
-                    for order_num, (idx, roll) in enumerate(valid_rolls, start=1)
-                ]
-                for f in futures:
-                    f.result()
-
-            failed_copy = list(failed_videos)
-            self.log(f"Очередь завершена: успешно {total - len(failed_copy)} из {total}, ошибок {len(failed_copy)}")
-            self.after(0, lambda: self._show_queue_summary(batch_dir, total, failed_copy))
-
+            with self._queue_lock:
+                self._queue_batch_dir = batch_dir
+                self.log(f"Роликов в очереди: {len(self._queue_pending)}")
+                self.log(f"Параллельность: {CONCURRENT_ROLLS} ролика одновременно"
+                         + (f", в Sync — не больше {sync_gen_gate.limit}" if sync_gen_gate.limit else ""))
+                self.log(f"Задержка старта: {PAUSE_BETWEEN_ROLLS_SEC} сек после предыдущего запуска")
+                self.log("=" * 70)
+                self._queue_spawn_workers()
+                idle = self._queue_workers == 0
+                if idle:
+                    self._queue_accepting = False
+            self.after(0, self._schedule_state_save)
+            self.after(0, self._render_queue_panel)      # «Открыть папку» — сразу, как папка создана
+            if idle:
+                self._queue_finish()
         except Exception as e:
             err = str(e)
             self.log(f"ОБЩАЯ ОШИБКА: {err}")
-            self.after(0, lambda: messagebox.showerror("Ошибка", err))
-        finally:
+            with self._queue_lock:
+                self._queue_accepting = False
+                pending = list(self._queue_pending)
+                self._queue_pending = []
+                with self._progress_lock:
+                    ids = [self._queue_progress.get(q, {}).get("roll_id") for q in pending]
+            for rid in ids:
+                self.set_roll_status_by_id(rid, "Ожидает")
             self.is_processing = False
-            self.after(0, lambda: self.start_btn.configure(state="normal", text="НАЧАТЬ ОЧЕРЕДЬ"))
-            self.after(0, self._tick_queue_progress)  # финальное состояние в окне прогресса
+            self.after(0, lambda: messagebox.showerror("Ошибка", err))
+            self.after(0, self._refresh_start_btn)
+            self.after(0, self._tick_queue_progress)
+
+    def _queue_worker(self):
+        """Рабочий поток: берёт следующую ждущую сцену, пока очередь не пуста и не нажато «Остановить»."""
+        last = False
+        while True:
+            with self._queue_lock:
+                if self._queue_stop or not self._queue_pending:
+                    self._queue_workers -= 1
+                    last = self._queue_workers == 0
+                    if last:
+                        self._queue_accepting = False      # дальше добавление — новой партией
+                    break
+                seq = self._queue_pending.pop(0)
+                nn = self._queue_next_nn
+                self._queue_next_nn += 1
+                now = time.time()
+                # Старт не раньше PAUSE после предыдущего запуска — не бьём по Sync одновременно.
+                start_at = max(now, self._queue_last_start + PAUSE_BETWEEN_ROLLS_SEC)
+                self._queue_last_start = start_at
+                self._mark_roll_progress(seq, nn=nn)
+            self._run_queue_item(seq, nn, start_at - now)
+        if last:
+            self._queue_finish()
+
+    def _run_queue_item(self, seq, nn, delay):
+        with self._progress_lock:
+            planned = dict(self._queue_progress.get(seq, {}))
+        roll_id = planned.get("roll_id")
+        roll = next((r for r in list(self.rolls) if r["id"] == roll_id), None)
+        prefix = f"[#{nn:02d}]"
+
+        def prefixed_log(msg):
+            self.log(f"{prefix} {msg}")
+
+        if roll is None:
+            prefixed_log("Сцена удалена — пропускаю")
+            self._mark_roll_progress(seq, start=time.time(), end=time.time(), state="ошибка")
+            return
+        if delay > 0:
+            prefixed_log(f"Жду {delay:.0f} сек перед стартом...")
+            time.sleep(delay)
+        self._mark_roll_progress(seq, start=time.time(), end=None)
+        if planned.get("cost") is not None:
+            prefixed_log(f"Оценка ролика: ≈ ${planned['cost']:.2f} "
+                         f"({format_estimate_source(planned.get('source'))}), "
+                         f"время ≈ {format_minutes(planned['range'])}")
+        else:
+            prefixed_log("Оценка ролика недоступна")
+        idx = next((i for i, r in enumerate(list(self.rolls)) if r["id"] == roll_id), 0)
+        try:
+            self.set_roll_status_by_id(roll_id, f"Обработка #{nn:02d}")
+            files = self._process_single_roll(nn, idx, roll, self._queue_batch_dir, prefixed_log) or []
+            self.set_roll_status_by_id(roll_id, "Готово")
+            self._mark_roll_progress(seq, end=time.time(), state="готово", files=list(files))
+        except Exception as e:
+            self._mark_roll_progress(seq, end=time.time(), state="ошибка")
+            if roll["mode"] == "1 видео":
+                video_name = Path(roll.get("video_single", "")).name or f"ролик {idx + 1}"
+            else:
+                s_name = Path(roll.get("video_start", "")).name
+                e_name = Path(roll.get("video_end", "")).name
+                video_name = f"{s_name} + {e_name}" if (s_name and e_name) else f"ролик {idx + 1}"
+            error_text = str(e)
+            prefixed_log(f"❌ ОШИБКА в '{video_name}': {error_text}")
+            self.set_roll_status_by_id(roll_id, "Ошибка")
+            with self._queue_lock:
+                self._queue_failed.append({"video_name": video_name, "error": error_text, "roll_id": roll_id})
+
+    def _queue_finish(self):
+        """Последний рабочий поток: итог партии, кнопка, панель."""
+        with self._queue_lock:
+            batch_dir = self._queue_batch_dir
+            failed = list(self._queue_failed)
+            with self._progress_lock:
+                total = sum(1 for p in self._queue_progress.values() if p.get("end"))
+        self.log(f"Очередь завершена: успешно {total - len(failed)} из {total}, ошибок {len(failed)}")
+        self.is_processing = False
+        self.after(0, lambda: self._show_queue_summary(batch_dir, total, failed))
+        self.after(0, self._refresh_start_btn)
+        self.after(0, self._tick_queue_progress)      # финальное состояние панели хода
 
     def _show_queue_summary(self, batch_dir, total, failed):
         """Итог очереди — строкой в панели хода очереди. Не модально, папку сам не открывает,
@@ -12075,6 +12261,8 @@ class LipsyncTwoModeApp(_BaseApp):
         w["toggle"] = ctk.CTkButton(head, text="Развернуть", width=100, command=self._qp_toggle, **small)
         w["toggle"].pack(side="right", padx=(6, 6))
         w["folder"] = ctk.CTkButton(head, text="Открыть папку", width=120, command=self._qp_open_folder, **small)
+        w["stop"] = ctk.CTkButton(head, text="Остановить после текущего", width=200,
+                                  command=self._queue_request_stop, **small)
         w["details_btn"] = ctk.CTkButton(head, text="Подробнее", width=100, command=self._qp_toggle_details, **small)
         mono = ctk.CTkFont(family="Courier New", size=12)
         # Подробности итога: ошибки с причинами и job_id, текст копируется
@@ -12086,9 +12274,12 @@ class LipsyncTwoModeApp(_BaseApp):
                       command=lambda: self._qp_copy(w["details_box"]), **small).pack(anchor="e", padx=12, pady=(4, 6))
         # Развёрнутая часть: строки роликов и лог
         w["body"] = ctk.CTkFrame(qp, fg_color="transparent")
-        w["rolls"] = ctk.CTkTextbox(w["body"], height=60, fg_color=BG, text_color=TEXT, font=mono,
-                                    corner_radius=8, wrap="none")
+        # Строки роликов: у ждущих — «Убрать из очереди», у готовых — «Показать в папке» и «Открыть».
+        w["rolls"] = ctk.CTkScrollableFrame(w["body"], height=90, fg_color=BG, corner_radius=8)
         w["rolls"].pack(fill="x", padx=12, pady=(0, 6))
+        w["rolls_empty"] = self.label(w["rolls"], "Очередь не запускалась", size=12, color=MUTED)
+        w["mono"] = mono
+        self._qp_row_w = {}
         w["log"] = ctk.CTkTextbox(w["body"], height=120, fg_color="#111111", text_color="#e5e5e5", font=mono,
                                   corner_radius=8)
         w["log"].pack(fill="both", expand=True, padx=12)
@@ -12137,8 +12328,68 @@ class LipsyncTwoModeApp(_BaseApp):
         self._qp_details_open = not self._qp_details_open
         self._render_queue_panel()
 
+    def _qp_render_rows(self):
+        """Строки роликов — виджеты создаются один раз на строку; кнопки пересобираются при смене состояния."""
+        w = self._qp_w
+        rows = self._qp_rows()
+        with self._queue_lock:
+            pending = set(self._queue_pending) if self.is_processing else set()
+        seqs = {r[0] for r in rows}
+        for seq in [q for q in self._qp_row_w if q not in seqs]:
+            self._qp_row_w.pop(seq)["frame"].destroy()
+        if rows and w["rolls_empty"].winfo_manager():
+            w["rolls_empty"].pack_forget()
+        elif not rows and not w["rolls_empty"].winfo_manager():
+            w["rolls_empty"].pack(anchor="w", padx=6, pady=4)
+        small = dict(height=22, corner_radius=8, font=ctk.CTkFont(size=11), fg_color=BTN, hover_color=BTN_HOVER,
+                     text_color=TEXT)
+        for seq, icon, title, status, p in rows:
+            nn = p.get("nn")
+            text = f"{icon} #{nn:02d} {title} — {status}" if nn else f"{icon} #-- {title} — {status}"
+            files = tuple(f for f in (p.get("files") or ()) if f)
+            kind = "pending" if seq in pending else ("done" if files and p.get("state") == "готово" else "other")
+            entry = self._qp_row_w.get(seq)
+            if entry is None:
+                frame = ctk.CTkFrame(w["rolls"], fg_color="transparent")
+                frame.pack(fill="x")
+                lbl = ctk.CTkLabel(frame, text="", anchor="w", font=w["mono"], text_color=TEXT)
+                lbl.pack(side="left", padx=(4, 8))
+                entry = self._qp_row_w[seq] = {"frame": frame, "label": lbl, "sig": None, "btns": []}
+            if entry["label"].cget("text") != text:
+                entry["label"].configure(text=text)
+            sig = (kind, files)
+            if entry["sig"] == sig:
+                continue
+            for b in entry["btns"]:
+                b.destroy()
+            btns = []
+            if kind == "pending":
+                btns.append(ctk.CTkButton(entry["frame"], text="Убрать из очереди", width=140,
+                                          command=lambda rid=p.get("roll_id"): self._queue_remove_roll(rid), **small))
+            elif kind == "done":
+                btns.append(ctk.CTkButton(entry["frame"], text="Показать в папке", width=130,
+                                          command=lambda f=files[0]: self._qp_file_action(reveal_in_file_manager, f),
+                                          **small))
+                names = ["Открыть"] if len(files) == 1 else ["Открыть начало", "Открыть конец"][:len(files)]
+                for f, name in zip(files, names):
+                    btns.append(ctk.CTkButton(entry["frame"], text=name, width=110,
+                                              command=lambda f=f: self._qp_file_action(open_folder, f), **small))
+            for b in btns:
+                b.pack(side="left", padx=(0, 4))
+            entry["sig"], entry["btns"] = sig, btns
+
+    def _qp_file_action(self, action, path):
+        if not os.path.exists(path):
+            messagebox.showwarning("Файл не найден", f"Файла уже нет:\n{path}", parent=self)
+            return
+        try:
+            action(path)
+        except Exception as e:
+            messagebox.showerror("Не удалось открыть", f"{type(e).__name__}: {e}", parent=self)
+
     def _qp_open_folder(self):
-        folder = (self._queue_summary or {}).get("batch_dir") or self._queue_batch_dir
+        folder = (self._queue_batch_dir if self.is_processing else None) or \
+            (self._queue_summary or {}).get("batch_dir") or self._queue_batch_dir
         if folder:
             open_folder(folder)
 
@@ -12170,6 +12421,7 @@ class LipsyncTwoModeApp(_BaseApp):
 
     # Данные
     def _qp_rows(self):
+        """[(номер строки, значок, название, статус, данные)] в порядке добавления; NN — в данных («nn»)."""
         now = time.time()
         with self._progress_lock:
             items = sorted((k, dict(v)) for k, v in self._queue_progress.items())
@@ -12195,7 +12447,7 @@ class LipsyncTwoModeApp(_BaseApp):
         rows = self._qp_rows()
         total = len(rows)
         done = sum(1 for r in rows if r[4].get("end"))
-        running = [r[0] for r in rows if r[4].get("start") and not r[4].get("end")]
+        running = [r[4].get("nn") or r[0] for r in rows if r[4].get("start") and not r[4].get("end")]
         frac, remaining = float(done), []
         for _order, _icon, _title, _status, p in rows:
             if p.get("end"):
@@ -12248,9 +12500,14 @@ class LipsyncTwoModeApp(_BaseApp):
             w["bar"].set(0)
             w["eta"].configure(text="")
         has_summary = summary is not None and not self.is_processing
-        folder = (summary or {}).get("batch_dir") or self._queue_batch_dir
-        for key, show, side_opts in (("folder", bool(folder) and has_summary, {"side": "right", "padx": (6, 0)}),
-                                     ("details_btn", has_summary, {"side": "right", "padx": (6, 0)})):
+        folder = self._queue_batch_dir if self.is_processing else ((summary or {}).get("batch_dir")
+                                                                    or self._queue_batch_dir)
+        w["stop"].configure(text="Останавливаюсь…" if self._queue_stop else "Остановить после текущего",
+                            state="disabled" if self._queue_stop else "normal")
+        for key, show, side_opts in (("folder", bool(folder) and (has_summary or self.is_processing),
+                                      {"side": "right", "padx": (6, 0)}),
+                                     ("details_btn", has_summary, {"side": "right", "padx": (6, 0)}),
+                                     ("stop", self.is_processing, {"side": "right", "padx": (6, 0)})):
             if show and not w[key].winfo_manager():
                 w[key].pack(before=w["toggle"], **side_opts)
             elif not show and w[key].winfo_manager():
@@ -12276,13 +12533,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 w["body"].pack(fill="both", expand=True)
                 self._qp_fit_height()
                 self._qp_sync_log(force=True)
-            lines = "\n".join(f"{icon} #{order:02d} {title} — {status}"
-                              for order, icon, title, status, _p in self._qp_rows())
-            if w["rolls"].get("1.0", "end").rstrip("\n") != lines:
-                w["rolls"].configure(state="normal")
-                w["rolls"].delete("1.0", "end")
-                w["rolls"].insert("1.0", lines or "Очередь не запускалась")
-                w["rolls"].configure(state="disabled")
+            self._qp_render_rows()
         elif w["body"].winfo_manager():
             w["body"].pack_forget()
         f = w["folder2"]
@@ -12400,6 +12651,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self._schedule_state_save()  # вызывается после любых изменений роликов
         valid, _ = self.validate_rolls()
         queue_estimate = self._queue_estimate_text()
+        self._refresh_start_btn()
         self.status_label.configure(
             text=f"к запуску: {len(valid)} | всего роликов: {len(self.rolls)}"
                  + (f" | {queue_estimate}" if queue_estimate else ""))
