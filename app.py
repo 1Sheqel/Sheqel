@@ -2656,16 +2656,40 @@ COMPRESS_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", 
 COMPRESS_SUFFIX = "_compressed"
 COMPRESS_DIR_NAME = "compressed"
 COMPRESS_TMP_SUFFIX = ".compressing.mp4"
+COMPRESS_AD_PRESET = "Для рекламы — максимум качества"
+COMPRESS_HQ_PRESET = "Высокое качество — для монтажа и Sync"
+COMPRESS_BALANCED_PRESET = "Сбалансированно — для отправки и соцсетей"
+COMPRESS_SMALL_PRESET = "Маленький файл — для чата и предпросмотра"
+COMPRESS_LIMIT_PRESET = "Не больше 95 МБ — для Cloudinary"
+COMPRESS_EXACT_PRESET = "Точный размер файла (МБ)"
 COMPRESS_PRESETS = {
-    "Под лимит (для Cloudinary)": ("target", None),
-    "Высокое качество (CRF 20)": ("crf", 20),
-    "Баланс (CRF 23)": ("crf", 23),
-    "Маленький (CRF 27)": ("crf", 27),
-    "Свой размер, МБ": ("target", None),
+    COMPRESS_AD_PRESET: ("ad", 18),
+    COMPRESS_HQ_PRESET: ("crf", 20),
+    COMPRESS_BALANCED_PRESET: ("crf", 23),
+    COMPRESS_SMALL_PRESET: ("crf", 27),
+    COMPRESS_LIMIT_PRESET: ("target", None),
+    COMPRESS_EXACT_PRESET: ("target", None),
 }
-COMPRESS_LIMIT_PRESET = "Под лимит (для Cloudinary)"
-COMPRESS_DEFAULT_PRESET = "Высокое качество (CRF 20)"
-COMPRESS_PRESET_ALIASES = {"Под лимит": COMPRESS_LIMIT_PRESET}   # имена из прошлых версий
+COMPRESS_DEFAULT_PRESET = COMPRESS_AD_PRESET        # только для тех, у кого выбор ещё не сохранён
+COMPRESS_PRESET_ALIASES = {                         # имена из прошлых версий → нынешние
+    "Под лимит": COMPRESS_LIMIT_PRESET, "Под лимит (для Cloudinary)": COMPRESS_LIMIT_PRESET,
+    "Высокое качество (CRF 20)": COMPRESS_HQ_PRESET, "Баланс (CRF 23)": COMPRESS_BALANCED_PRESET,
+    "Маленький (CRF 27)": COMPRESS_SMALL_PRESET, "Свой размер, МБ": COMPRESS_EXACT_PRESET,
+}
+COMPRESS_PRESET_DETAILS = {
+    COMPRESS_AD_PRESET: "H.264 High, CRF 18, x264 slow, BT.709, ключевой кадр каждые 2 с, AAC 192k/48 кГц "
+                        "(AAC исходника копируется). Разрешение и fps — как в исходнике. Медленно, но без компромиссов.",
+    COMPRESS_HQ_PRESET: "H.264, CRF 20: на глаз почти не отличить от оригинала.",
+    COMPRESS_BALANCED_PRESET: "H.264, CRF 23: заметно меньше, потери видны только при сравнении.",
+    COMPRESS_SMALL_PRESET: "H.264, CRF 27: файл в разы меньше, качество ниже — для чата и предпросмотра.",
+    COMPRESS_LIMIT_PRESET: "2 прохода, итог не больше 95 МБ — Cloudinary принимает файлы до 100 МБ.",
+    COMPRESS_EXACT_PRESET: "2 прохода, итог ≈ заданному размеру (±10%). Пусто — около 50% размера каждого файла.",
+}
+COMPRESS_EXACT_AUTO_SHARE = 0.5      # «Точный размер» без числа: половина размера файла
+COMPRESS_AD_X264_PRESET = "slow"
+COMPRESS_AD_AAC_KBPS = 192
+COMPRESS_AD_GOP_SEC = 2
+COMPRESS_AD_MAX_BPP = 0.3            # потолок пиков: 0.3 бит на пиксель (1080p30 ≈ 19 Мбит/с)
 COMPRESS_PRESET_HINT = ("Sync принимает большие файлы (до 5 ГБ с учётом тарифа; проверено 521 МБ), сжимать для "
                         "него обычно не нужно. «Под лимит» нужен для Cloudinary — он берёт файлы до 100 МБ.")
 COMPRESS_CFR_VALUES = ("30", "25")
@@ -2934,15 +2958,23 @@ def hdr_to_sdr_method():
 
 
 def default_compress_settings():
-    return {"preset": COMPRESS_DEFAULT_PRESET, "target_mb": COMPRESS_DEFAULT_LIMIT_MB, "resolution": "source",
-            "fps": "source", "audio": "copy", "codec": "h264", "fast": False, "hdr_mode": "sdr",
-            "out_dir": "", "cfr": None, "cfr_fps": "30"}
+    return {"preset": COMPRESS_DEFAULT_PRESET, "target_mb": COMPRESS_DEFAULT_LIMIT_MB, "exact_mb": None,
+            "resolution": "source", "fps": "source", "audio": "copy", "codec": "h264", "fast": False,
+            "hdr_mode": "sdr", "out_dir": "", "cfr": None, "cfr_fps": "30", "ssim": True}
 
 
 def normalize_compress_settings(settings):
-    """Настройки из state.json прошлых версий: старые имена пресетов, недостающие поля."""
-    s = dict(default_compress_settings(), **(settings or {}))
+    """Настройки из state.json прошлых версий: старые имена пресетов, недостающие поля.
+    Сохранённый пресет не меняется (только переименовывается); «Для рекламы» — умолчание для новых."""
+    saved = dict(settings or {})
+    s = dict(default_compress_settings(), **saved)
+    if saved.get("preset") == "Свой размер, МБ" and "exact_mb" not in saved and saved.get("target_mb"):
+        s["exact_mb"] = saved["target_mb"]           # размер из прошлой версии — к «Точному размеру»
     s["preset"] = COMPRESS_PRESET_ALIASES.get(s["preset"], s["preset"])
+    try:
+        s["exact_mb"] = float(s["exact_mb"]) if s.get("exact_mb") not in (None, "") else None
+    except (TypeError, ValueError):
+        s["exact_mb"] = None
     if s["preset"] not in COMPRESS_PRESETS:
         s["preset"] = COMPRESS_DEFAULT_PRESET
     if str(s.get("cfr_fps")) not in COMPRESS_CFR_VALUES:
@@ -2959,10 +2991,17 @@ def compress_target_kbps(info, target_mb, audio_kbps, strict):
     return (total_bits - audio_bits) / duration / 1000
 
 
+def compress_exact_auto_mb(info):
+    return round(info["size"] / MB * COMPRESS_EXACT_AUTO_SHARE, 1)
+
+
 def compress_plan(info, settings, encoders=None, works=None, platform_name=None, sdr_method="auto"):
     """Что и как кодировать для файла: кодировщик, фильтры, звук, битрейт или качество, предупреждения."""
     settings = normalize_compress_settings(settings)
     kind, crf = COMPRESS_PRESETS[settings["preset"]]
+    ad = kind == "ad"
+    if ad:   # «Для рекламы»: только x264, разрешение и fps исходника, SDR
+        settings = dict(settings, codec="h264", fast=False, resolution="source", fps="source", hdr_mode="sdr")
     codec = settings.get("codec", "h264")
     warnings = []
     ten_bit = False
@@ -3019,7 +3058,13 @@ def compress_plan(info, settings, encoders=None, works=None, platform_name=None,
     audio_mode = settings.get("audio", "copy")
     audio_kbps = 0
     audio_args = []
-    if info["has_audio"]:
+    if info["has_audio"] and ad:
+        if info["audio_codec"] == "aac":
+            audio_args, audio_kbps = ["-c:a", "copy"], info.get("audio_kbps") or COMPRESS_AD_AAC_KBPS
+        else:
+            audio_args = ["-c:a", "aac", "-b:a", f"{COMPRESS_AD_AAC_KBPS}k", "-ar", "48000"]
+            audio_kbps = COMPRESS_AD_AAC_KBPS
+    elif info["has_audio"]:
         if audio_mode == "copy" and info["audio_codec"] in COMPRESS_MP4_AUDIO_COPY:
             audio_args = ["-c:a", "copy"]
             audio_kbps = info.get("audio_kbps") or COMPRESS_AAC_KBPS
@@ -3034,10 +3079,18 @@ def compress_plan(info, settings, encoders=None, works=None, platform_name=None,
             "out_w": out_w, "out_h": out_h, "out_fps": out_fps, "hdr_out": info.get("hdr") if ten_bit else None,
             "color_transfer": info.get("color_transfer"), "warnings": warnings, "video_kbps": None,
             "cfr": bool(target_fps),
-            "target_mb": None, "strict": False}
+            "target_mb": None, "strict": False, "ad": ad}
+    if ad:
+        fps_for_cap = out_fps or 30
+        plan.update(x264_preset=COMPRESS_AD_X264_PRESET, profile="high", gop_sec=COMPRESS_AD_GOP_SEC,
+                    maxrate_kbps=int(out_w * out_h * fps_for_cap * COMPRESS_AD_MAX_BPP / 1000))
+        if ten_bit:
+            warnings.append("Для рекламы лучше H.264 SDR, но перевести HDR в SDR этим ffmpeg нельзя — "
+                            "сохраняю HDR в 10-bit HEVC.")
     if kind == "target":
-        target_mb = float(settings.get("target_mb") or COMPRESS_DEFAULT_LIMIT_MB)
         strict = settings["preset"] == COMPRESS_LIMIT_PRESET
+        target_mb = (COMPRESS_DEFAULT_LIMIT_MB if strict
+                     else float(settings.get("exact_mb") or compress_exact_auto_mb(info)))
         kbps = compress_target_kbps(info, target_mb, audio_kbps, strict)
         # Битрейт выше исходного не нужен: файл только вырос бы. Тогда кодируем с битрейтом исходника.
         source_kbps = (info.get("bitrate_kbps") or info["size"] * 8 / max(info["duration"], 0.1) / 1000)
@@ -3110,7 +3163,10 @@ def build_compress_cmd(src, dst, plan, video_kbps=None, pass_no=None, passlog="s
     cmd += ["-vf", ",".join(plan["filters"]), "-c:v", plan["encoder"]]
     enc = plan["encoder"]
     if enc == "libx264":
-        cmd += ["-preset", COMPRESS_X264_PRESET]
+        cmd += ["-preset", plan.get("x264_preset") or COMPRESS_X264_PRESET]
+        if plan.get("ad"):
+            cmd += ["-profile:v", "high",
+                    "-force_key_frames", f"expr:gte(t,n_forced*{plan.get('gop_sec') or COMPRESS_AD_GOP_SEC})"]
     if enc == "libx265":
         cmd += ["-preset", COMPRESS_X264_PRESET]
     if video_kbps:
@@ -3118,6 +3174,9 @@ def build_compress_cmd(src, dst, plan, video_kbps=None, pass_no=None, passlog="s
         cmd += ["-b:v", f"{kb}k", "-maxrate", f"{int(kb * 1.5)}k", "-bufsize", f"{kb * 2}k"]
     else:
         cmd += _encoder_quality_args(plan)
+        if plan.get("maxrate_kbps"):      # CRF с потолком пиков — рекламные кабинеты не любят выбросы
+            mr = int(plan["maxrate_kbps"])
+            cmd += ["-maxrate", f"{mr}k", "-bufsize", f"{mr * 2}k"]
     x265_params = ["log-level=error"]
     if plan["ten_bit"]:
         cmd += ["-color_primaries", "bt2020", "-color_trc", plan.get("color_transfer") or "smpte2084",
@@ -3126,8 +3185,13 @@ def build_compress_cmd(src, dst, plan, video_kbps=None, pass_no=None, passlog="s
             x265_params += ["hdr10=1", "repeat-headers=1"]
         if enc.endswith("_videotoolbox"):
             cmd += ["-profile:v", "main10"]
-    elif plan["filters"] and any(f.startswith(("scale=out_transfer", "zscale")) for f in plan["filters"]):
+    elif plan.get("ad") or (plan["filters"] and any(f.startswith(("scale=out_transfer", "zscale"))
+                                                    for f in plan["filters"])):
         cmd += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+        if enc == "libx264":
+            # Флаги -color_* до libx264 доходят не во всех сборках ffmpeg (8.x пишет только colorspace) —
+            # метки в самом потоке H.264 задаём явно.
+            cmd += ["-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709"]
     if enc == "libx265" and pass_no:
         x265_params += [f"pass={pass_no}", f"stats={passlog}.x265.log"]
     elif pass_no:
@@ -7089,8 +7153,10 @@ class LipsyncTwoModeApp(_BaseApp):
         preset_hint.configure(wraplength=520)
         preset_hint.grid(row=1, column=1, sticky="w", pady=(0, 4))
         self.label(grid, "Размер, МБ", size=12, color=MUTED).grid(row=2, column=0, sticky="w", pady=4)
-        size_entry = ctk.CTkEntry(grid, width=90, height=28, font=ctk.CTkFont(size=12))
-        size_entry.insert(0, f"{settings['target_mb']:g}")
+        size_entry = ctk.CTkEntry(grid, width=110, height=28, font=ctk.CTkFont(size=12),
+                                  placeholder_text="≈50% файла")
+        if settings.get("exact_mb"):
+            size_entry.insert(0, f"{settings['exact_mb']:g}")
         size_entry.grid(row=2, column=1, sticky="w", pady=4)
         menu(3, "Разрешение", self.COMPRESS_RES_LABELS, settings["resolution"], "resolution", self.COMPRESS_RES_LABELS)
         menu(4, "Частота кадров", self.COMPRESS_FPS_LABELS, settings["fps"], "fps", self.COMPRESS_FPS_LABELS)
@@ -7114,9 +7180,10 @@ class LipsyncTwoModeApp(_BaseApp):
         hdr_menu = menu(8, "HDR-файлы", self.COMPRESS_HDR_LABELS, settings["hdr_mode"], "hdr_mode",
                         self.COMPRESS_HDR_LABELS)
         fast_var = ctk.BooleanVar(value=bool(settings["fast"]))
-        ctk.CTkCheckBox(card, text="Быстрее (хуже качество) — аппаратный кодировщик", variable=fast_var,
-                        text_color=TEXT, font=ctk.CTkFont(size=12),
-                        command=lambda: on_setting("fast", bool(fast_var.get()))).pack(anchor="w", padx=20, pady=(4, 2))
+        fast_cb = ctk.CTkCheckBox(card, text="Быстрее (хуже качество) — аппаратный кодировщик", variable=fast_var,
+                                  text_color=TEXT, font=ctk.CTkFont(size=12),
+                                  command=lambda: on_setting("fast", bool(fast_var.get())))
+        fast_cb.pack(anchor="w", padx=20, pady=(4, 2))
         fast_hint = self.label(card, COMPRESS_FAST_HINT, size=11, color=MUTED)
         fast_hint.configure(wraplength=640)
         fast_hint.pack(anchor="w", fill="x", padx=20, pady=(0, 4))
@@ -7152,15 +7219,21 @@ class LipsyncTwoModeApp(_BaseApp):
             render_compress()
 
         def on_size(_e=None):
+            text = size_entry.get().strip().replace(",", ".")
+            if not text:
+                on_setting("exact_mb", None)             # пусто — около 50% каждого файла
+                return
             try:
-                value = float(size_entry.get().replace(",", "."))
+                value = float(text)
                 if value <= 0:
                     raise ValueError
             except ValueError:
                 size_entry.delete(0, "end")
-                size_entry.insert(0, f"{self._compress_settings()['target_mb']:g}")
+                current = self._compress_settings().get("exact_mb")
+                if current:
+                    size_entry.insert(0, f"{current:g}")
                 return
-            on_setting("target_mb", value)
+            on_setting("exact_mb", value)
 
         size_entry.bind("<Return>", on_size)
         size_entry.bind("<FocusOut>", on_size)
@@ -7292,7 +7365,13 @@ class LipsyncTwoModeApp(_BaseApp):
             show(empty_lbl, not files, anchor="w", padx=8, pady=8)
 
             # Настройки
-            size_entry.configure(state="normal" if kind == "target" else "disabled")
+            exact = settings["preset"] == COMPRESS_EXACT_PRESET
+            size_entry.configure(state="normal" if exact else "disabled")
+            preset_hint.configure(text=COMPRESS_PRESET_DETAILS.get(settings["preset"], "") + "\n" + COMPRESS_PRESET_HINT)
+            ad_locked = kind == "ad"                     # «Для рекламы»: исходные разрешение и fps, x264
+            for key in ("resolution", "fps", "codec"):
+                menus[key].configure(state="disabled" if ad_locked else "normal")
+            fast_cb.configure(state="disabled" if ad_locked else "normal")
             any_hdr = any((self._compress_info.get(p) or {}).get("hdr") for p in files)
             sdr = hdr_to_sdr_method() if caps else None
             hdr_menu.configure(state="normal" if any_hdr else "disabled")
@@ -7408,7 +7487,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 w["keep"].configure(command=(lambda i=keep_id: keep_original(i)))
                 show(w["keep"], bool(keep_id), side="right", padx=4)
                 w["remove"].configure(state="disabled" if running else "normal")
-            if kind == "crf" and est_items and not running:
+            if kind in ("crf", "ad") and est_items and not running:
                 self._compress_request_estimates(est_items)
 
             # Общий прогресс
