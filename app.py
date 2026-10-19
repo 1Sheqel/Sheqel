@@ -1366,10 +1366,264 @@ def eleven_voice_settings(model_id):
     return settings
 
 
-def text_to_speech_mp3(text, voice_id, output_mp3, log, model_id=None, language_code=None):
+# ── Эффекты звука ElevenLabs (audio_effects) ───────────────────────────────
+# Документация TTS: filter_preset_id, distance 0–1 (0 — близко, без изменений), environment_id, send_level 0–1
+# (только с environment_id), background_noise_id (громкости шума в API нет), pan −1…1. Цена не меняется.
+# Реверберация и панорама дают стерео; для ulaw_/alaw_/pcm_ это 400, поэтому эффекты уходят только с mp3_*.
+AUDIO_EFFECTS_CATALOG_URL = f"{ELEVEN_BASE_URL}/v1/audio-effects/catalog"
+AUDIO_EFFECTS_CACHE_NAME = "audio_effects_catalog.json"
+AUDIO_EFFECTS_TTL_SEC = 24 * 3600
+AUDIO_EFFECT_GROUPS = (("filter", "filter_presets", "filter_preset_id"),
+                       ("environment", "environments", "environment_id"),
+                       ("noise", "background_noises", "background_noise_id"))
+AUDIO_EFFECTS_DEFAULTS = {"filter": None, "environment": None, "send_level": 0.5, "distance": 0.0,
+                          "noise": None, "pan": 0.0}
+AUDIO_EFFECTS_TARGETS = {"к обоим": "both", "только A": "A", "только B": "B"}
+AUDIO_EFFECTS_TARGET_DEFAULT = "B"           # сравнить с чистым вариантом A
+AUDIO_EFFECTS_DISTANCE_MARKS = (("Близко", 0.0), ("Средне", 0.5), ("Далеко", 1.0))   # наше соглашение
+AUDIO_EFFECTS_PREVIEW_TEXT = "Проверка эффекта: так звучит мой голос."
+AUDIO_EFFECTS_PRESETS_MAX = 30
+AUDIO_EFFECT_FIELDS = {"filter_preset_id": "фильтр", "environment_id": "пространство",
+                       "background_noise_id": "фоновый шум", "distance": "расстояние", "send_level": "уровень",
+                       "pan": "панорама", "audio_effects": "эффекты"}
+SPLIT_PAUSE_HINT = "шум или реверберация мешают разделению, отключите эффект или разделите вручную"
+
+
+def audio_effects_cache_path():
+    return os.path.join(APP_DATA_DIR, AUDIO_EFFECTS_CACHE_NAME)
+
+
+def parse_audio_effects_catalog(data):
+    """Ответ каталога → {"filter": [...], "environment": [...], "noise": [...]}; элемент {id, name, description}.
+    Порядок и названия — как в каталоге. Элементы без id или имени отбрасываются."""
+    if not isinstance(data, dict):
+        raise ValueError("каталог эффектов: не объект")
+    out = {}
+    for key, group, id_field in AUDIO_EFFECT_GROUPS:
+        items = data.get(group)
+        if not isinstance(items, list):
+            raise ValueError(f"каталог эффектов: нет списка {group}")
+        seen, clean = set(), []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            eid, name = str(item.get(id_field) or "").strip(), str(item.get("name") or "").strip()
+            if not eid or not name or eid in seen:
+                continue
+            seen.add(eid)
+            desc = item.get("description")
+            clean.append({"id": eid, "name": name, "description": str(desc).strip() if desc else ""})
+        out[key] = clean
+    return out
+
+
+def audio_effects_catalog_empty(catalog):
+    return not catalog or not any(catalog.get(k) for k, _, _ in AUDIO_EFFECT_GROUPS)
+
+
+def fetch_audio_effects_catalog(api_key, get=None, timeout=20):
+    """GET каталога с ключом в заголовке. Ошибка — RuntimeError только с кодом (без тела и ключа)."""
+    get = get or requests.get
+    try:
+        res = get(AUDIO_EFFECTS_CATALOG_URL, headers={"xi-api-key": api_key}, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"каталог эффектов недоступен ({type(e).__name__})")
+    if res.status_code != 200:
+        raise RuntimeError(f"каталог эффектов: HTTP {res.status_code}")
+    try:
+        return parse_audio_effects_catalog(res.json())
+    except ValueError as e:
+        raise RuntimeError(str(e))
+
+
+def load_audio_effects_cache(path=None):
+    """(каталог, время получения) или (None, 0)."""
+    try:
+        with open(path or audio_effects_cache_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return parse_audio_effects_catalog(data["catalog_raw"]), float(data.get("fetched_at") or 0)
+    except Exception:
+        return None, 0.0
+
+
+def save_audio_effects_cache(catalog, path=None, now=None):
+    """Кэш в ~/.sheqelmotion (0600), с датой. Хранится в виде ответа API — тот же разбор при чтении."""
+    raw = {group: [{id_field: i["id"], "name": i["name"], "description": i["description"] or None}
+                   for i in catalog.get(key, [])] for key, group, id_field in AUDIO_EFFECT_GROUPS}
+    path = path or audio_effects_cache_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open_private(tmp) as f:
+        json.dump({"fetched_at": now or time.time(), "catalog_raw": raw}, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def audio_effects_cache_stale(fetched_at, now=None):
+    return (now or time.time()) - float(fetched_at or 0) > AUDIO_EFFECTS_TTL_SEC
+
+
+def _clamp(value, lo, hi, default):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if v != v else max(lo, min(hi, v))      # NaN → по умолчанию
+
+
+def normalize_audio_effects(spec, catalog=None):
+    """Полный набор полей с умолчаниями и границами. id, которых нет в каталоге, сбрасываются."""
+    spec = spec if isinstance(spec, dict) else {}
+    out = dict(AUDIO_EFFECTS_DEFAULTS)
+    for key, _, _ in AUDIO_EFFECT_GROUPS:
+        eid = spec.get(key)
+        eid = str(eid).strip() if eid else None
+        if eid and catalog is not None and eid not in {i["id"] for i in catalog.get(key, [])}:
+            eid = None
+        out[key] = eid or None
+    out["send_level"] = round(_clamp(spec.get("send_level"), 0.0, 1.0, AUDIO_EFFECTS_DEFAULTS["send_level"]), 2)
+    out["distance"] = round(_clamp(spec.get("distance"), 0.0, 1.0, 0.0), 2)
+    out["pan"] = round(_clamp(spec.get("pan"), -1.0, 1.0, 0.0), 2)
+    return out
+
+
+def audio_effects_active(spec):
+    s = normalize_audio_effects(spec)
+    return bool(s["filter"] or s["environment"] or s["noise"] or s["distance"] > 0 or s["pan"] != 0)
+
+
+def audio_effects_reverb(spec):
+    s = normalize_audio_effects(spec)
+    return bool(s["environment"] and s["send_level"] > 0)
+
+
+def build_audio_effects_payload(spec, output_format=None):
+    """Тело audio_effects для запроса TTS или None: ничего не выбрано или формат не mp3."""
+    output_format = output_format or ELEVEN_OUTPUT_FORMAT
+    if not str(output_format).startswith("mp3_") or not audio_effects_active(spec):
+        return None
+    s = normalize_audio_effects(spec)
+    payload = {}
+    if s["filter"]:
+        payload["filter_preset_id"] = s["filter"]
+    if s["environment"]:
+        payload["environment_id"] = s["environment"]
+        payload["send_level"] = s["send_level"]
+    if s["distance"] > 0:
+        payload["distance"] = s["distance"]
+    if s["noise"]:
+        payload["background_noise_id"] = s["noise"]
+    if s["pan"] != 0:
+        payload["pan"] = s["pan"]
+    return payload
+
+
+def audio_effects_for_slot(spec, target, slot):
+    """Эффекты для варианта A/B по режиму «к обоим / только A / только B»; None — вариант без эффектов."""
+    if target not in ("both", "A", "B"):
+        target = AUDIO_EFFECTS_TARGET_DEFAULT
+    return spec if (target == "both" or target == slot) and audio_effects_active(spec) else None
+
+
+def audio_effects_summary(spec, catalog=None):
+    """Коротко для карточки и заголовка блока: «Old Radio · Small Room 50% · расстояние 0.5 · Café · панорама Л 0.3»."""
+    s = normalize_audio_effects(spec)
+    names = {k: {i["id"]: i["name"] for i in (catalog or {}).get(k, [])} for k, _, _ in AUDIO_EFFECT_GROUPS}
+    parts = []
+    if s["filter"]:
+        parts.append(names["filter"].get(s["filter"], s["filter"]))
+    if s["environment"]:
+        parts.append(f"{names['environment'].get(s['environment'], s['environment'])} {round(s['send_level'] * 100)}%")
+    if s["distance"] > 0:
+        parts.append(f"расстояние {s['distance']:g}")
+    if s["noise"]:
+        parts.append(names["noise"].get(s["noise"], s["noise"]))
+    if s["pan"] != 0:
+        parts.append(f"панорама {'Л' if s['pan'] < 0 else 'П'} {abs(s['pan']):g}")
+    return " · ".join(parts)
+
+
+class AudioEffectsError(RuntimeError):
+    """ElevenLabs не принял эффект. В тексте — только код и имя поля, без тела ответа."""
+
+    def __init__(self, status, param=""):
+        self.status, self.param = status, param
+        field = AUDIO_EFFECT_FIELDS.get(param.split(".")[-1], "") if param else ""
+        super().__init__(f"Эффект не принят ElevenLabs: {field or 'эффекты'} (HTTP {status})")
+
+
+def audio_effects_error_from_response(status, body_text):
+    """AudioEffectsError, если ответ 400/404/422 относится к audio_effects; иначе None."""
+    if status not in (400, 404, 422):
+        return None
+    param = ""
+    try:
+        detail = json.loads(body_text or "{}")
+        detail = detail.get("detail", detail) if isinstance(detail, dict) else detail
+        if isinstance(detail, list) and detail:
+            detail = detail[0]
+        if isinstance(detail, dict):
+            param = detail.get("param") or ".".join(str(x) for x in detail.get("loc", []) if not isinstance(x, int))
+    except (ValueError, TypeError, AttributeError):
+        pass
+    text = f"{param} {body_text or ''}"
+    fields = [f for f in AUDIO_EFFECT_FIELDS if f in text]
+    if not fields:
+        return None
+    if not param or not any(f in param for f in fields):
+        param = fields[0]
+    return AudioEffectsError(status, param if re.fullmatch(r"[a-z_.]{1,60}", param) else "audio_effects")
+
+
+def split_pause_count(voice_path, expected_separators, log=None):
+    """(найдено внутренних пауз, ожидалось) — те же пороги, что при разделении на 2 части."""
+    total = get_duration(voice_path)
+    silences = [s for s in detect_silences(voice_path, log or (lambda m: None))
+                if s["start"] > 0.5 and (total - s["end"]) > 0.5]
+    return len(silences), max(1, int(expected_separators or 1))
+
+
+REVERB_TAIL_REL_DB = 25.0          # хвост — конец файла тише пика речи на 25 дБ и больше
+
+
+def audio_trailing_tail(path, rel_db=REVERB_TAIL_REL_DB, min_sec=0.1):
+    """Длина тихого «хвоста» в конце файла (реверберация после речи), с. Только ffmpeg, без сети."""
+    proc = subprocess.run([ffmpeg_bin(), "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace")
+    m = re.search(r"max_volume:\s*(-?[0-9.]+) dB", proc.stderr or "")
+    if not m:
+        return 0.0
+    threshold = float(m.group(1)) - rel_db
+    proc = subprocess.run([ffmpeg_bin(), "-hide_banner", "-i", path, "-af",
+                           f"silencedetect=noise={threshold:.1f}dB:d={min_sec}", "-f", "null", "-"],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace")
+    out = proc.stderr or ""
+    starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", out)]
+    ends = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", out)]
+    total = get_duration(path)
+    if not starts:
+        return 0.0
+    last = starts[-1]
+    closed = len(ends) >= len(starts) and ends[-1] < total - 0.05     # тишина закончилась до конца файла
+    return 0.0 if closed else round(max(0.0, total - last), 2)
+
+
+def reverb_tail_cost(tail_sec, part):
+    """Прибавка Sync за хвост: кадры и $ по той же оценке части (цена кадра = цена / кадры)."""
+    fps = part.get("fps") or 25.0
+    frames = int(round(tail_sec * fps))
+    per_frame = (part["cost"] / part["frames"]) if part.get("frames") else local_price_per_frame()
+    return frames, round(frames * per_frame, 2)
+
+
+def split_pause_error(found, expected):
+    return f"найдено паузы: {found} из {expected}; {SPLIT_PAUSE_HINT}"
+
+
+def text_to_speech_mp3(text, voice_id, output_mp3, log, model_id=None, language_code=None, audio_effects=None):
     """
     model_id: str | None — ELEVEN_TTS_MODEL_ID (v4) по умолчанию, либо ELEVEN_TTS_MODEL_ID_V3
     language_code: str | None — ISO 639-1 код (напр. "ru"); None/не передан — автоопределение
+    audio_effects: dict | None — эффекты звука; уходят, только если что-то выбрано и формат mp3
     """
     model_id = model_id or ELEVEN_TTS_MODEL_ID
     url = f"{ELEVEN_BASE_URL}/v1/text-to-speech/{voice_id}?output_format={ELEVEN_OUTPUT_FORMAT}"
@@ -1381,9 +1635,14 @@ def text_to_speech_mp3(text, voice_id, output_mp3, log, model_id=None, language_
     }
     if language_code:
         data["language_code"] = language_code
+    effects = build_audio_effects_payload(audio_effects)
+    if effects:
+        data["audio_effects"] = effects
     chars = len(text)
     log(f"[TIMING] Текст: {chars} символов, модель: {model_id}" +
         (f", язык: {language_code}" if language_code else ""))
+    if effects:
+        log("Эффекты звука: " + ", ".join(f"{k}={v}" for k, v in effects.items()))   # id из каталога, не данные
     log("Генерирую аудио ElevenLabs...")
 
     t_api_start = time.time()
@@ -1393,6 +1652,9 @@ def text_to_speech_mp3(text, voice_id, output_mp3, log, model_id=None, language_
     log(f"[TIMING] ElevenLabs API (ожидание ответа): {t_api:.2f} сек  (статус {res.status_code})")
 
     if res.status_code != 200:
+        fx_err = audio_effects_error_from_response(res.status_code, res.text) if effects else None
+        if fx_err:
+            raise fx_err
         raise RuntimeError(f"ElevenLabs TTS error: {res.status_code}\n{res.text}")
 
     t_save_start = time.time()
@@ -1475,11 +1737,9 @@ def detect_silences(audio_path, log):
 
 def split_start_end_by_silence(full_voice_mp3, output_dir, log, expected_separators=None):
     silences = detect_silences(full_voice_mp3, log)
+    expected = max(1, int(expected_separators or 1))
     if not silences:
-        raise RuntimeError(
-            "Не нашёл пауз в full_voice.mp3. "
-            "Сгенерируй голос с разделителями ------."
-        )
+        raise RuntimeError(f"Разделение на 2 части: {split_pause_error(0, expected)}.")
 
     # Отбрасываем хвостовую тишину (если она у самого конца файла)
     total_duration = get_duration(full_voice_mp3)
@@ -1491,19 +1751,13 @@ def split_start_end_by_silence(full_voice_mp3, output_dir, log, expected_separat
     log(f"После фильтра хвостовой/начальной тишины: {len(silences)} пауз")
 
     if not silences:
-        raise RuntimeError(
-            "Не нашёл внутренних пауз в full_voice.mp3. "
-            "Возможно ты сгенерил голос без разделителей ------."
-        )
+        raise RuntimeError(f"Разделение на 2 части: {split_pause_error(0, expected)}.")
 
     # Сверка с текстом
     if expected_separators is not None and expected_separators > 0:
         if len(silences) < expected_separators:
-            raise RuntimeError(
-                f"В тексте {expected_separators} разделителей ------, "
-                f"а в аудио найдено только {len(silences)} пауз. "
-                f"Похоже full_voice.mp3 сгенерирован не из этого текста."
-            )
+            raise RuntimeError(f"Разделение на 2 части: {split_pause_error(len(silences), expected_separators)} "
+                               f"(или голос сгенерирован не из этого текста).")
         log(f"Сверка с текстом: ожидалось {expected_separators} пауз, "
             f"в аудио найдено {len(silences)} — ок.")
 
@@ -5110,6 +5364,9 @@ class LipsyncTwoModeApp(_BaseApp):
         self.gender_highlight_var = ctk.BooleanVar(value=True)
         self.regender_mode = None                # None — по умолчанию: Groq, если задан ключ; иначе локально
         self.regender_groq_notice_shown = False
+        self.audio_effect_presets = {}           # пресеты эффектов звука — в config, переживают очистку данных
+        self._fx_catalog, self._fx_catalog_at = load_audio_effects_cache()
+        self._fx_fetching = False
         self.cost_confirm_enabled = True
         self.cost_confirm_threshold = COST_CONFIRM_DEFAULT_THRESHOLD
         self.queue_panel_mode = "running"
@@ -5197,6 +5454,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.after(2000, self._check_elevenlabs)
         self.after(3000, self._refresh_balance_badge)
         self.after(4000, self._check_ytdlp_update)
+        self.after(5000, self._refresh_effects_catalog_async)     # каталог эффектов: раз в сутки, в фоне
         threading.Thread(target=self._voice_expiry_watcher, daemon=True).start()
 
 
@@ -7303,6 +7561,109 @@ class LipsyncTwoModeApp(_BaseApp):
         if vg and vg.get("gender_refresh"):
             vg["gender_refresh"]()
 
+    # ── Эффекты звука: каталог, реестр файлов с эффектами, предупреждения очереди ─
+    def _refresh_effects_catalog_async(self, force=False):
+        """Каталог эффектов в фоне: при запуске, если кэшу больше суток; force — после 404 на эффект.
+        При ошибке остаётся последний кэш; кэша нет — блок эффектов скрыт. Ключ в лог не пишется."""
+        if not self.api_key or self._fx_fetching:
+            return
+        if not force and self._fx_catalog is not None and not audio_effects_cache_stale(self._fx_catalog_at):
+            return
+        self._fx_fetching = True
+        key = self.api_key
+
+        def work():
+            try:
+                catalog = fetch_audio_effects_catalog(key)
+            except Exception as e:
+                write_log_file(f"Каталог эффектов не обновлён: {e}")
+                self.after(0, lambda: setattr(self, "_fx_fetching", False))
+                return
+            try:
+                save_audio_effects_cache(catalog)
+            except OSError as e:
+                write_log_file(f"Кэш каталога эффектов не сохранён ({type(e).__name__})")
+            self.after(0, lambda: self._apply_fx_catalog(catalog, time.time()))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_fx_catalog(self, catalog, fetched_at):
+        self._fx_fetching = False
+        self._fx_catalog, self._fx_catalog_at = catalog, fetched_at
+        self.log(f"Каталог эффектов: " + ", ".join(f"{k} {len(catalog.get(k, []))}" for k, _, _ in AUDIO_EFFECT_GROUPS))
+        vg = getattr(self, "_vg", None)
+        if vg and vg.get("fx_refresh"):
+            vg["fx_refresh"]()
+
+    def _remember_fx_file(self, path, spec, batch=None):
+        """Голос с эффектами: запоминаем файл (и копии при «Скачать»), чтобы предупредить при запуске очереди."""
+        s = normalize_audio_effects(spec)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = None
+        reg = self._panel_state.setdefault("fx_files", {})
+        reg[os.path.abspath(path)] = {"name": os.path.basename(path), "size": size, "noise": bool(s["noise"]),
+                                      "reverb": audio_effects_reverb(s), "pan": s["pan"] != 0,
+                                      "summary": audio_effects_summary(s, self._fx_catalog), "batch": batch}
+        while len(reg) > 100:
+            reg.pop(next(iter(reg)))
+
+    def _fx_file_info(self, path):
+        reg = self._panel_state.get("fx_files") or {}
+        if not path:
+            return None
+        info = reg.get(os.path.abspath(path))
+        if info:
+            return info
+        try:
+            name, size = os.path.basename(path), os.path.getsize(path)
+        except OSError:
+            return None
+        return next((i for i in reg.values() if i.get("name") == name and i.get("size") == size), None)
+
+    def _queue_fx_warnings(self, valid, estimates=None):
+        """Предупреждения очереди про эффекты в голосе. Не блокируют запуск. Фоновый поток: читает файлы."""
+        out = []
+        for k, (idx, roll) in enumerate(valid):
+            info = self._fx_file_info(roll.get("voice_file"))
+            if not info:
+                continue
+            title = f"Ролик {idx + 1}"
+            est = (estimates or [None] * len(valid))[k]
+            if info.get("reverb") and est and not est.get("error") and est.get("parts"):
+                try:
+                    tail = audio_trailing_tail(roll["voice_file"])
+                except Exception:
+                    tail = 0.0
+                clean = self._clean_sibling_duration(info.get("batch"))
+                how = "не меньше; по тихому концу файла"
+                if clean:
+                    try:
+                        tail, how = max(0.0, get_duration(roll["voice_file"]) - clean), "по сравнению с чистым вариантом"
+                    except Exception:
+                        pass
+                if tail >= 0.2:                 # хвост попадает в последнюю часть (у «2 видео» — в конец)
+                    frames, cost = reverb_tail_cost(tail, est["parts"][-1])
+                    out.append(f"{title}: хвост реверберации удлиняет аудио: ≈ +{frames} кадров, "
+                               f"≈ +${cost:.2f} за часть (≈ {tail:.1f} с, {how}).")
+            if info.get("noise"):
+                out.append(f"{title}: в голосе фоновый шум — может ухудшить синхронизацию губ; "
+                           f"лучше добавить шум в монтаже.")
+            if info.get("pan"):
+                out.append(f"{title}: панорама пропадёт — для Sync звук сводится в моно, голос станет тише.")
+        return out
+
+    def _clean_sibling_duration(self, batch):
+        """Длительность варианта без эффектов из той же генерации A/B (тот же текст) или None."""
+        if not batch:
+            return None
+        for t in self.background_tasks.list(kind="voice_gen", batch=batch):
+            res = t.get("result") or {}
+            if t.get("status") == "done" and not (t.get("meta") or {}).get("fx") and res.get("duration"):
+                return float(res["duration"])
+        return None
+
     def _voice_gender_store(self):
         st = self._panel_state.setdefault("voice_gender", {})
         for k in ("labels", "names", "user"):
@@ -9394,6 +9755,326 @@ class LipsyncTwoModeApp(_BaseApp):
             button_hover_color=BTN_HOVER, width=150,
         ).pack(side="left")
 
+        # ── Эффекты звука (каталог ElevenLabs; без каталога блок скрыт) ───────
+        fx = {"spec": normalize_audio_effects(saved.get("fx")), "open": bool(saved.get("fx_open")),
+              "target": saved.get("fx_target") if saved.get("fx_target") in ("both", "A", "B")
+              else AUDIO_EFFECTS_TARGET_DEFAULT, "proc": None, "busy": False, "error": "", "note": ""}
+        FX_NONE = "— нет —"
+        FX_PRESET_HINT = "— пресеты —"
+        fx_section = ctk.CTkFrame(frame, fg_color=CARD, corner_radius=12)
+        fx_header = ctk.CTkButton(fx_section, text="", anchor="w", fg_color="transparent", hover_color=BTN_HOVER,
+                                  text_color=TEXT, height=30, font=ctk.CTkFont(size=13, weight="bold"),
+                                  command=lambda: toggle_fx())
+        fx_header.pack(fill="x", padx=6, pady=4)
+        fx_summary = self.label(fx_section, "", size=12, color=MUTED)
+        fx_summary.configure(wraplength=440, justify="left")
+        fx_body = ctk.CTkFrame(fx_section, fg_color="transparent")
+
+        def fx_row(caption, parent=None):
+            row = ctk.CTkFrame(parent or fx_body, fg_color="transparent")
+            row.pack(fill="x", padx=10, pady=3)
+            if caption:
+                self.label(row, caption, size=12, color=MUTED).pack(side="left", padx=(0, 8))
+            return row
+
+        def fx_hint(parent):
+            lbl = self.label(parent, "", size=11, color=MUTED)
+            lbl.configure(wraplength=440, justify="left")
+            return lbl
+
+        fx_target_seg = ctk.CTkSegmentedButton(fx_row("Применить к:"), values=list(AUDIO_EFFECTS_TARGETS),
+                                               command=lambda v: on_fx_target(v))
+        fx_target_seg.pack(side="left")
+        fx_menus, fx_rows = {}, {}
+        for key, caption in (("filter", "Фильтр:"), ("environment", "Пространство:")):
+            fx_rows[key] = fx_row(caption)
+            fx_menus[key] = ctk.CTkOptionMenu(fx_rows[key], values=[FX_NONE], width=210, height=26, fg_color=BTN,
+                                              button_color=BTN, button_hover_color=BTN_HOVER,
+                                              command=lambda v, k=key: on_fx_menu(k, v))
+            fx_menus[key].pack(side="left")
+            HoverTip(fx_menus[key], lambda k=key: fx_description(k))
+        fx_sliders, fx_values = {}, {}
+        for key, caption, lo, hi, steps in (("send_level", "Уровень пространства:", 0, 1, 20),
+                                            ("distance", "Расстояние:", 0, 1, 20)):
+            fx_rows[key] = fx_row(caption)
+            fx_sliders[key] = ctk.CTkSlider(fx_rows[key], from_=lo, to=hi, number_of_steps=steps,
+                                            width=160 if key == "send_level" else 110,
+                                            command=lambda v, k=key: on_fx_slider(k, v))
+            fx_sliders[key].pack(side="left")
+            fx_values[key] = self.label(fx_rows[key], "", size=12, color=MUTED)
+            fx_values[key].pack(side="left", padx=8)
+        for caption, value in AUDIO_EFFECTS_DISTANCE_MARKS:
+            ctk.CTkButton(fx_rows["distance"], text=caption, width=56, height=24, corner_radius=8, fg_color=BTN,
+                          hover_color=BTN_HOVER, text_color=TEXT, font=ctk.CTkFont(size=11),
+                          command=lambda v=value: on_fx_slider("distance", v, from_button=True)).pack(
+                side="left", padx=(0, 4))
+        fx_rows["noise"] = fx_row("Фоновый шум:")
+        fx_menus["noise"] = ctk.CTkOptionMenu(fx_rows["noise"], values=[FX_NONE], width=210, height=26, fg_color=BTN,
+                                              button_color=BTN, button_hover_color=BTN_HOVER,
+                                              command=lambda v: on_fx_menu("noise", v))
+        fx_menus["noise"].pack(side="left")
+        HoverTip(fx_menus["noise"], lambda: fx_description("noise"))
+        noise_hint = fx_hint(fx_body)
+        noise_hint.configure(text="Громкость шума в API ElevenLabs не настраивается. Шум может ухудшить "
+                                  "синхронизацию губ — для Sync лучше добавить шум в монтаже.")
+        fx_rows["pan"] = fx_row("Панорама:")
+        fx_sliders["pan"] = ctk.CTkSlider(fx_rows["pan"], from_=-1, to=1, number_of_steps=40, width=160,
+                                          command=lambda v: on_fx_slider("pan", v))
+        fx_sliders["pan"].pack(side="left")
+        fx_values["pan"] = self.label(fx_rows["pan"], "", size=12, color=MUTED)
+        fx_values["pan"].pack(side="left", padx=8)
+        pan_hint = fx_hint(fx_body)
+        pan_hint.configure(text="Для Sync звук сводится в моно: панорама пропадёт, голос станет тише (до −6 дБ).")
+        preset_row = fx_row("")
+        self.button(preset_row, "Сбросить", lambda: reset_fx(), color=BTN, hover=BTN_HOVER, width=90).pack(side="left")
+        fx_preset_menu = ctk.CTkOptionMenu(preset_row, values=[FX_PRESET_HINT], width=150, height=26, fg_color=BTN,
+                                           button_color=BTN, button_hover_color=BTN_HOVER,
+                                           command=lambda v: apply_preset(v))
+        fx_preset_menu.pack(side="left", padx=6)
+        preset_row2 = fx_row("")
+        fx_preset_name = ctk.CTkEntry(preset_row2, placeholder_text="имя пресета", width=150, height=26,
+                                      fg_color="white", text_color="#111", border_color="#737373")
+        fx_preset_name.pack(side="left")
+        self.button(preset_row2, "Сохранить пресет", lambda: save_preset(), color=BTN, hover=BTN_HOVER,
+                    width=140).pack(side="left", padx=6)
+        self.button(preset_row2, "Удалить", lambda: delete_preset(), color=BTN, hover=BTN_HOVER,
+                    width=80).pack(side="left")
+        test_row = fx_row("")
+        fx_test_btn = self.button(test_row, "▶ Проверить эффект", lambda: preview_fx(), color=BTN_OK,
+                                  hover=BTN_OK_HOVER, width=170)
+        fx_test_btn.pack(side="left")
+        fx_cost = self.label(test_row, "", size=11, color=MUTED)
+        fx_cost.configure(wraplength=220, justify="left")
+        fx_cost.pack(side="left", padx=8)
+        fx_warn = fx_hint(fx_body)
+        fx_warn.configure(text_color="#fcd34d")
+
+        def fx_catalog():
+            return self._fx_catalog if not audio_effects_catalog_empty(self._fx_catalog) else None
+
+        def fx_items(key):
+            return (fx_catalog() or {}).get(key, [])
+
+        def fx_name(key, eid):
+            return next((i["name"] for i in fx_items(key) if i["id"] == eid), FX_NONE)
+
+        def fx_description(key):
+            item = next((i for i in fx_items(key) if i["id"] == fx["spec"].get(key)), None)
+            return (item["description"] or item["name"]) if item else "Без эффекта"
+
+        def save_fx():
+            self._panel_state_set("voice_gen", fx=dict(fx["spec"]), fx_open=fx["open"], fx_target=fx["target"])
+
+        def fx_text_warning():
+            text = text_box.get("1.0", "end-1c")
+            if "------" in text and any(audio_effects_for_slot(fx["spec"], fx["target"], sl) for sl in ("A", "B")) \
+                    and (fx["spec"]["noise"] or audio_effects_reverb(fx["spec"])):
+                return ("В тексте есть ------: шум или реверберация могут помешать разделению на 2 части по паузам. "
+                        "Если пауз не хватит, очередь не запустится и ничего не спишется.")
+            return ""
+
+        def render_fx():
+            catalog = fx_catalog()
+            if catalog is None:
+                fx_section.pack_forget()                 # каталога нет ни в кэше, ни в сети
+                return
+            fx["spec"] = normalize_audio_effects(fx["spec"], catalog)
+            spec, active = fx["spec"], audio_effects_active(fx["spec"])
+            if not fx_section.winfo_manager():
+                fx_section.pack(fill="x", padx=22, pady=(0, 10), after=model_row)
+            target_label = next(k for k, v in AUDIO_EFFECTS_TARGETS.items() if v == fx["target"])
+            fx_header.configure(text=("▾ " if fx["open"] else "▸ ") + "Эффекты звука"
+                                + (f" ({target_label})" if active else ""))
+            fx_summary.configure(text=audio_effects_summary(spec, catalog) if active else "")
+            if active:
+                fx_summary.pack(anchor="w", padx=16, pady=(0, 6), after=fx_header)
+            else:
+                fx_summary.pack_forget()
+            if not fx["open"]:
+                fx_body.pack_forget()
+                return
+            if not fx_body.winfo_manager():
+                fx_body.pack(fill="x", padx=4, pady=(0, 8))
+            fx_target_seg.set(target_label)
+            for key in ("filter", "environment", "noise"):
+                fx_menus[key].configure(values=[FX_NONE] + [i["name"] for i in fx_items(key)])
+                fx_menus[key].set(fx_name(key, spec[key]))
+            for key in ("send_level", "distance", "pan"):
+                if abs(fx_sliders[key].get() - spec[key]) > 1e-6:
+                    fx_sliders[key].set(spec[key])
+            fx_values["send_level"].configure(text=f"{round(spec['send_level'] * 100)}%")
+            fx_values["distance"].configure(text=f"{spec['distance']:.2f}")
+            fx_values["pan"].configure(text="центр" if spec["pan"] == 0 else
+                                       f"{'Л' if spec['pan'] < 0 else 'П'} {abs(spec['pan']):.2f}")
+            if spec["environment"]:
+                fx_rows["send_level"].pack(fill="x", padx=10, pady=3, after=fx_rows["environment"])
+            else:
+                fx_rows["send_level"].pack_forget()
+            for hint, show, after in ((noise_hint, bool(spec["noise"]), fx_rows["noise"]),
+                                      (pan_hint, spec["pan"] != 0, fx_rows["pan"])):
+                if show:
+                    hint.pack(anchor="w", padx=12, pady=(0, 4), after=after)
+                else:
+                    hint.pack_forget()
+            fx_preset_menu.configure(values=[FX_PRESET_HINT] + list(self.audio_effect_presets))
+            fx_preset_menu.set(FX_PRESET_HINT)
+            fx_test_btn.configure(state="normal" if active and not fx["busy"] else "disabled",
+                                  text="Озвучиваю…" if fx["busy"] else "▶ Проверить эффект")
+            fx_cost.configure(text=fx["note"] or f"Спишется до {len(AUDIO_EFFECTS_PREVIEW_TEXT)} символов; повтор с "
+                                                  f"теми же настройками — бесплатно.")
+            warn = fx["error"] or fx_text_warning()
+            fx_warn.configure(text=warn)
+            if warn:
+                fx_warn.pack(anchor="w", padx=12, pady=(2, 6))
+            else:
+                fx_warn.pack_forget()
+
+        def toggle_fx():
+            fx["open"] = not fx["open"]
+            save_fx()
+            render_fx()
+
+        def on_fx_target(label):
+            fx["target"] = AUDIO_EFFECTS_TARGETS.get(label, AUDIO_EFFECTS_TARGET_DEFAULT)
+            save_fx()
+            render_fx()
+
+        def on_fx_menu(key, name):
+            fx["spec"][key] = next((i["id"] for i in fx_items(key) if i["name"] == name), None)
+            fx["error"], fx["note"] = "", ""
+            save_fx()
+            render_fx()
+
+        def on_fx_slider(key, value, from_button=False):
+            fx["spec"][key] = round(float(value), 2)
+            fx["note"] = ""
+            save_fx()
+            if from_button:
+                fx_sliders[key].set(fx["spec"][key])
+            render_fx()
+
+        def reset_fx():
+            fx["spec"] = normalize_audio_effects({})
+            fx["error"], fx["note"] = "", ""
+            save_fx()
+            render_fx()
+
+        def apply_preset(name):
+            if name in self.audio_effect_presets:
+                fx["spec"] = normalize_audio_effects(self.audio_effect_presets[name], fx_catalog())
+                fx_preset_name.delete(0, "end")
+                fx_preset_name.insert(0, name)
+                fx["error"], fx["note"] = "", ""
+                save_fx()
+            render_fx()
+
+        def save_preset():
+            name = fx_preset_name.get().strip()[:40]
+            if not name:
+                messagebox.showwarning("Пресет эффектов", "Введите имя пресета.", parent=self)
+                return
+            if name not in self.audio_effect_presets and len(self.audio_effect_presets) >= AUDIO_EFFECTS_PRESETS_MAX:
+                messagebox.showwarning("Пресет эффектов", f"Не больше {AUDIO_EFFECTS_PRESETS_MAX} пресетов — "
+                                                          f"удалите ненужный.", parent=self)
+                return
+            self.audio_effect_presets[name] = dict(fx["spec"])
+            self.save_config()
+            fx["note"] = f"Пресет «{name}» сохранён."
+            render_fx()
+
+        def delete_preset():
+            name = fx_preset_name.get().strip()
+            if name in self.audio_effect_presets:
+                del self.audio_effect_presets[name]
+                self.save_config()
+                fx_preset_name.delete(0, "end")
+                fx["note"] = f"Пресет «{name}» удалён."
+            render_fx()
+
+        def play_fx(path):
+            p = fx["proc"]
+            if p and p.poll() is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            fx["proc"] = None
+            if sys.platform == "darwin":
+                fx["proc"] = subprocess.Popen(["afplay", path])
+            elif sys.platform == "win32":
+                os.startfile(path)
+            else:
+                fx["proc"] = subprocess.Popen(["xdg-open", path])
+
+        def preview_fx():
+            if fx["busy"] or not audio_effects_active(fx["spec"]):
+                return
+            if not self.api_key:
+                messagebox.showerror("Ошибка", "Сначала добавь ElevenLabs API key.", parent=self)
+                return
+            voice_value = voice_box.get("1.0", "end").strip()
+            if not voice_value:
+                messagebox.showerror("Ошибка", "Введите voice_id или имя голоса.", parent=self)
+                return
+            model_id = ELEVEN_TTS_MODEL_ID_V3 if model_var.get() == "Eleven v3" else ELEVEN_TTS_MODEL_ID
+            language_code = ELEVEN_TTS_LANGUAGES.get(lang_var.get())
+            spec = dict(fx["spec"])
+            fx["busy"], fx["error"] = True, ""
+            render_fx()
+
+            def run():
+                try:
+                    if re.fullmatch(r"[A-Za-z0-9]{20}", voice_value):
+                        voice_id = voice_value
+                    else:
+                        voice_id = self.fetch_voice_id_by_name(voice_value)
+                    if not voice_id:
+                        raise RuntimeError("голос не найден")
+                    key = hashlib.sha1(json.dumps([voice_id, model_id, language_code, build_audio_effects_payload(spec),
+                                                   AUDIO_EFFECTS_PREVIEW_TEXT], sort_keys=True).encode()).hexdigest()[:16]
+                    folder = os.path.join(VOICE_DATA_DIR, "fx_previews")
+                    os.makedirs(folder, exist_ok=True)
+                    path = os.path.join(folder, f"{key}.mp3")
+                    cached = os.path.exists(path) and os.path.getsize(path) > 0
+                    if not cached:
+                        global ELEVENLABS_API_KEY
+                        ELEVENLABS_API_KEY = self.api_key
+                        text_to_speech_mp3(AUDIO_EFFECTS_PREVIEW_TEXT, voice_id, path, self.log, model_id=model_id,
+                                           language_code=language_code, audio_effects=spec)
+                        old = sorted(Path(folder).glob("*.mp3"), key=lambda f: f.stat().st_mtime)[:-20]
+                        for f in old:
+                            try:
+                                f.unlink()
+                            except OSError:
+                                pass
+                    self.after(0, lambda: preview_done(path, cached, None))
+                except Exception as e:
+                    if isinstance(e, AudioEffectsError):
+                        error_reporter.report("app.audio_effects.preview", exc_type="AudioEffectsError",
+                                              message=f"HTTP {e.status} {e.param}")
+                        if e.status == 404:
+                            self.after(0, lambda: self._refresh_effects_catalog_async(force=True))
+                    else:
+                        error_reporter.report("app.audio_effects.preview", exc=e)
+                    self.after(0, lambda err=e: preview_done(None, False, err))
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def preview_done(path, cached, err):
+            fx["busy"] = False
+            if err is not None:
+                fx["error"] = (f"{err}. Выберите другой эффект или «Сбросить»." if isinstance(err, AudioEffectsError)
+                               else f"Проверка не удалась: {str(err)[:80]}")
+                fx["note"] = ""
+            else:
+                fx["error"] = ""
+                fx["note"] = "Воспроизвожу из кэша — без списания." if cached else "Воспроизвожу проверочную фразу."
+                try:
+                    play_fx(path)
+                except Exception as e:
+                    fx["error"] = f"Не удалось воспроизвести: {type(e).__name__}"
+            render_fx()
+
         # ── Кнопка запуска ────────────────────────────────────────────────
         gen_row = ctk.CTkFrame(frame, fg_color="transparent")
         gen_row.pack(fill="x", padx=22, pady=(0, 16))
@@ -9475,6 +10156,7 @@ class LipsyncTwoModeApp(_BaseApp):
 
         def render_slots():
             running = False
+            fx_error_seen = False
             for slot in ("A", "B"):
                 w = slot_widgets[slot]
                 task = _current_task(slot)
@@ -9487,6 +10169,8 @@ class LipsyncTwoModeApp(_BaseApp):
                 elif task["status"] == "done" and path:
                     dur = (task.get("result") or {}).get("duration")
                     text = f"✓ Готово — {dur:.1f} сек" if dur else "✓ Готово"
+                    if (task.get("meta") or {}).get("fx"):
+                        text += " · с эффектами"
                     color, value = "#86efac", 1.0
                 elif task["status"] == "done":
                     text, color, value = "Файл варианта не найден", "#fca5a5", 0
@@ -9494,6 +10178,10 @@ class LipsyncTwoModeApp(_BaseApp):
                     text, color, value = "Прервано: приложение закрыли во время генерации", "#fcd34d", 0
                 else:
                     text, color, value = f"Ошибка: {str(task.get('error'))[:60]}", "#fca5a5", 0
+                    if str(task.get("error") or "").startswith("Эффект не принят"):
+                        fx["error"] = (f"Вариант {slot}: {task['error']}. Выберите другой эффект или «Сбросить» — "
+                                       f"текст не изменён.")
+                        fx_error_seen = True
                 note = notes.get(slot)
                 if note and task and note[0] == task["id"]:
                     text, color = note[1], "#86efac"
@@ -9503,6 +10191,8 @@ class LipsyncTwoModeApp(_BaseApp):
                 w["save"].configure(state="normal" if path else "disabled")
             gen_btn.configure(state="disabled" if running else "normal",
                               text="Генерирую..." if running else "⚡ Сгенерировать A и B")
+            if fx_error_seen:
+                render_fx()
             gen_status.configure(
                 text="Генерация идёт — можно переключаться на другие вкладки" if running else "")
 
@@ -9554,6 +10244,10 @@ class LipsyncTwoModeApp(_BaseApp):
                 shutil.copy2(p, dst)
                 task = _current_task(slot)
                 notes[slot] = (task["id"], f"✓ Сохранено: {Path(dst).name}")
+                if (task.get("meta") or {}).get("fx_spec"):
+                    self._remember_fx_file(dst, task["meta"]["fx_spec"],     # копия тоже «с эффектами»
+                                           batch=task["meta"].get("batch"))
+                    self._schedule_state_save()
                 render_slots()
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}", parent=self)
@@ -9580,8 +10274,11 @@ class LipsyncTwoModeApp(_BaseApp):
             model_id = (ELEVEN_TTS_MODEL_ID_V3 if model_var.get() == "Eleven v3"
                         else ELEVEN_TTS_MODEL_ID)
             language_code = ELEVEN_TTS_LANGUAGES.get(lang_var.get())
+            slot_fx = audio_effects_for_slot(dict(fx["spec"]), fx["target"], slot)
             task_id = tasks.create("voice_gen", "voice_gen", title=f"Голос, вариант {slot}",
-                                   meta={"slot": slot, "batch": batch}, status="running")
+                                   meta={"slot": slot, "batch": batch,
+                                         "fx": audio_effects_summary(slot_fx, self._fx_catalog) if slot_fx else "",
+                                         "fx_spec": slot_fx}, status="running")
 
             def run():
                 try:
@@ -9603,7 +10300,9 @@ class LipsyncTwoModeApp(_BaseApp):
                     os.makedirs(VOICE_DATA_DIR, exist_ok=True)
                     out_path = os.path.join(VOICE_DATA_DIR, f"{safe_vname}_{timestamp}_variant_{slot}.mp3")
                     text_to_speech_mp3(eleven_text, voice_id, out_path, self.log,
-                                       model_id=model_id, language_code=language_code)
+                                       model_id=model_id, language_code=language_code, audio_effects=slot_fx)
+                    if slot_fx:
+                        self._remember_fx_file(out_path, slot_fx, batch=batch)
                     try:
                         dur = get_duration(out_path)
                     except Exception:
@@ -9615,7 +10314,13 @@ class LipsyncTwoModeApp(_BaseApp):
                 except Exception as e:
                     err = str(e)
                     self.log(f"Ошибка генерации голоса (вариант {slot}): {err}")
-                    error_reporter.report("app.text_to_speech_mp3", exc=e)
+                    if isinstance(e, AudioEffectsError):    # в отчёт — код и поле, без тела ответа
+                        error_reporter.report("app.audio_effects.tts", exc_type="AudioEffectsError",
+                                              message=f"HTTP {e.status} {e.param}")
+                        if e.status == 404:
+                            self.after(0, lambda: self._refresh_effects_catalog_async(force=True))
+                    else:
+                        error_reporter.report("app.text_to_speech_mp3", exc=e)
                     tasks.update(task_id, status="error", error=err)
 
             threading.Thread(target=run, daemon=True).start()
@@ -9982,11 +10687,21 @@ class LipsyncTwoModeApp(_BaseApp):
                      f"({pending['source']}, слов: {pending['count']})")
 
         voice_box._textbox.bind("<KeyRelease>", lambda e: render_gender(), add="+")
+        tk_text.bind("<KeyRelease>", lambda e: render_fx() if fx["open"] else None, add="+")
         lang_var.trace_add("write", lambda *a: schedule_gender())
         self._vg = {"voice_box": voice_box, "text_box": text_box, "save_fields": save_fields,
                     "update_status": lambda: self.after(100, _update_status),
                     "render_restore_notice": render_restore_notice,
                     "gender_refresh": lambda: apply_gender(gstate["analysis"], gstate["seq"]),
+                    "fx_refresh": render_fx,
+                    "fx": {"state": fx, "section": fx_section, "header": fx_header, "body": fx_body,
+                           "summary": fx_summary,
+                           "menus": fx_menus, "sliders": fx_sliders, "rows": fx_rows, "warn": fx_warn,
+                           "noise_hint": noise_hint, "pan_hint": pan_hint, "cost": fx_cost, "test": fx_test_btn,
+                           "preset_menu": fx_preset_menu, "preset_name": fx_preset_name, "toggle": toggle_fx,
+                           "target": on_fx_target, "menu": on_fx_menu, "slider": on_fx_slider, "reset": reset_fx,
+                           "save_preset": save_preset, "apply_preset": apply_preset, "delete_preset": delete_preset,
+                           "preview": preview_fx},
                     "gender": {"state": gstate, "label": gender_lbl, "buttons": rg_btns, "warn": vgender_warn,
                                "row": gender_row, "vgender_row": vgender_row, "vgender_menu": vgender_menu,
                                "vgender_info": vgender_info, "notice": rg_notice, "preview": rg_preview,
@@ -9995,6 +10710,7 @@ class LipsyncTwoModeApp(_BaseApp):
                                "pick_gender": on_vgender_pick, "restore_label": restore_lbl,
                                "restore": restore_text, "lang": lang_var}}
         render_restore_notice()
+        render_fx()
         self._register_renderer("voice_gen", render_slots)
         if saved.get("text"):
             self.after(100, _update_status)
@@ -10775,27 +11491,60 @@ class LipsyncTwoModeApp(_BaseApp):
             except Exception as e:
                 return {"error": str(e)}
 
+        def split_check():
+            """«2 видео»: паузы для разделения ищутся ДО загрузки в Sync и списания денег."""
+            problems = []
+            for idx, roll in rolls:
+                if roll["mode"] == "1 видео":
+                    continue
+                try:
+                    _, _, sep = parse_start_end_text(roll["text"])
+                    found, expected = split_pause_count(roll["voice_file"], sep)
+                except Exception:
+                    continue                     # файл не читается — ошибку покажет обработка ролика
+                if found < expected:
+                    problems.append(f"Ролик {idx + 1}: {split_pause_error(found, expected)}.")
+            return problems
+
         def work():
+            problems = split_check()
+            if problems:
+                self.after(0, lambda: split_failed(problems))
+                return
             try:
                 with ThreadPoolExecutor(max_workers=4) as ex:
                     estimates = list(ex.map(one, rolls))
             except Exception as e:
                 estimates = [{"error": str(e)} for _ in rolls]
-            self.after(0, lambda: decide(estimates))
+            try:
+                warnings = self._queue_fx_warnings(rolls, estimates)
+            except Exception as e:
+                write_log_file(f"Предупреждения об эффектах не посчитаны ({type(e).__name__})")
+                warnings = []
+            self.after(0, lambda: decide(estimates, warnings))
 
-        def decide(estimates):
+        def split_failed(problems):
+            self.start_btn.configure(state="normal", text="НАЧАТЬ ОЧЕРЕДЬ")
+            self.log("Очередь не запущена: разделение на 2 части по паузам не удалось")
+            messagebox.showerror("Разделение на 2 части",
+                                 "Очередь не запущена, в Sync ничего не отправлено.\n\n" + "\n".join(problems),
+                                 parent=self)
+
+        def decide(estimates, warnings):
             self.start_btn.configure(state="normal", text="НАЧАТЬ ОЧЕРЕДЬ")
             self._persist_sync_price()
+            for w in warnings:
+                self.log(f"⚠ {w}")
             total = sum(e["cost"] for e in estimates if not e.get("error"))
-            if self.cost_confirm_enabled or total > self.cost_confirm_threshold:
+            if self.cost_confirm_enabled or total > self.cost_confirm_threshold or warnings:
                 self._show_cost_confirm_window(rolls, estimates,
-                                               lambda: self._launch_queue(rolls, estimates))
+                                               lambda: self._launch_queue(rolls, estimates), warnings=warnings)
             else:
                 self._launch_queue(rolls, estimates)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _show_cost_confirm_window(self, valid, estimates, on_start):
+    def _show_cost_confirm_window(self, valid, estimates, on_start, warnings=None):
         win = ctk.CTkToplevel(self)
         win.title("Стоимость очереди")
         win.configure(fg_color=BG)
@@ -10805,6 +11554,10 @@ class LipsyncTwoModeApp(_BaseApp):
         box.pack(fill="both", expand=True, padx=16, pady=16)
         self.label(box, "Перед запуском: оценка Sync", size=18, weight="bold").pack(
             anchor="w", padx=16, pady=(14, 8))
+        if warnings:
+            warn = self.label(box, "\n".join(warnings), size=12, color="#fcd34d")
+            warn.configure(wraplength=700, justify="left")
+            warn.pack(anchor="w", fill="x", padx=16, pady=(0, 8))
 
         rows = sum(1 + (len(e["parts"]) if not e.get("error") and len(e["parts"]) > 1 else 0)
                    for e in estimates)
@@ -11565,6 +12318,10 @@ class LipsyncTwoModeApp(_BaseApp):
             mode = data.get("regender_mode")
             self.regender_mode = mode if mode in REGENDER_MODES.values() else None
             self.regender_groq_notice_shown = bool(data.get("regender_groq_notice_shown", False))
+            presets = data.get("audio_effect_presets")
+            if isinstance(presets, dict):
+                self.audio_effect_presets = {str(k)[:40]: normalize_audio_effects(v) for k, v in
+                                             list(presets.items())[:AUDIO_EFFECTS_PRESETS_MAX] if str(k).strip()}
             with _lock_of(self, "_expiry_lock"):
                 self.voice_expiry_list = list(data.get("voice_expiry_list", []))
             self.groq_api_key = data.get("groq_api_key", "") or self.groq_api_key
@@ -11627,6 +12384,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 "gender_highlight":      getattr(self, "gender_highlight", True),
                 "regender_mode":         getattr(self, "regender_mode", None),
                 "regender_groq_notice_shown": getattr(self, "regender_groq_notice_shown", False),
+                "audio_effect_presets":  getattr(self, "audio_effect_presets", {}),
                 "voice_expiry_list":     _locked_copy(self, "_expiry_lock", "voice_expiry_list"),
                 "groq_api_key":          self.groq_api_key,
                 "groq_used_seconds":     _locked_copy(self, "_groq_lock", "groq_used_seconds"),
