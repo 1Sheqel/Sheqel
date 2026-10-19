@@ -1386,6 +1386,15 @@ AUDIO_EFFECTS_PRESETS_MAX = 30
 AUDIO_EFFECT_FIELDS = {"filter_preset_id": "фильтр", "environment_id": "пространство",
                        "background_noise_id": "фоновый шум", "distance": "расстояние", "send_level": "уровень",
                        "pan": "панорама", "audio_effects": "эффекты"}
+ROLL_QUEUED = "В очереди"
+
+
+def roll_in_queue(roll):
+    """Сцена уже в работе очереди: ждёт («В очереди») или обрабатывается («Обработка N»)."""
+    status = str((roll or {}).get("status", ""))
+    return status == ROLL_QUEUED or status.startswith("Обработка")
+
+
 SPLIT_PAUSE_HINT = "шум или реверберация мешают разделению, отключите эффект или разделите вручную"
 
 
@@ -6155,14 +6164,15 @@ class LipsyncTwoModeApp(_BaseApp):
             pass
 
     def _roll_is_locked(self, roll, parent=None, notify=True):
-        """Ролик в обработке нельзя править: поток очереди уже читает его данные."""
-        # Очередь пишет статус вида «Обработка 1/3», поэтому сравниваем по началу строки.
-        if not str(roll.get("status", "")).startswith("Обработка"):
+        """Ролик в очереди или в обработке нельзя править: поток очереди читает (или прочитает) его данные."""
+        if not roll_in_queue(roll):
             return False
         if notify:
+            queued = roll.get("status") == ROLL_QUEUED
             messagebox.showwarning(
-                "Ролик в обработке",
-                "Этот ролик сейчас обрабатывается — изменить его можно после завершения.",
+                "Ролик в очереди" if queued else "Ролик в обработке",
+                ("Этот ролик ждёт своей очереди — чтобы изменить его, сначала «Убрать из очереди»."
+                 if queued else "Этот ролик сейчас обрабатывается — изменить его можно после завершения."),
                 parent=parent or self,
             )
         return True
@@ -10942,7 +10952,7 @@ class LipsyncTwoModeApp(_BaseApp):
             status_color = "#86efac"
         elif roll["status"] == "Ошибка":
             status_color = "#fca5a5"
-        elif roll["status"] == "В очереди" or roll["status"] == "Обработка":
+        elif roll_in_queue(roll):
             status_color = "#fcd34d"
 
         ctk.CTkLabel(
@@ -11020,7 +11030,7 @@ class LipsyncTwoModeApp(_BaseApp):
             status_color = "#86efac"
         elif roll["status"] == "Ошибка":
             status_color = "#fca5a5"
-        elif roll["status"] in ("В очереди", "Обработка"):
+        elif roll_in_queue(roll):
             status_color = "#fcd34d"
 
         self.label(title_row, roll["status"], size=13, color=status_color).pack(
@@ -11030,6 +11040,9 @@ class LipsyncTwoModeApp(_BaseApp):
                     lambda rid=roll["id"]: self.remove_roll_by_id(rid),
                     color=BTN_DANGER, hover=BTN_DANGER_HOVER, width=100).pack(
             side="right", padx=(0, 10))
+        if roll["status"] == "Готово":
+            self.button(title_row, "Запустить заново", lambda rid=roll["id"]: self.rerun_roll(rid),
+                        color=BTN, hover=BTN_HOVER, width=150).pack(side="right", padx=(0, 10))
 
         self._sync_fetch_widgets = None
         if roll["status"] == "Прервано":
@@ -11433,6 +11446,17 @@ class LipsyncTwoModeApp(_BaseApp):
 
 
 
+    def rerun_roll(self, roll_id):
+        """«Запустить заново»: готовая сцена снова попадёт в очередь (статус «Ожидает»)."""
+        roll = next((r for r in self.rolls if r["id"] == roll_id), None)
+        if roll is None or roll.get("status") != "Готово":
+            return
+        roll["status"] = "Ожидает"
+        self.log(f"{self.get_roll_title(self.rolls.index(roll), roll)}: снова «Ожидает» — запустится со следующей очередью")
+        self.render_scene_list()
+        self.render_scene_detail()
+        self.update_status()
+
     def remove_roll_by_id(self, roll_id):
         if self.is_processing:
             messagebox.showwarning("Очередь", "Нельзя удалять во время обработки.")
@@ -11578,10 +11602,22 @@ class LipsyncTwoModeApp(_BaseApp):
         self.button(frame, "Сохранить", save, color=BTN_OK, hover=BTN_OK_HOVER, width=180).pack(anchor="e", padx=22, pady=(0, 20))
 
     def validate_rolls(self):
-        valid, errors = [], []
+        """(к запуску, ошибки). Готовые и уже стоящие в очереди сцены пропускаются."""
+        valid, errors, _ = self.queue_candidates()
+        return valid, errors
+
+    def queue_candidates(self):
+        """(к запуску, ошибки, пропущенные готовые). «Готово» снова запускается только кнопкой
+        «Запустить заново» в карточке сцены; «В очереди» и «Обработка» уже в работе."""
+        valid, errors, skipped_done = [], [], []
         for i, roll in enumerate(self.rolls):
             has_any = any([roll["voice_file"], roll["text"], roll["video_single"], roll["video_start"], roll["video_end"]])
             if not has_any:
+                continue
+            if roll.get("status") == "Готово":
+                skipped_done.append((i, roll))
+                continue
+            if roll_in_queue(roll):
                 continue
             if not roll["voice_file"]:
                 errors.append(f"Ролик {i + 1}: не выбран full_voice.mp3.")
@@ -11613,18 +11649,20 @@ class LipsyncTwoModeApp(_BaseApp):
                 complete = bool(roll["voice_file"] and roll["text"] and roll["video_start"] and roll["video_end"])
             if complete:
                 valid.append((i, roll))
-        return valid, errors
+        return valid, errors, skipped_done
 
     def start_queue(self):
         if self.is_processing:
             messagebox.showinfo("Очередь", "Очередь уже обрабатывается.")
             return
-        valid, errors = self.validate_rolls()
+        valid, errors, skipped_done = self.queue_candidates()
         if errors:
             messagebox.showerror("Ошибка", "\n".join(errors))
             return
         if not valid:
-            messagebox.showerror("Ошибка", "Нет роликов для обработки.")
+            messagebox.showerror("Ошибка", "Нет роликов для обработки." + (
+                f"\n\nГотовые сцены ({len(skipped_done)}) не запускаются повторно — чтобы обработать заново, "
+                "нажми «Запустить заново» в карточке сцены." if skipped_done else ""))
             return
         if not self.sync_key or "ВСТАВЬ" in self.sync_key:
             messagebox.showerror(
@@ -11642,9 +11680,9 @@ class LipsyncTwoModeApp(_BaseApp):
             return
         global SYNC_API_KEY
         SYNC_API_KEY = self.sync_key
-        self._confirm_queue_cost(valid)
+        self._confirm_queue_cost(valid, skipped=len(skipped_done))
 
-    def _confirm_queue_cost(self, valid):
+    def _confirm_queue_cost(self, valid, skipped=0):
         """Оценка перед запуском. Любая ошибка расчёта очередь не блокирует — строка «оценка недоступна»."""
         self.start_btn.configure(state="disabled", text="СЧИТАЮ СТОИМОСТЬ…")
         rolls = list(valid)
@@ -11699,16 +11737,18 @@ class LipsyncTwoModeApp(_BaseApp):
             self._persist_sync_price()
             for w in warnings:
                 self.log(f"⚠ {w}")
+            if skipped:
+                self.log(f"Пропущено готовых: {skipped}")
             total = sum(e["cost"] for e in estimates if not e.get("error"))
             if self.cost_confirm_enabled or total > self.cost_confirm_threshold or warnings:
-                self._show_cost_confirm_window(rolls, estimates,
-                                               lambda: self._launch_queue(rolls, estimates), warnings=warnings)
+                self._show_cost_confirm_window(rolls, estimates, lambda: self._launch_queue(rolls, estimates),
+                                               warnings=warnings, skipped=skipped)
             else:
                 self._launch_queue(rolls, estimates)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _show_cost_confirm_window(self, valid, estimates, on_start, warnings=None):
+    def _show_cost_confirm_window(self, valid, estimates, on_start, warnings=None, skipped=0):
         win = ctk.CTkToplevel(self)
         win.title("Стоимость очереди")
         win.configure(fg_color=BG)
@@ -11718,6 +11758,9 @@ class LipsyncTwoModeApp(_BaseApp):
         box.pack(fill="both", expand=True, padx=16, pady=16)
         self.label(box, "Перед запуском: оценка Sync", size=18, weight="bold").pack(
             anchor="w", padx=16, pady=(14, 8))
+        if skipped:
+            self.label(box, f"Пропущено готовых: {skipped} (запустить снова — «Запустить заново» в карточке сцены)",
+                       size=12, color=MUTED).pack(anchor="w", padx=16, pady=(0, 6))
         if warnings:
             warn = self.label(box, "\n".join(warnings), size=12, color="#fcd34d")
             warn.configure(wraplength=700, justify="left")
@@ -12358,7 +12401,7 @@ class LipsyncTwoModeApp(_BaseApp):
         valid, _ = self.validate_rolls()
         queue_estimate = self._queue_estimate_text()
         self.status_label.configure(
-            text=f"готовых роликов: {len(valid)} | всего роликов: {len(self.rolls)}"
+            text=f"к запуску: {len(valid)} | всего роликов: {len(self.rolls)}"
                  + (f" | {queue_estimate}" if queue_estimate else ""))
         self._render_key_status()   # точки ключей, баланс, строки «Настроек»
         self._render_nav_active()
