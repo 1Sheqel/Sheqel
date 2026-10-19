@@ -2121,6 +2121,98 @@ class SyncResultDownloadError(RuntimeError):
     """Sync-задача COMPLETED (оплачена), но результат не сохранён локально — пересоздавать её нельзя."""
 
 
+# ── Лимит одновременных генераций Sync (429 concurrency_limit_reached) ─────
+# Отказ по лимиту — до создания генерации, без оплаты: не тратит SYNC_RETRIES, ассеты не удаляются,
+# повтор — с тем же Idempotency-Key (отказ при допуске освобождает ключ; новый ключ в цикле повтора
+# документация Sync запрещает). Фаза «создание задачи → COMPLETED» проходит через ворота с лимитом N.
+SYNC_CONCURRENCY_WAIT_MIN_SEC = 20
+SYNC_CONCURRENCY_MAX_WAIT_SEC = 2 * 3600       # дольше ждать места в Sync — ошибка ролика
+SYNC_CONCURRENCY_RELEARN_SEC = 24 * 3600       # узнанный лимит раз в сутки проверяется заново
+SYNC_CONCURRENCY_CHOICES = {"авто": None, "1": 1, "2": 2, "3": 3}
+
+
+def parse_sync_concurrency_429(res):
+    """(лимит одновременных генераций?, retryAfterSeconds или None, N из «concurrency limit of N» или None).
+    Тело 429 разбирается терпимо: errorCode, message, retryAfterSeconds, заголовок Retry-After."""
+    text = str(getattr(res, "text", "") or "")
+    try:
+        body = res.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    detail = body.get("detail") if isinstance(body.get("detail"), dict) else {}
+    fields = {**detail, **body}
+    code = str(fields.get("errorCode") or fields.get("error_code") or fields.get("code") or "")
+    hay = f"{code} {fields.get('message') or ''} {fields.get('error') or ''} {text}".lower()
+    is_conc = "concurrency_limit" in hay or "concurrency limit" in hay
+    retry_after = None
+    for raw in (fields.get("retryAfterSeconds"), fields.get("retry_after_seconds"),
+                (getattr(res, "headers", None) or {}).get("Retry-After")):
+        try:
+            if raw is not None:
+                retry_after = max(0.0, float(raw))
+                break
+        except (TypeError, ValueError):
+            continue
+    m = re.search(r"concurrency limit of (\d+)", hay)
+    n = int(m.group(1)) if m and 0 < int(m.group(1)) <= 100 else None
+    return is_conc, retry_after, n
+
+
+class SyncGenerationGate:
+    """Не больше N генераций Sync одновременно (фаза «создание → COMPLETED»). Подготовка видео
+    и загрузка ассетов идут без ворот. N — ручной выбор в «Настройках» или узнанный из ответа 429."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self.active = 0
+        self.manual = None
+        self.learned = None
+        self.max_seen = 0
+
+    @property
+    def limit(self):
+        return self.manual or self.learned
+
+    def configure(self, manual=None, learned=None):
+        with self._cond:
+            self.manual, self.learned = manual, learned
+            self._cond.notify_all()
+
+    def learn(self, n):
+        with self._cond:
+            self.learned = n
+            self._cond.notify_all()
+
+    def acquire(self, log=None):
+        with self._cond:
+            told = False
+            while self.limit and self.active >= self.limit:
+                if log and not told:
+                    log(f"Жду свободного места в Sync (одновременно не больше {self.limit})")
+                    told = True
+                self._cond.wait(1.0)
+            self.active += 1
+            self.max_seen = max(self.max_seen, self.active)
+
+    def release(self):
+        with self._cond:
+            self.active = max(0, self.active - 1)
+            self._cond.notify_all()
+
+
+sync_gen_gate = SyncGenerationGate()
+sync_concurrency_hook = None        # приложение сохраняет узнанный лимит в config
+_sync_sleep = time.sleep            # пауза ожидания места (подменяется в тестах)
+
+
+def effective_queue_workers():
+    """Сколько роликов реально идут параллельно: потоки очереди, но не больше лимита Sync."""
+    limit = sync_gen_gate.limit
+    return max(1, min(CONCURRENT_ROLLS, limit)) if limit else CONCURRENT_ROLLS
+
+
 def apply_lipsync_sync(video_in, audio_wav, final_out, log, options=None, estimate=None,
                        storage="cloudinary", journal_ctx=None):
     """Отправляет видео и аудио в Sync: через хранилище Sync (assetId) или Cloudinary (URL).
@@ -2270,6 +2362,17 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log, options=None, estima
     last_error_code = None
     # Одни и те же options на каждой попытке: sync_mode всегда, плюс выбор лица, если задан.
     request_options = {"sync_mode": SYNC_SYNC_MODE, **(options or {})}
+    gate = {"held": False}
+
+    def gate_take():
+        if not gate["held"]:
+            sync_gen_gate.acquire(log)
+            gate["held"] = True
+
+    def gate_drop():
+        if gate["held"]:
+            gate["held"] = False
+            sync_gen_gate.release()
 
     for attempt in range(1, SYNC_RETRIES + 1):
         session = _make_session()
@@ -2295,31 +2398,55 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log, options=None, estima
             # после подтверждённого провала получает новый ключ.
             idempotency_key = f"sheqel-{uuid.uuid4()}"
             create_headers = dict(headers, **{"Idempotency-Key": idempotency_key})
+            gate_take()                      # не больше N генераций Sync одновременно
             log(f"Создаю задачу Sync (Idempotency-Key {idempotency_key})")
             job_id = None
-            try:
-                res = session.post(
-                    SYNC_GENERATE_URL,
-                    headers=create_headers,
-                    json=payload,
-                    timeout=SYNC_CREATE_TIMEOUT_SEC,
-                )
-            except _NET_ERRORS as e:
-                # Неопределённая ошибка: неизвестно, создался ли job на стороне Sync.
-                log(f"Ambiguous-ошибка при создании job'а: {e} — повторяю тот же запрос "
-                    "с тем же Idempotency-Key")
-                res = _replay_create(payload, create_headers)
-                if res is None:
-                    log("Повтор с ключом не дал ответа — проверяю через /v2/generations")
-                    found_id, confirmed = _find_existing_job(video_ref, audio_ref)
-                    if found_id:
-                        job_id = found_id
-                        log(f"Job подтверждён (id={job_id}) несмотря на ошибку create-запроса — "
-                            "продолжаю без повторной загрузки")
-                    else:
-                        if confirmed:
+            limit_waited = 0.0
+            while True:
+                try:
+                    res = session.post(
+                        SYNC_GENERATE_URL,
+                        headers=create_headers,
+                        json=payload,
+                        timeout=SYNC_CREATE_TIMEOUT_SEC,
+                    )
+                except _NET_ERRORS as e:
+                    # Неопределённая ошибка: неизвестно, создался ли job на стороне Sync.
+                    log(f"Ambiguous-ошибка при создании job'а: {e} — повторяю тот же запрос "
+                        "с тем же Idempotency-Key")
+                    res = _replay_create(payload, create_headers)
+                    if res is None:
+                        log("Повтор с ключом не дал ответа — проверяю через /v2/generations")
+                        found_id, confirmed = _find_existing_job(video_ref, audio_ref)
+                        if found_id:
+                            job_id = found_id
+                            log(f"Job подтверждён (id={job_id}) несмотря на ошибку create-запроса — "
+                                "продолжаю без повторной загрузки")
+                        else:
+                            if confirmed:
+                                pair["safe"] = True
+                            raise
+                if job_id is None and res is not None and res.status_code == 429:
+                    is_conc, retry_after, limit_n = parse_sync_concurrency_429(res)
+                    if is_conc:
+                        if limit_n:
+                            sync_gen_gate.learn(limit_n)
+                            if sync_concurrency_hook:
+                                sync_concurrency_hook(limit_n)
+                        wait = max(retry_after or 0.0, SYNC_CONCURRENCY_WAIT_MIN_SEC)
+                        if limit_waited + wait > SYNC_CONCURRENCY_MAX_WAIT_SEC:
                             pair["safe"] = True
-                        raise
+                            raise RuntimeError("Sync: место для генерации не освободилось за "
+                                               f"{SYNC_CONCURRENCY_MAX_WAIT_SEC // 3600} ч (лимит одновременных)")
+                        log(f"Sync: занято, лимит одновременных генераций"
+                            + (f" — {limit_n}" if limit_n else "") + f". Жду {wait:g} с; попытка не тратится, "
+                            "тот же Idempotency-Key")
+                        gate_drop()
+                        _sync_sleep(wait)
+                        limit_waited += wait
+                        gate_take()
+                        continue
+                break
             if job_id is None:
                 log(f"Sync create response: {res.status_code}")
                 log(res.text[:1500])
@@ -2380,6 +2507,7 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log, options=None, estima
                     log(f"Sync status: {state}")
                     last_state = state
                 if state == "COMPLETED":
+                    gate_drop()                  # генерация закончена — место в Sync свободно
                     # Задача оплачена и готова: любая ошибка дальше — только повтор
                     # скачивания этого же job_id, без новой загрузки и новой задачи.
                     pair["safe"] = True
@@ -2439,12 +2567,14 @@ def apply_lipsync_sync(video_in, audio_wav, final_out, log, options=None, estima
             error_reporter.report("app.apply_lipsync_sync", exc=e, job_id=last_job_id)
             raise
         except Exception as e:
+            gate_drop()
             last_error = e
             log(f"Sync ошибка на попытке {attempt}: {e}")
             if attempt < SYNC_RETRIES:
                 log("Пауза 60 секунд перед повтором...")
                 time.sleep(60)
         finally:
+            gate_drop()
             session.close()
 
     # Удаляем с Cloudinary только те пары, чей исход подтверждён.
@@ -3454,15 +3584,19 @@ def estimate_sync_time(billable_sec):
 
 
 def estimate_queue_time(roll_times, workers=None, stagger=None):
-    """Время всей очереди при параллельности workers: раскладка роликов по потокам в порядке очереди."""
-    workers = max(1, workers or CONCURRENT_ROLLS)
+    """Время всей очереди при параллельности workers (по умолчанию — с учётом лимита Sync):
+    раскладка роликов по потокам в порядке очереди; старт не раньше stagger после предыдущего."""
+    workers = max(1, workers or effective_queue_workers())
     stagger = PAUSE_BETWEEN_ROLLS_SEC if stagger is None else stagger
 
     def makespan(durations):
         free = [0.0] * workers
-        for i, d in enumerate(durations):
+        last_start = -stagger
+        for d in durations:
             w = min(range(workers), key=free.__getitem__)
-            free[w] = max(free[w], i * stagger) + d
+            start = max(free[w], last_start + stagger)
+            last_start = start
+            free[w] = start + d
         return max(free) if durations else 0.0
 
     return makespan([t[0] for t in roll_times]), makespan([t[1] for t in roll_times])
@@ -5365,6 +5499,9 @@ class LipsyncTwoModeApp(_BaseApp):
         self.regender_mode = None                # None — по умолчанию: Groq, если задан ключ; иначе локально
         self.regender_groq_notice_shown = False
         self.audio_effect_presets = {}           # пресеты эффектов звука — в config, переживают очистку данных
+        self.sync_concurrency_mode = None        # None — авто (узнаётся из 429 Sync); 1/2/3 — вручную
+        self.sync_concurrency_learned = None
+        self.sync_concurrency_learned_at = 0.0
         self._fx_catalog, self._fx_catalog_at = load_audio_effects_cache()
         self._fx_fetching = False
         self.cost_confirm_enabled = True
@@ -5445,8 +5582,9 @@ class LipsyncTwoModeApp(_BaseApp):
         self._saved_sync_price = sync_price_state["per_frame"]
         self._restore_state()
         self._apply_nav_collapsed()
-        global sync_job_hook
+        global sync_job_hook, sync_concurrency_hook
         sync_job_hook = self._on_sync_journal_event
+        sync_concurrency_hook = self._on_sync_concurrency_learned
         self.update_status()
         self.after(3000, lambda: self.check_for_updates(silent=True))
         self.after(500, self._check_just_updated)
@@ -5576,6 +5714,29 @@ class LipsyncTwoModeApp(_BaseApp):
         if price and price != self._saved_sync_price:
             self._saved_sync_price = price
             self.save_config()
+
+    def _on_sync_concurrency_learned(self, n):
+        """Поток очереди: Sync ответил 429 «concurrency limit of N» — запоминаем N на сутки."""
+        self.sync_concurrency_learned, self.sync_concurrency_learned_at = n, time.time()
+        self.log(f"Sync: лимит одновременных генераций — {n}; очередь подстраивается")
+        self.after(0, self.save_config)
+
+    def _on_sync_concurrency_change(self, label):
+        self.sync_concurrency_mode = SYNC_CONCURRENCY_CHOICES.get(label)
+        sync_gen_gate.configure(manual=self.sync_concurrency_mode, learned=self.sync_concurrency_learned)
+        self.save_config()
+        self.update_status()
+        if self._settings_widgets:
+            self._render_settings()
+
+    def _sync_concurrency_hint(self):
+        if self.sync_concurrency_mode:
+            return f"Выбрано вами: не больше {self.sync_concurrency_mode}. По умолчанию — авто."
+        if self.sync_concurrency_learned:
+            when = time.strftime("%d.%m %H:%M", time.localtime(self.sync_concurrency_learned_at))
+            return (f"Авто: лимит Sync — {self.sync_concurrency_learned} (узнан {when}, проверяется заново раз в "
+                    f"сутки). Очередь готовит видео параллельно, а в Sync отправляет не больше этого.")
+        return "Авто: лимит узнаётся из ответа Sync, если он откажет из-за занятости. Сейчас не ограничено."
 
     def _has_cloudinary_keys(self):
         return bool(self.cloudinary_cloud_name and self.cloudinary_api_key and self.cloudinary_api_secret)
@@ -6463,6 +6624,9 @@ class LipsyncTwoModeApp(_BaseApp):
             ("menu", "Хранилище файлов для Sync", list(SYNC_STORAGE_MODES),
              lambda: SYNC_STORAGE_LABELS[self.sync_storage], self._on_sync_storage_change,
              self._sync_storage_hint),
+            ("menu", "Одновременных генераций Sync", list(SYNC_CONCURRENCY_CHOICES),
+             lambda: next(k for k, v in SYNC_CONCURRENCY_CHOICES.items() if v == self.sync_concurrency_mode),
+             self._on_sync_concurrency_change, self._sync_concurrency_hint),
             ("menu", "Частота кадров для Sync", list(SYNC_FPS_MODES),
              lambda: SYNC_FPS_LABELS[self.sync_fps_mode], self._on_sync_fps_change),
             ("switch", "Показывать окно стоимости перед запуском", self.cost_confirm_var,
@@ -12318,6 +12482,12 @@ class LipsyncTwoModeApp(_BaseApp):
             mode = data.get("regender_mode")
             self.regender_mode = mode if mode in REGENDER_MODES.values() else None
             self.regender_groq_notice_shown = bool(data.get("regender_groq_notice_shown", False))
+            mode = data.get("sync_concurrency_mode")
+            self.sync_concurrency_mode = mode if mode in SYNC_CONCURRENCY_CHOICES.values() and mode else None
+            learned, learned_at = data.get("sync_concurrency_learned"), float(data.get("sync_concurrency_learned_at") or 0)
+            if isinstance(learned, int) and 0 < learned <= 100 and time.time() - learned_at < SYNC_CONCURRENCY_RELEARN_SEC:
+                self.sync_concurrency_learned, self.sync_concurrency_learned_at = learned, learned_at
+            sync_gen_gate.configure(manual=self.sync_concurrency_mode, learned=self.sync_concurrency_learned)
             presets = data.get("audio_effect_presets")
             if isinstance(presets, dict):
                 self.audio_effect_presets = {str(k)[:40]: normalize_audio_effects(v) for k, v in
@@ -12385,6 +12555,9 @@ class LipsyncTwoModeApp(_BaseApp):
                 "regender_mode":         getattr(self, "regender_mode", None),
                 "regender_groq_notice_shown": getattr(self, "regender_groq_notice_shown", False),
                 "audio_effect_presets":  getattr(self, "audio_effect_presets", {}),
+                "sync_concurrency_mode": getattr(self, "sync_concurrency_mode", None),
+                "sync_concurrency_learned": getattr(self, "sync_concurrency_learned", None),
+                "sync_concurrency_learned_at": getattr(self, "sync_concurrency_learned_at", 0.0),
                 "voice_expiry_list":     _locked_copy(self, "_expiry_lock", "voice_expiry_list"),
                 "groq_api_key":          self.groq_api_key,
                 "groq_used_seconds":     _locked_copy(self, "_groq_lock", "groq_used_seconds"),
