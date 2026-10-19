@@ -1649,6 +1649,11 @@ SYNC_ASSET_PUT_TIMEOUT = (10, 600)          # (соединение, ожида�
 SYNC_ASSET_EXPIRY_MARGIN_SEC = 60
 CLOUDINARY_FALLBACK_MAX_BYTES = 100 * 1024 * 1024
 SYNC_STORAGE_MODES = {"Sync (рекомендуется)": "sync", "Cloudinary": "cloudinary"}
+REGENDER_MODES = {"Groq (текст уходит в Groq)": "groq", "Только локально": "local"}
+REGENDER_MODE_LABELS = {v: k for k, v in REGENDER_MODES.items()}
+VOICE_GENDER_CHOICES = {"не задан": None, "мужской": "male", "женский": "female"}
+VOICE_GENDER_TEXT = {"male": "мужской", "female": "женский"}
+GENDER_RECALC_MS = 400               # пересчёт рода текста после паузы в наборе
 SYNC_STORAGE_LABELS = {v: k for k, v in SYNC_STORAGE_MODES.items()}
 
 
@@ -5101,6 +5106,10 @@ class LipsyncTwoModeApp(_BaseApp):
         self.clear_text_after_clone_var = ctk.BooleanVar(value=True)
         self.spellcheck_online = True            # LanguageTool: текст генератора уходит на languagetool.org
         self.spellcheck_online_var = ctk.BooleanVar(value=True)
+        self.gender_highlight = True             # подсветка рода текста в генераторе
+        self.gender_highlight_var = ctk.BooleanVar(value=True)
+        self.regender_mode = None                # None — по умолчанию: Groq, если задан ключ; иначе локально
+        self.regender_groq_notice_shown = False
         self.cost_confirm_enabled = True
         self.cost_confirm_threshold = COST_CONFIRM_DEFAULT_THRESHOLD
         self.queue_panel_mode = "running"
@@ -5175,6 +5184,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.cost_confirm_var.set(self.cost_confirm_enabled)
         self.clear_text_after_clone_var.set(self.clear_text_after_clone)
         self.spellcheck_online_var.set(self.spellcheck_online)
+        self.gender_highlight_var.set(self.gender_highlight)
         self._saved_sync_price = sync_price_state["per_frame"]
         self._restore_state()
         self._apply_nav_collapsed()
@@ -6212,6 +6222,11 @@ class LipsyncTwoModeApp(_BaseApp):
              self._on_clear_after_clone_toggle),
             ("switch", "Проверка орфографии (текст отправляется на languagetool.org)", self.spellcheck_online_var,
              self._on_spellcheck_toggle),
+            ("switch", "Подсвечивать род текста в генераторе голоса", self.gender_highlight_var,
+             self._on_gender_highlight_toggle),
+            ("menu", "Править род текста", list(REGENDER_MODES),
+             lambda: REGENDER_MODE_LABELS[self._regender_effective_mode()], self._on_regender_mode_change,
+             self._regender_mode_hint),
             ("buttons", "Отчёты об ошибках", [("Показать пример отчёта", self.show_report_example, BTN),
                                               ("Отправить тестовый отчёт", self.send_test_report, BTN)]),
             ("menu", "Ход очереди", list(QUEUE_PANEL_MODES), lambda: QUEUE_PANEL_LABELS[self.queue_panel_mode],
@@ -7268,6 +7283,65 @@ class LipsyncTwoModeApp(_BaseApp):
             messagebox.showwarning("Результат из Sync", text, parent=self)
 
     # ── Итог клонирования: голос в генератор, очистка текста ─────────────
+    def _regender_effective_mode(self):
+        return self.regender_mode or ("groq" if self.groq_api_key else "local")
+
+    def _regender_mode_hint(self):
+        return ("По умолчанию: Groq, если задан ключ Groq, иначе только локально. "
+                + ("Выбрано вами." if self.regender_mode else "Сейчас действует умолчание."))
+
+    def _on_regender_mode_change(self, label):
+        self.regender_mode = REGENDER_MODES[label]
+        self.save_config()
+        if self._settings_widgets:
+            self._render_settings()
+
+    def _on_gender_highlight_toggle(self):
+        self.gender_highlight = bool(self.gender_highlight_var.get())
+        self.save_config()
+        vg = getattr(self, "_vg", None)
+        if vg and vg.get("gender_refresh"):
+            vg["gender_refresh"]()
+
+    def _voice_gender_store(self):
+        st = self._panel_state.setdefault("voice_gender", {})
+        for k in ("labels", "names", "user"):
+            if not isinstance(st.get(k), dict):
+                st[k] = {}
+        return st
+
+    def _remember_voice_labels(self, voices):
+        """Пол из меток ElevenLabs (labels.gender: male/female); у клонов метки обычно нет."""
+        st = self._voice_gender_store()
+        for v in voices:
+            vid = v.get("voice_id")
+            if not vid:
+                continue
+            if v.get("gender") in ("male", "female"):
+                st["labels"][vid] = v["gender"]
+            else:
+                st["labels"].pop(vid, None)
+            if v.get("name"):
+                st["names"][v["name"].strip().lower()] = vid
+
+    def _voice_gender_for(self, voice_id, name):
+        """(пол или None, источник: label|user|None, ключ для выбора пользователя)."""
+        st = self._voice_gender_store()
+        vid = voice_id or st["names"].get((name or "").strip().lower(), "")
+        key = vid or "name:" + (name or "").strip().lower()
+        if vid and st["labels"].get(vid) in ("male", "female"):
+            return st["labels"][vid], "label", key
+        g = st["user"].get(key)
+        return (g, "user", key) if g in ("male", "female") else (None, None, key)
+
+    def _set_user_voice_gender(self, key, gender):
+        st = self._voice_gender_store()
+        if gender in ("male", "female"):
+            st["user"][key] = gender
+        else:
+            st["user"].pop(key, None)
+        self._schedule_state_save()
+
     def _on_spellcheck_toggle(self):
         self.spellcheck_online = bool(self.spellcheck_online_var.get())
         self.save_config()
@@ -7357,6 +7431,12 @@ class LipsyncTwoModeApp(_BaseApp):
             messagebox.showwarning("Клонирование", f"Голос «{name}» создан, но подставить его в генератор "
                                    "не удалось. Текст генерации не тронут — выбери голос вручную: "
                                    "«Выбрать из списка моих голосов».", parent=self)
+        gender = result.get("gender") or task.get("meta", {}).get("gender")
+        if applied and gender in ("male", "female"):
+            self._set_user_voice_gender(voice_id, gender)     # пол, выбранный при клонировании
+            vg = getattr(self, "_vg", None)
+            if vg and vg.get("gender_refresh"):
+                vg["gender_refresh"]()
         if self._clone_cleanup is not None:
             try:
                 self._clone_cleanup()
@@ -7416,6 +7496,7 @@ class LipsyncTwoModeApp(_BaseApp):
         if self.clear_text_after_clone and current.strip():
             try:
                 state["text_backup"] = current       # «Вернуть» — и после перезапуска
+                state["text_backup_kind"] = "clone"
                 state["text"] = ""
                 if widget is not None:
                     widget.delete("1.0", "end")
@@ -7698,7 +7779,9 @@ class LipsyncTwoModeApp(_BaseApp):
                 "category": category,
                 "preview_url": v.get("preview_url", ""),
                 "created_at": v.get("created_at_unix", 0),
+                "gender": str((v.get("labels") or {}).get("gender") or "").lower(),
             })
+        self._remember_voice_labels(result)
         return result
     
     def create_voice_from_sample(self, audio_path, voice_name, description=""):
@@ -7798,6 +7881,12 @@ class LipsyncTwoModeApp(_BaseApp):
         )
         desc_entry.pack(fill="x", padx=22, pady=(6, 14))
         self._fix_paste(desc_entry)
+
+        self.label(frame, "Пол голоса (для подсказки о роде текста)", size=14, weight="bold").pack(anchor="w", padx=22)
+        clone_gender_var = ctk.StringVar(value="не задан")
+        ctk.CTkOptionMenu(frame, values=list(VOICE_GENDER_CHOICES), variable=clone_gender_var, fg_color=BTN,
+                          button_color=BTN, button_hover_color=BTN_HOVER, width=150).pack(
+            anchor="w", padx=22, pady=(6, 14))
 
         selected = {"path": ""}
         extracted = {"tmp_dir": None}
@@ -7981,8 +8070,9 @@ class LipsyncTwoModeApp(_BaseApp):
             if tasks.active(kind="clone_upload"):
                 return
             # Загрузка в ElevenLabs — в фоне: окно не зависает, вкладки можно переключать.
+            gender = VOICE_GENDER_CHOICES.get(clone_gender_var.get())
             task_id = tasks.create("clone_upload", "voice_clone", title=f"Клон «{name}»",
-                                   meta={"name": name}, status="running")
+                                   meta={"name": name, "gender": gender}, status="running")
             clone_state["announce"] = task_id
             self._clone_pending.add(task_id)
             render_clone()
@@ -7994,7 +8084,8 @@ class LipsyncTwoModeApp(_BaseApp):
                                       "expires_at": time.time() + 10 * 60 * 60})
                     self.save_config()
                     # Голос и текст генератора меняет главный поток (_on_clone_finished) — при любой вкладке.
-                    tasks.update(task_id, status="done", result={"voice_id": voice_id, "name": name})
+                    tasks.update(task_id, status="done", result={"voice_id": voice_id, "name": name,
+                                                                 "gender": gender})
                 except Exception as e:
                     tasks.update(task_id, status="error", error=str(e))
 
@@ -9158,11 +9249,23 @@ class LipsyncTwoModeApp(_BaseApp):
             voice_box.insert("1.0", saved.get("voice") or self.main_voice_name)
         self._fix_paste(voice_box)
 
+        # Пол голоса: метка ElevenLabs или выбор пользователя (для клонов без метки); предупреждение.
+        vgender_row = ctk.CTkFrame(frame, fg_color="transparent")
+        self.label(vgender_row, "Пол голоса:", size=12, color=MUTED).pack(side="left", padx=(0, 6))
+        vgender_info = self.label(vgender_row, "", size=12, color=MUTED)
+        vgender_var = ctk.StringVar(value="не задан")
+        vgender_menu = ctk.CTkOptionMenu(vgender_row, values=list(VOICE_GENDER_CHOICES), variable=vgender_var,
+                                         fg_color=BTN, button_color=BTN, button_hover_color=BTN_HOVER, width=130,
+                                         height=26, command=lambda label: on_vgender_pick(label))
+        vgender_warn = self.label(frame, "", size=12, color="#fcd34d")
+        vgender_warn.configure(wraplength=440, justify="left")
+
         def on_voice_picked(name, voice_id):
             voice_box.delete("1.0", "end")
             voice_box.insert("1.0", name)
             self._panel_state.setdefault("voice_gen", {})["voice_id"] = voice_id
             save_fields()
+            render_gender()
 
         self.button(frame, "📋 Выбрать из списка моих голосов",
                     lambda: self.open_voice_picker(self, on_voice_picked),
@@ -9173,11 +9276,14 @@ class LipsyncTwoModeApp(_BaseApp):
         self.label(frame, "Текст (один для обоих вариантов)", size=14, weight="bold").pack(
             anchor="w", padx=22)
         restore_row = ctk.CTkFrame(frame, fg_color="#2a2d3e", corner_radius=8)
-        self.label(restore_row, "Текст очищен после клонирования.", size=12, color="#fcd34d").pack(
-            side="left", padx=10, pady=4)
+        restore_lbl = self.label(restore_row, "Текст очищен после клонирования.", size=12, color="#fcd34d")
+        restore_lbl.pack(side="left", padx=10, pady=4)
         restore_btn = ctk.CTkButton(restore_row, text="Вернуть", width=90, height=24, fg_color=BTN,
                                     hover_color=BTN_HOVER, text_color=TEXT, corner_radius=8)
         restore_btn.pack(side="left", pady=4)
+        restore_close = ctk.CTkButton(restore_row, text="✕", width=28, height=24, fg_color="transparent",
+                                      hover_color=BTN_HOVER, text_color=TEXT)
+        restore_close.pack(side="right", padx=(4, 8))
         text_box = ctk.CTkTextbox(
             frame, height=180,
             fg_color="#ffffff", text_color="#111111",
@@ -9192,6 +9298,9 @@ class LipsyncTwoModeApp(_BaseApp):
 
         def render_restore_notice():
             backup = self._panel_state_get("voice_gen", "text_backup")
+            kind = self._panel_state_get("voice_gen", "text_backup_kind")
+            restore_lbl.configure(text="Текст изменён (род)." if kind == "regender"
+                                  else "Текст очищен после клонирования.")
             if backup and not restore_row.winfo_manager():
                 restore_row.pack(fill="x", padx=22, pady=(6, 0), before=text_box)
             elif not backup and restore_row.winfo_manager():
@@ -9203,11 +9312,19 @@ class LipsyncTwoModeApp(_BaseApp):
                 text_box.delete("1.0", "end")
                 text_box.insert("1.0", backup)
             self._panel_state.setdefault("voice_gen", {}).pop("text_backup", None)
+            self._panel_state["voice_gen"].pop("text_backup_kind", None)
             render_restore_notice()
             save_fields()
             _update_status()
 
+        def dismiss_restore():
+            self._panel_state.setdefault("voice_gen", {}).pop("text_backup", None)
+            self._panel_state["voice_gen"].pop("text_backup_kind", None)
+            self._schedule_state_save()
+            render_restore_notice()
+
         restore_btn.configure(command=restore_text)
+        restore_close.configure(command=dismiss_restore)
 
         # ── Счётчик символов ──────────────────────────────────────────────
         status_text_label = ctk.CTkLabel(
@@ -9215,6 +9332,45 @@ class LipsyncTwoModeApp(_BaseApp):
             font=ctk.CTkFont(size=12), text_color=MUTED, anchor="w"
         )
         status_text_label.pack(anchor="w", padx=22, pady=(0, 8))
+
+        # ── Род текста: строка, кнопки, уведомление о Groq, предпросмотр ─────
+        gender_row = ctk.CTkFrame(frame, fg_color="transparent")
+        gender_lbl = ctk.CTkLabel(gender_row, text="", font=ctk.CTkFont(size=12), text_color=MUTED,
+                                  anchor="w", justify="left", wraplength=440)
+        gender_lbl.pack(anchor="w")
+        gender_btn_row = ctk.CTkFrame(gender_row, fg_color="transparent")     # кнопки — отдельной строкой
+        rg_btns = {}
+        for tgt, caption in ((GENDER_MALE, "Привести к мужскому роду"), (GENDER_FEMALE, "Привести к женскому роду")):
+            rg_btns[tgt] = ctk.CTkButton(gender_btn_row, text=caption, width=200, height=26, corner_radius=8,
+                                         fg_color=BTN, hover_color=BTN_HOVER, text_color=TEXT,
+                                         font=ctk.CTkFont(size=12), command=lambda t=tgt: start_regender(t))
+        rg_notice = ctk.CTkFrame(frame, fg_color="#2a2d3e", corner_radius=10)
+        rg_notice_lbl = self.label(rg_notice, "Текст будет отправлен в Groq (как в переводчике), чтобы поправить род "
+                                              "слов говорящего. Можно править только локально — без отправки, "
+                                              "заменой окончаний.", size=12, color="#fcd34d")
+        rg_notice_lbl.configure(wraplength=440, justify="left")
+        rg_notice_lbl.pack(anchor="w", padx=12, pady=(8, 4))
+        rg_notice_btns = ctk.CTkFrame(rg_notice, fg_color="transparent")
+        rg_notice_btns.pack(fill="x", padx=10, pady=(0, 8))
+        rg_preview = ctk.CTkFrame(frame, fg_color=CARD, corner_radius=12)
+        rg_head = self.label(rg_preview, "", size=12, color=TEXT)
+        rg_head.configure(wraplength=440, justify="left")
+        rg_head.pack(anchor="w", padx=12, pady=(10, 4))
+        rg_boxes = {}
+        for key, caption in (("before", "Было"), ("after", "Стало")):
+            self.label(rg_preview, caption, size=12, color=MUTED).pack(anchor="w", padx=12)
+            box = ctk.CTkTextbox(rg_preview, height=90, fg_color="#ffffff", text_color="#111111", wrap="word",
+                                 corner_radius=8, font=ctk.CTkFont(size=13))
+            box.pack(fill="x", padx=12, pady=(2, 6))
+            box._textbox.tag_config("changed", background="#fecaca" if key == "before" else "#bbf7d0")
+            rg_boxes[key] = box
+        rg_preview_btns = ctk.CTkFrame(rg_preview, fg_color="transparent")
+        rg_preview_btns.pack(fill="x", padx=10, pady=(0, 10))
+        rg_apply_btn = self.button(rg_preview_btns, "Применить", lambda: apply_regender(),
+                                   color=BTN_OK, hover=BTN_OK_HOVER, width=130)
+        rg_apply_btn.pack(side="left")
+        self.button(rg_preview_btns, "Отмена", lambda: hide_preview(),
+                    color=BTN, hover=BTN_HOVER, width=110).pack(side="left", padx=8)
 
         # ── Модель и язык ─────────────────────────────────────────────────
         model_row = ctk.CTkFrame(frame, fg_color="transparent")
@@ -9412,7 +9568,9 @@ class LipsyncTwoModeApp(_BaseApp):
                 lang=lang_var.get(),
             )
             # В поле появился новый текст (набор, вставка, переводчик) — старый больше не предлагаем.
-            if text.strip() and self._panel_state_get("voice_gen", "text_backup"):
+            # Резерв правки рода остаётся до «Вернуть» или «✕»: текст после правки не пустой.
+            if text.strip() and self._panel_state_get("voice_gen", "text_backup") \
+                    and self._panel_state_get("voice_gen", "text_backup_kind") != "regender":
                 self._panel_state["voice_gen"].pop("text_backup", None)
                 render_restore_notice()
 
@@ -9532,6 +9690,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 status_text_label.configure(
                     text=f"⚠ {chars} символов · {errors} ошибок",
                     text_color="#fcd34d")
+            schedule_gender()
 
         def check_spelling(text):
             try:
@@ -9592,9 +9751,249 @@ class LipsyncTwoModeApp(_BaseApp):
         tk_text.bind("<KeyRelease>", lambda e: save_fields(), add="+")
         model_var.trace_add("write", lambda *a: save_fields())
         lang_var.trace_add("write", lambda *a: save_fields())
+
+        # ── Род текста: пересчёт после паузы в наборе, анализ в фоне ─────────
+        tk_text.tag_config("gender_f", background="#fce7f3")
+        tk_text.tag_config("gender_m", background="#dbeafe")
+        tk_text.tag_lower("gender_f")
+        tk_text.tag_lower("gender_m")
+        gstate = {"analysis": None, "seq": 0, "timer": None, "busy": False, "pending": None, "notice_target": None}
+
+        def schedule_gender(*_):
+            if gstate["timer"]:
+                try:
+                    frame.after_cancel(gstate["timer"])
+                except Exception:
+                    pass
+            gstate["timer"] = frame.after(GENDER_RECALC_MS, run_gender)
+
+        def run_gender():
+            gstate["timer"] = None
+            gstate["seq"] += 1
+            seq = gstate["seq"]
+            text = text_box.get("1.0", "end-1c")
+            if not text_gender_applicable(text, lang_var.get()):
+                apply_gender(None, seq)
+                return
+
+            def work():
+                try:
+                    res = analyze_text_gender(text)
+                except Exception as e:
+                    write_log_file(f"Род текста: анализ не удался ({type(e).__name__})")
+                    error_reporter.report(regender_report_where("analyze"), exc_type=type(e).__name__,
+                                          message=regender_report_message("analyze", e))
+                    res = None
+                self.after(0, lambda: apply_gender(res, seq))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def apply_gender(res, seq):
+            if seq != gstate["seq"] or not frame.winfo_exists():
+                return                                   # пришёл устаревший результат: текст уже другой
+            gstate["analysis"] = res
+            tk_text.tag_remove("gender_f", "1.0", "end")
+            tk_text.tag_remove("gender_m", "1.0", "end")
+            if res and self.gender_highlight:
+                for w in res["words"]:
+                    tk_text.tag_add("gender_f" if w["gender"] == GENDER_FEMALE else "gender_m",
+                                    f"1.0 + {w['start']} chars", f"1.0 + {w['end']} chars")
+            render_gender()
+
+        def render_gender():
+            res = gstate["analysis"]
+            if res is None:
+                for w in (gender_row, vgender_row, vgender_warn, rg_notice):
+                    w.pack_forget()
+                return
+            g = res["gender"]
+            caption = f"Род текста: {GENDER_TEXT_LABELS[g]}"
+            if res["words"]:
+                caption += " · " + gender_words_summary(res["words"])
+            if gstate["busy"]:
+                caption += " · правлю…"
+            gender_lbl.configure(text=caption, text_color="#fcd34d" if g == GENDER_MIXED else MUTED)
+            if not gender_row.winfo_manager():
+                gender_row.pack(anchor="w", fill="x", padx=22, pady=(0, 8), after=status_text_label)
+            voice_id, name = self._selected_generator_voice()
+            vg_gender, source, _ = self._voice_gender_for(voice_id, name) if name else (None, None, None)
+            if name:
+                if source == "label":
+                    vgender_menu.pack_forget()
+                    vgender_info.configure(text=f"{VOICE_GENDER_TEXT[vg_gender]} (метка ElevenLabs)")
+                    if not vgender_info.winfo_manager():
+                        vgender_info.pack(side="left")
+                else:
+                    vgender_info.pack_forget()
+                    vgender_var.set(next(k for k, v in VOICE_GENDER_CHOICES.items() if v == vg_gender))
+                    if not vgender_menu.winfo_manager():
+                        vgender_menu.pack(side="left")
+                if not vgender_row.winfo_manager():
+                    vgender_row.pack(anchor="w", padx=22, pady=(0, 6), after=voice_box)
+            else:
+                vgender_row.pack_forget()
+            if vg_gender and g in (GENDER_MALE, GENDER_FEMALE) and g != vg_gender:
+                other = [w["word"] for w in res["words"] if w["gender"] != vg_gender]
+                vgender_warn.configure(text=f"Голос «{name}» {VOICE_GENDER_TEXT[vg_gender]}, а текст в "
+                                            f"{'женском' if g == GENDER_FEMALE else 'мужском'} роде: "
+                                            f"{gender_words_summary([{'word': x} for x in other])}")
+                if not vgender_warn.winfo_manager():
+                    vgender_warn.pack(anchor="w", padx=22, pady=(0, 8), after=vgender_row)
+            else:
+                vgender_warn.pack_forget()
+            for b in rg_btns.values():
+                b.pack_forget()
+            gender_btn_row.pack_forget()
+            state = "disabled" if gstate["busy"] else "normal"
+            if g == GENDER_UNKNOWN or (vg_gender and g == vg_gender):
+                return
+            gender_btn_row.pack(anchor="w", pady=(4, 0))
+            if vg_gender:
+                if g != vg_gender:                       # пол известен и не совпадает: одна подсвеченная кнопка
+                    rg_btns[vg_gender].configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER, state=state)
+                    rg_btns[vg_gender].pack(side="left", padx=(0, 6))
+                return
+            for tgt in (GENDER_MALE, GENDER_FEMALE):     # пол не задан: оба направления
+                rg_btns[tgt].configure(fg_color=BTN, hover_color=BTN_HOVER,
+                                       state="disabled" if g == tgt or gstate["busy"] else "normal")
+                rg_btns[tgt].pack(side="left", padx=(0, 6))
+
+        def on_vgender_pick(label):
+            voice_id, name = self._selected_generator_voice()
+            if not name:
+                return
+            _, _, key = self._voice_gender_for(voice_id, name)
+            self._set_user_voice_gender(key, VOICE_GENDER_CHOICES.get(label))
+            render_gender()
+
+        def hide_notice():
+            gstate["notice_target"] = None
+            rg_notice.pack_forget()
+
+        def notice_choice(use_groq):
+            target = gstate["notice_target"]
+            hide_notice()
+            self.regender_groq_notice_shown = True
+            if not use_groq:
+                self.regender_mode = "local"
+            self.save_config()
+            if target:
+                run_regender(target, use_groq)
+
+        for caption, cmd, color in (("Отправить в Groq", lambda: notice_choice(True), BTN_OK),
+                                    ("Только локально", lambda: notice_choice(False), BTN),
+                                    ("Отмена", hide_notice, BTN)):
+            ctk.CTkButton(rg_notice_btns, text=caption, command=cmd, width=140, height=26, corner_radius=8,
+                          fg_color=color, hover_color=BTN_OK_HOVER if color == BTN_OK else BTN_HOVER,
+                          text_color=TEXT, font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 6))
+
+        def start_regender(target):
+            if gstate["busy"] or not text_box.get("1.0", "end-1c").strip():
+                return
+            hide_preview()
+            use_groq = self._regender_effective_mode() == "groq"
+            if use_groq and not self.regender_groq_notice_shown:
+                gstate["notice_target"] = target       # первый раз: спросить про отправку в Groq
+                rg_notice.pack(fill="x", padx=22, pady=(0, 10), after=gender_row)
+                return
+            run_regender(target, use_groq)
+
+        def run_regender(target, use_groq):
+            text = text_box.get("1.0", "end-1c")
+            key = self.groq_api_key if use_groq else ""
+            gstate["busy"] = True
+            render_gender()
+
+            def work():
+                stage = "groq" if use_groq and key else "local"
+                try:
+                    res = regender_text(text, target, key, use_groq=use_groq, log=self.log)
+                except Exception as e:
+                    write_log_file(f"Род текста: правка не удалась ({type(e).__name__})")
+                    error_reporter.report(regender_report_where(stage), exc_type=type(e).__name__,
+                                          message=regender_report_message(stage, e))
+                    res = None
+                self.after(0, lambda: finish_regender(res, text, target))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def finish_regender(res, src_text, target):
+            gstate["busy"] = False
+            render_gender()
+            if res is None:
+                messagebox.showerror("Род текста", "Не удалось поправить род. Текст не изменён.", parent=self)
+                return
+            show_preview(res, src_text, target)
+
+        def fill_box(box, text, ranges):
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+            for a, b in ranges:
+                box._textbox.tag_add("changed", f"1.0 + {a} chars", f"1.0 + {b} chars")
+            box.configure(state="disabled")
+
+        def show_preview(res, src_text, target):
+            n = len(res["changes"])
+            rod = "мужскому" if target == GENDER_MALE else "женскому"
+            if not n:
+                head = f"Менять нечего: слова говорящего уже приведены к {rod} роду."
+            elif res["source"] == "groq":
+                head = f"Groq привёл к {rod} роду слов: {n}. Проверьте и нажмите «Применить»."
+            elif res.get("groq_tried"):
+                head = (f"Groq не помог ({res['note']}) — использована локальная замена окончаний. "
+                        f"Изменено слов: {n}.")
+            else:
+                head = (f"Использована локальная замена окончаний (текст никуда не отправлялся"
+                        + (f"; {res['note']}" if res["note"] else "") + f"). Изменено слов: {n}.")
+            if res.get("missed"):
+                head += f" Не удалось заменить: {', '.join(res['missed'][:5])} — поправьте вручную."
+            rg_head.configure(text=head)
+            fill_box(rg_boxes["before"], src_text, [(c["old_start"], c["old_end"]) for c in res["changes"]])
+            fill_box(rg_boxes["after"], res["text"], [(c["new_start"], c["new_end"]) for c in res["changes"]])
+            rg_apply_btn.configure(state="normal" if n else "disabled")
+            gstate["pending"] = {"src": src_text, "new": res["text"], "target": target, "source": res["source"],
+                                 "count": n}
+            rg_preview.pack(fill="x", padx=22, pady=(0, 10), after=gender_row)
+
+        def hide_preview():
+            gstate["pending"] = None
+            rg_preview.pack_forget()
+
+        def apply_regender():
+            pending = gstate["pending"]
+            if not pending:
+                return
+            if text_box.get("1.0", "end-1c") != pending["src"]:
+                hide_preview()
+                messagebox.showwarning("Род текста", "Текст изменился после предпросмотра — нажмите кнопку "
+                                                     "ещё раз.", parent=self)
+                return
+            state = self._panel_state.setdefault("voice_gen", {})
+            state["text_backup"] = pending["src"]      # «Вернуть» — и после перезапуска
+            state["text_backup_kind"] = "regender"
+            text_box.delete("1.0", "end")
+            text_box.insert("1.0", pending["new"])
+            hide_preview()
+            render_restore_notice()
+            save_fields()
+            _update_status()
+            self.log(f"Род текста приведён к {'мужскому' if pending['target'] == GENDER_MALE else 'женскому'} "
+                     f"({pending['source']}, слов: {pending['count']})")
+
+        voice_box._textbox.bind("<KeyRelease>", lambda e: render_gender(), add="+")
+        lang_var.trace_add("write", lambda *a: schedule_gender())
         self._vg = {"voice_box": voice_box, "text_box": text_box, "save_fields": save_fields,
                     "update_status": lambda: self.after(100, _update_status),
-                    "render_restore_notice": render_restore_notice}
+                    "render_restore_notice": render_restore_notice,
+                    "gender_refresh": lambda: apply_gender(gstate["analysis"], gstate["seq"]),
+                    "gender": {"state": gstate, "label": gender_lbl, "buttons": rg_btns, "warn": vgender_warn,
+                               "row": gender_row, "vgender_row": vgender_row, "vgender_menu": vgender_menu,
+                               "vgender_info": vgender_info, "notice": rg_notice, "preview": rg_preview,
+                               "head": rg_head, "boxes": rg_boxes, "apply": apply_regender,
+                               "start": start_regender, "notice_choice": notice_choice,
+                               "pick_gender": on_vgender_pick, "restore_label": restore_lbl,
+                               "restore": restore_text, "lang": lang_var}}
         render_restore_notice()
         self._register_renderer("voice_gen", render_slots)
         if saved.get("text"):
@@ -11162,6 +11561,10 @@ class LipsyncTwoModeApp(_BaseApp):
             self.main_voice_id = data.get("main_voice_id", "") or getattr(self, "main_voice_id", "")
             self.clear_text_after_clone = bool(data.get("clear_text_after_clone", True))
             self.spellcheck_online = bool(data.get("spellcheck_online", True))
+            self.gender_highlight = bool(data.get("gender_highlight", True))
+            mode = data.get("regender_mode")
+            self.regender_mode = mode if mode in REGENDER_MODES.values() else None
+            self.regender_groq_notice_shown = bool(data.get("regender_groq_notice_shown", False))
             with _lock_of(self, "_expiry_lock"):
                 self.voice_expiry_list = list(data.get("voice_expiry_list", []))
             self.groq_api_key = data.get("groq_api_key", "") or self.groq_api_key
@@ -11221,6 +11624,9 @@ class LipsyncTwoModeApp(_BaseApp):
                 "main_voice_id":         getattr(self, "main_voice_id", ""),
                 "clear_text_after_clone": getattr(self, "clear_text_after_clone", True),
                 "spellcheck_online":     getattr(self, "spellcheck_online", True),
+                "gender_highlight":      getattr(self, "gender_highlight", True),
+                "regender_mode":         getattr(self, "regender_mode", None),
+                "regender_groq_notice_shown": getattr(self, "regender_groq_notice_shown", False),
                 "voice_expiry_list":     _locked_copy(self, "_expiry_lock", "voice_expiry_list"),
                 "groq_api_key":          self.groq_api_key,
                 "groq_used_seconds":     _locked_copy(self, "_groq_lock", "groq_used_seconds"),
