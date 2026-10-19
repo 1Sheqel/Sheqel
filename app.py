@@ -1217,6 +1217,7 @@ NAV_ICONS = {
     "new_task": "➕",
     "clear_all": "🗑",
     "update": "🔄",
+    "history": "🗂",
     "settings": "⚙",
 }
 NAV_ARROW_OPEN = "▼"
@@ -1387,6 +1388,17 @@ AUDIO_EFFECT_FIELDS = {"filter_preset_id": "фильтр", "environment_id": "п
                        "background_noise_id": "фоновый шум", "distance": "расстояние", "send_level": "уровень",
                        "pan": "панорама", "audio_effects": "эффекты"}
 ROLL_QUEUED = "В очереди"
+QUEUE_HISTORY_MAX = 20
+
+
+def format_bytes(n):
+    """«850 КБ», «12.4 МБ», «1.3 ГБ» — для истории партий."""
+    n = float(n or 0)
+    if n < MB:
+        return f"{max(1, round(n / 1024))} КБ"
+    if n < 1024 * MB:
+        return f"{n / MB:.1f} МБ"
+    return f"{n / (1024 * MB):.1f} ГБ"
 
 
 def roll_in_queue(roll):
@@ -5544,6 +5556,8 @@ class LipsyncTwoModeApp(_BaseApp):
         self._queue_last_start = 0.0
         self._queue_failed = []
         self._queue_costing = False      # идёт расчёт стоимости — кнопку не трогаем
+        self._queue_history = []         # последние партии (state.json): папка, время, готово, ошибок
+        self._history_sizes = {}         # размер папки партии — считается лениво, в фоне
         self._qp_w = {}
         self._qp_forced = False
         self._qp_details_open = False
@@ -6422,6 +6436,8 @@ class LipsyncTwoModeApp(_BaseApp):
             "selected_roll_id": self.selected_roll_id,
             "panels": self._panel_state,
             "queue_active_batch": self._queue_batch_dir if self.is_processing else None,
+            "queue_summary": self._queue_summary,
+            "queue_history": self._queue_history,
             "tasks": self.background_tasks.snapshot(),
             "sync_journal": journal,
         }
@@ -6477,6 +6493,13 @@ class LipsyncTwoModeApp(_BaseApp):
         if rolls or data.get("tasks"):
             self.log(f"Восстановлено из прошлой сессии: роликов {len(rolls or [])}, "
                      f"задач {len(data.get('tasks') or [])}, записей журнала Sync {len(self._sync_journal)}")
+        history = data.get("queue_history")
+        self._queue_history = [h for h in history if isinstance(h, dict) and h.get("batch_dir")][:QUEUE_HISTORY_MAX] \
+            if isinstance(history, list) else []
+        summary = data.get("queue_summary")
+        if isinstance(summary, dict) and {"batch_dir", "total", "failed"} <= set(summary):
+            self._queue_summary = summary               # итог последней очереди — и после перезапуска
+            self.after(0, self._render_queue_panel)
         if requeued:
             self.log(f"Сцены, ждавшие очереди при закрытии, снова «Ожидает»: {len(requeued)} (в Sync не отправлялись)")
         if interrupted:
@@ -6517,6 +6540,8 @@ class LipsyncTwoModeApp(_BaseApp):
             ("tasks", "ЗАДАЧИ", [
                 (None, "new_task", "Новая задача", "Добавить ролик в очередь", self.add_roll),
                 (None, "clear_all", "Очистить всё", "Очистить очередь роликов", self.clear_rolls),
+                ("history", "history", "История", "История партий: папки с готовыми роликами",
+                 self.show_history_panel),
                 (None, "update", "Обновить", "Проверить обновления приложения",
                  lambda: self.check_for_updates(silent=False)),
             ]),
@@ -7589,6 +7614,7 @@ class LipsyncTwoModeApp(_BaseApp):
             self._sync_journal = []
             self._journal_dirty = False
         self._panel_state = {}
+        self._queue_history, self._queue_summary = [], None
         self._compress_cancel_estimates()
         with self._compress_lock:
             self._compress_info = {}
@@ -12183,8 +12209,9 @@ class LipsyncTwoModeApp(_BaseApp):
             prefixed_log("Сцена удалена — пропускаю")
             self._mark_roll_progress(seq, start=time.time(), end=time.time(), state="ошибка")
             return
-        if delay > 0:
+        if delay >= 0.5:
             prefixed_log(f"Жду {delay:.0f} сек перед стартом...")
+        if delay > 0:
             time.sleep(delay)
         self._mark_roll_progress(seq, start=time.time(), end=None)
         if planned.get("cost") is not None:
@@ -12226,11 +12253,105 @@ class LipsyncTwoModeApp(_BaseApp):
         self.after(0, self._refresh_start_btn)
         self.after(0, self._tick_queue_progress)      # финальное состояние панели хода
 
+    # ── История партий (боковое меню → ЗАДАЧИ → История) ────────────────
+    def show_history_panel(self):
+        scroll = self._start_panel("history")
+        if scroll is None:
+            return
+        frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="x", padx=20, pady=20)
+        self.label(frame, "История партий", size=22, weight="bold").pack(anchor="w", padx=22, pady=(20, 4))
+        hint = self.label(frame, f"Последние {QUEUE_HISTORY_MAX} запусков очереди. Готовые ролики — в папке партии "
+                                 "(рабочий стол → Lipsync_Queue_Output).", size=13, color=MUTED)
+        hint.configure(wraplength=440, justify="left")
+        hint.pack(anchor="w", padx=22, pady=(0, 12))
+        body = ctk.CTkFrame(frame, fg_color="transparent")
+        body.pack(fill="x", padx=16, pady=(0, 16))
+        small = dict(height=26, corner_radius=8, font=ctk.CTkFont(size=12), fg_color=BTN, hover_color=BTN_HOVER,
+                     text_color=TEXT)
+
+        def render():
+            for c in body.winfo_children():
+                c.destroy()
+            if not self._queue_history:
+                self.label(body, "Очередь ещё не запускалась.", size=13, color=MUTED).pack(anchor="w", padx=6, pady=8)
+                return
+            for item in list(self._queue_history):
+                path = item["batch_dir"]
+                card = ctk.CTkFrame(body, fg_color=CARD, corner_radius=12)
+                card.pack(fill="x", pady=4)
+                when = time.strftime("%d.%m.%Y %H:%M", time.localtime(float(item.get("time") or 0)))
+                stats = f"готово {item.get('ok', 0)}" + (f" · ошибок {item['failed']}" if item.get("failed") else "")
+                exists = os.path.isdir(path)
+                size = self._history_size_text(path) if exists else ""
+                top = ctk.CTkFrame(card, fg_color="transparent")
+                top.pack(fill="x", padx=12, pady=(8, 2))
+                self.label(top, when, size=14, weight="bold").pack(side="left")
+                self.label(top, f"  {stats}" + (f" · {size}" if size else ""), size=12,
+                           color="#fcd34d" if item.get("failed") else MUTED).pack(side="left")
+                name = self.label(card, Path(path).name, size=11, color=MUTED)
+                name.pack(anchor="w", padx=12)
+                btns = ctk.CTkFrame(card, fg_color="transparent")
+                btns.pack(fill="x", padx=10, pady=(4, 8))
+                if exists:
+                    ctk.CTkButton(btns, text="Открыть папку", width=130,
+                                  command=lambda p=path: open_folder(p), **small).pack(side="left")
+                    ctk.CTkButton(btns, text="Скопировать путь", width=140,
+                                  command=lambda p=path: self._history_copy(p), **small).pack(side="left", padx=6)
+                else:
+                    self.label(btns, "папка не найдена", size=12, color="#fca5a5").pack(side="left", padx=(2, 8))
+                    ctk.CTkButton(btns, text="Убрать из списка", width=140,
+                                  command=lambda p=path: self._history_remove(p), **small).pack(side="left")
+
+        self._register_renderer("history", render)
+
+    def _history_size_text(self, path):
+        """Размер папки партии: из кэша или «считаю…» с подсчётом в фоне (папка может быть большой)."""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return ""
+        cached = self._history_sizes.get(path)
+        if cached and cached[0] == mtime:
+            return format_bytes(cached[1]) if cached[1] is not None else "считаю…"
+        self._history_sizes[path] = (mtime, None)
+
+        def work():
+            total = 0
+            for root, _dirs, files in os.walk(path):
+                for f in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+            self._history_sizes[path] = (mtime, total)
+            self.after(0, lambda: self._render_panel("history"))
+
+        threading.Thread(target=work, daemon=True).start()
+        return "считаю…"
+
+    def _history_copy(self, path):
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        self.log("Путь папки партии скопирован")
+
+    def _history_remove(self, path):
+        self._queue_history = [h for h in self._queue_history if h.get("batch_dir") != path]
+        self._schedule_state_save()
+        self._render_panel("history")
+
     def _show_queue_summary(self, batch_dir, total, failed):
         """Итог очереди — строкой в панели хода очереди. Не модально, папку сам не открывает,
         остаётся, пока пользователь не закроет."""
         self._queue_summary = {"batch_dir": batch_dir, "total": total, "failed": list(failed),
                                "time": time.time()}
+        if batch_dir:
+            entry = {"batch_dir": batch_dir, "time": self._queue_summary["time"], "total": total,
+                     "ok": total - len(failed), "failed": len(failed)}
+            self._queue_history = ([entry] + [h for h in self._queue_history
+                                              if h.get("batch_dir") != batch_dir])[:QUEUE_HISTORY_MAX]
+        self._schedule_state_save()                     # итог и история переживают перезапуск
+        self._render_panel("history")
         self._qp_details_open = False
         self._qp_set_state(hidden=False)
         self._render_queue_panel()
@@ -12249,7 +12370,7 @@ class LipsyncTwoModeApp(_BaseApp):
         w = {"head": head}
         w["title"] = self.label(head, "", size=12, weight="bold")
         w["title"].pack(side="left")
-        w["bar"] = ctk.CTkProgressBar(head, width=140, height=6)
+        w["bar"] = ctk.CTkProgressBar(head, width=110, height=6)
         w["bar"].set(0)
         w["bar"].pack(side="left", padx=10)
         w["eta"] = self.label(head, "", size=12, color=MUTED)
@@ -12261,7 +12382,7 @@ class LipsyncTwoModeApp(_BaseApp):
         w["toggle"] = ctk.CTkButton(head, text="Развернуть", width=100, command=self._qp_toggle, **small)
         w["toggle"].pack(side="right", padx=(6, 6))
         w["folder"] = ctk.CTkButton(head, text="Открыть папку", width=120, command=self._qp_open_folder, **small)
-        w["stop"] = ctk.CTkButton(head, text="Остановить после текущего", width=200,
+        w["stop"] = ctk.CTkButton(head, text="Стоп после текущего", width=150,
                                   command=self._queue_request_stop, **small)
         w["details_btn"] = ctk.CTkButton(head, text="Подробнее", width=100, command=self._qp_toggle_details, **small)
         mono = ctk.CTkFont(family="Courier New", size=12)
@@ -12502,7 +12623,7 @@ class LipsyncTwoModeApp(_BaseApp):
         has_summary = summary is not None and not self.is_processing
         folder = self._queue_batch_dir if self.is_processing else ((summary or {}).get("batch_dir")
                                                                     or self._queue_batch_dir)
-        w["stop"].configure(text="Останавливаюсь…" if self._queue_stop else "Остановить после текущего",
+        w["stop"].configure(text="Останавливаюсь…" if self._queue_stop else "Стоп после текущего",
                             state="disabled" if self._queue_stop else "normal")
         for key, show, side_opts in (("folder", bool(folder) and (has_summary or self.is_processing),
                                       {"side": "right", "padx": (6, 0)}),
