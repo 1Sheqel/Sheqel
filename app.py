@@ -4243,6 +4243,694 @@ def translate_with_groq(text, target_lang, api_key, log) -> str:
     raise last_err
 
 
+# ── Род текста в генераторе голоса: формы говорящего «я» ────────────────────
+# Считаются только слова, относящиеся к говорящему: прошедшее время и краткие формы рядом с «я»
+# или в безличном начале предложения. Точность важнее полноты: сомнительное слово не считается.
+GENDER_FEMALE, GENDER_MALE, GENDER_MIXED, GENDER_UNKNOWN = "female", "male", "mixed", "unknown"
+GENDER_TEXT_LABELS = {GENDER_FEMALE: "женский", GENDER_MALE: "мужской", GENDER_MIXED: "смешанный",
+                      GENDER_UNKNOWN: "не определён"}
+GENDER_CLEAR_SHARE = 0.75          # «явный перевес»: доля слов одного рода при смешанном тексте
+GENDER_MIN_WORDS = 2               # меньше подтверждённых слов — род «не определён»
+GENDER_YA_WINDOW = 3               # слово считается «рядом с я» в пределах 3 слов
+
+_GV = "аеиоуыэюяё"
+
+
+def _gn(word):
+    return word.lower().replace("ё", "е")
+
+
+_G_PREFIXES = ("", "по", "за", "на", "при", "у", "от", "ото", "вы", "с", "со", "раз", "разо", "рас", "пере",
+               "про", "под", "подо", "о", "об", "обо", "до", "в", "во", "вз", "вс", "из", "ис", "недо", "пред",
+               "воз", "вос", "попри", "пона")
+
+# Около 300 основ частых глаголов: форма прошедшего времени без «л» (делал → «дела»), без приставок.
+_G_VERB_BASES = frozenset(_gn(w) for w in """
+дела дума зна понима поня реши реша получи получа пусти запуска смотре виде слыша слуша говори сказа
+писа чита работа жи люби хоте нача начина конча кончи заверши пыта стара жда ожида иска находи бра взя
+да дава купи покупа плати трати прода продава ответи отвеча спроси спрашива проси звони учи занима заня
+откры закры забы вспомни помни верну нрави ста бы сиде стоя лежа спа уста устава бега бежа ходи води
+носи вози езди еха лете плы гуля игра танцева рисова готови вари жари корми стира убира чисти строи чини
+заказа заказыва отправи отправля присла посла посыла принима приня пробова выбира сравни сравнива
+провери проверя тестирова анализирова нажа нажима вводи загрузи скача скачива установи устанавлива
+созда сохрани удали мени меня добави исправи ключи регистрирова оплати заработа вложи инвестирова
+торгова замети замеча узна догада надея боя волнова пережива радова удиви пуга вери сомнева встрети
+встреча знакоми роди жени ступи переезжа уезжа приезжа оста остава остави броси броса продолжа продолжи
+успе опозда спеши торопи зва хвали руга шути смея улыба плака крича молча кивну махну вздохну улыбну
+засну усну просну просыпа отдохну отдыха уволи нанима наня оформи собира мечта планирова обеща
+договори договарива согласи отказа отказыва извини благодари проща поздрави жела предложи предлага
+советова рекомендова помога поддержа поддержива следи наблюда отмети отмеча повтори переда подари дари
+теря лома реза боле выздорове лечи похуде поправи рискова победи сдава заполни голосова разговарива
+обща переписыва вра спори ссори мири обиде зли чувствова ощути ощуща осозна подозрева уме суме счита
+запомни сня подня обня показа показыва объясни объясня рассказыва упа пада удари служи дружи дели тяну
+кину крикну шепну горди стыди увлека интересова ошиба смотре реагирова отреагирова завтрака обеда ужина
+пообеща подпиши подписыва прыгну прыга прята спрята копи экономи тренирова худе толсте плати потрати жале справи
+зарабатыва заплати выясни выясня изучи изуча прочита записа оцени оценива вложи купа одева наряди ныря
+""".split())
+
+# Неправильные формы: (мужской, женский). Совпадение — с учётом «ё/е».
+_G_IRREGULAR = [
+    ("шёл", "шла"), ("пошёл", "пошла"), ("пришёл", "пришла"), ("ушёл", "ушла"), ("вышел", "вышла"),
+    ("зашёл", "зашла"), ("нашёл", "нашла"), ("прошёл", "прошла"), ("вошёл", "вошла"), ("дошёл", "дошла"),
+    ("подошёл", "подошла"), ("перешёл", "перешла"), ("обошёл", "обошла"), ("отошёл", "отошла"),
+    ("сошёл", "сошла"), ("разошёл", "разошла"), ("превзошёл", "превзошла"),
+    ("мог", "могла"), ("смог", "смогла"), ("помог", "помогла"), ("лёг", "легла"), ("слёг", "слегла"),
+    ("прилёг", "прилегла"), ("привык", "привыкла"), ("отвык", "отвыкла"), ("достиг", "достигла"),
+    ("постиг", "постигла"), ("проник", "проникла"), ("исчез", "исчезла"), ("погиб", "погибла"),
+    ("промок", "промокла"), ("замёрз", "замёрзла"), ("окреп", "окрепла"), ("ослеп", "ослепла"),
+    ("оглох", "оглохла"), ("нёс", "несла"), ("принёс", "принесла"), ("отнёс", "отнесла"),
+    ("вынес", "вынесла"), ("унёс", "унесла"), ("занёс", "занесла"), ("перенёс", "перенесла"),
+    ("донёс", "донесла"), ("вёз", "везла"), ("привёз", "привезла"), ("увёз", "увезла"), ("отвёз", "отвезла"),
+    ("вывез", "вывезла"), ("перевёз", "перевезла"), ("вёл", "вела"), ("привёл", "привела"),
+    ("провёл", "провела"), ("перевёл", "перевела"), ("завёл", "завела"), ("отвёл", "отвела"), ("увёл", "увела"),
+    ("довёл", "довела"), ("вывел", "вывела"), ("подвёл", "подвела"), ("навёл", "навела"), ("рос", "росла"),
+    ("вырос", "выросла"), ("подрос", "подросла"), ("спас", "спасла"), ("умер", "умерла"), ("запер", "заперла"),
+    ("стёр", "стёрла"), ("вытер", "вытерла"), ("пёк", "пекла"), ("испёк", "испекла"), ("берёг", "берегла"),
+    ("сберёг", "сберегла"), ("жёг", "жгла"), ("сжёг", "сожгла"), ("зажёг", "зажгла"), ("стриг", "стригла"),
+    ("постриг", "постригла"), ("лез", "лезла"), ("залез", "залезла"), ("вылез", "вылезла"), ("полез", "полезла"),
+    ("полз", "ползла"), ("увлёк", "увлекла"), ("привлёк", "привлекла"), ("отвлёк", "отвлекла"),
+    ("ошиб", "ошибла"), ("ушиб", "ушибла"), ("тряс", "трясла"), ("грыз", "грызла"), ("цвёл", "цвела"),
+    ("расцвёл", "расцвела"), ("прочёл", "прочла"), ("учёл", "учла"),
+]
+_G_IRREG_BY_NORM = {}
+for _m, _f in _G_IRREGULAR:
+    _G_IRREG_BY_NORM[_gn(_m)] = (GENDER_MALE, _m, _f)
+    _G_IRREG_BY_NORM[_gn(_f)] = (GENDER_FEMALE, _m, _f)
+
+# Краткие формы и слова, которые бывают только у одного рода говорящего: (мужской, женский).
+_G_SHORT = [
+    ("рад", "рада"), ("готов", "готова"), ("уверен", "уверена"), ("должен", "должна"), ("согласен", "согласна"),
+    ("сам", "сама"), ("способен", "способна"), ("счастлив", "счастлива"), ("доволен", "довольна"),
+    ("обязан", "обязана"), ("свободен", "свободна"), ("занят", "занята"), ("удивлён", "удивлена"),
+    ("благодарен", "благодарна"), ("признателен", "признательна"), ("знаком", "знакома"), ("болен", "больна"),
+    ("виноват", "виновата"), ("влюблён", "влюблена"), ("вынужден", "вынуждена"), ("убеждён", "убеждена"),
+    ("поражён", "поражена"), ("восхищён", "восхищена"), ("разочарован", "разочарована"),
+    ("расстроен", "расстроена"), ("впечатлён", "впечатлена"), ("жив", "жива"), ("здоров", "здорова"),
+    ("спокоен", "спокойна"), ("одинок", "одинока"), ("один", "одна"), ("горд", "горда"), ("честен", "честна"),
+    ("нужен", "нужна"), ("рождён", "рождена"), ("заинтересован", "заинтересована"), ("намерен", "намерена"),
+    ("склонен", "склонна"), ("полон", "полна"), ("прав", "права"), ("неправ", "неправа"), ("близок", "близка"),
+    ("похож", "похожа"), ("весел", "весела"), ("зол", "зла"), ("смел", "смела"), ("умён", "умна"),
+    ("глуп", "глупа"), ("красив", "красива"), ("молод", "молода"), ("стар", "стара"), ("богат", "богата"),
+    ("беден", "бедна"), ("голоден", "голодна"), ("сыт", "сыта"), ("мёртв", "мертва"), ("мил", "мила"),
+    ("женат", "замужем"), ("напуган", "напугана"), ("взволнован", "взволнована"), ("тронут", "тронута"),
+    ("уставший", "уставшая"), ("рождён", "рождена"),
+]
+_G_SHORT_BY_NORM = {}
+for _m, _f in _G_SHORT:
+    _G_SHORT_BY_NORM.setdefault(_gn(_m), (GENDER_MALE, _m, _f))
+    _G_SHORT_BY_NORM.setdefault(_gn(_f), (GENDER_FEMALE, _m, _f))
+
+# Считаются только рядом с «я»: без него слишком часто относятся к другому слову («Была зима», «Нужна помощь»).
+_G_NEEDS_YA = frozenset(_gn(w) for w in """
+был была стал стала сел села дал дала жил жила пил пила мыл мыла один одна прав права полон полна близок
+близка похож похожа стар стара молод молода зол зла жив жива нужен нужна красив красива богат богата
+беден бедна знаком знакома весел весела смел смела мил мила умен умна глуп глупа здоров здорова одинок
+одинока горд горда честен честна спокоен спокойна сыт сыта голоден голодна болен больна свободен свободна
+мертв мертва занят занята уставший уставшая
+""".split())
+_G_SAM = frozenset({"сам", "сама"})
+_G_SAM_NEXT_OK = frozenset("не по себе себя все всё это еще ещё уже так и".split())
+
+# Существительные на -л/-ла, похожие на глаголы.
+_G_NOUN_STOP_M = """стол зал пол вол кол гол мол ил тыл пыл мел мул канал сигнал материал капитал футбол баскетбол
+волейбол идеал финал журнал сериал персонал потенциал интервал оригинал арсенал вокзал подвал провал скандал
+причал штурвал шквал вал бал генерал адмирал минерал ритуал мануал аул стул гул посол орел осел котел пепел
+дятел щегол козел чехол престол протокол символ глагол пул портал трибунал ангел узел угол смысл вымысел
+замысел умысел промысел помысел крокодил пенал кинозал спортзал фингал""".split()
+_G_NOUN_STOP = frozenset([_gn(w) for w in _G_NOUN_STOP_M] + [_gn(w) + "а" for w in _G_NOUN_STOP_M] + [
+    _gn(w) for w in "школа скала шкала пчела стрела сила смола зола юла могила кила акула скула пиала дела тела "
+                    "крыла мула кабала модель опыт".split()])
+
+# Прилагательные на -ой (ударное окончание) — для «я такой» и для замены «-ая → -ой».
+_G_LONG_OJ = frozenset(_gn(w) for w in """
+такой другой большой молодой плохой простой родной живой крутой золотой голубой смешной больной чужой злой
+глухой немой слепой седой никакой какой дорогой прямой пустой густой худой лихой озорной деловой боевой
+ночной выходной домашний""".split() if w.endswith("ой"))
+_G_ADJ_STOP = frozenset(_gn(w) for w in "гений кий домой собой тобой мной порой весной зимой одной какой-то".split())
+
+_G_SKIP = frozenset(_gn(w) for w in """
+не ни же ж ведь вот ну уж уже еще тоже также даже только лишь просто сразу тогда потом затем сначала
+сперва наконец сегодня вчера позавчера недавно давно однажды всегда никогда иногда часто редко обычно
+снова опять вновь теперь сейчас очень так совсем почти вообще действительно честно впервые долго быстро
+наверное конечно кстати бы вскоре скоро тут здесь там утром днем вечером ночью летом зимой весной осенью
+лично вдруг внезапно постепенно специально случайно реально буквально много мало""".split())
+_G_SKIP_AFTER_YA = frozenset(_gn(w) for w in """
+его её ее ей ему им их это всё все тебя тебе вас вам нас нам себя себе сюда туда тут там""".split())
+_G_MULTI_SKIP = [tuple(p.split()) for p in ("после этого", "до этого", "в итоге", "в общем", "в конце концов",
+                                              "тем временем", "на днях", "с утра", "к тому же", "в результате")]
+_G_BOUNDARY_WORDS = frozenset("и а но или либо да что чтобы потому поэтому однако зато хотя если когда пока "
+                              "как где будто словно ибо чем".split())
+_G_OTHER_SUBJ = frozenset(_gn(w) for w in """он она оно они мы вы ты кто никто кто-то кто-нибудь некто каждый
+каждая который которая которое которые""".split())
+_G_SEG_START_OTHER = frozenset(_gn(w) for w in "это все всё тот та то этот эта".split())
+_G_PREPOSITIONS = frozenset(_gn(w) for w in """в во на с со к ко у о об обо от ото по под подо за из изо до для
+без при про через над перед между после""".split())
+# Глаголы, после которых в начале предложения часто стоит подлежащее («Прошёл год», «Наступила осень»).
+_G_EXIST_M = frozenset(_gn(w) for w in "прошел пришел наступил случил произошел появил возник остал начал "
+                                       "закончил шел стоял был стал".split())
+_G_ANIMATE_NEXT = frozenset(_gn(w) for w in """брат друг отец папа сын муж директор начальник клиент человек мужчина
+парень сосед курьер врач учитель дед дедушка дядя коллега""".split())
+_G_ANIMATE_M = frozenset(_gn(w) for w in "папа дядя дедушка мужчина юноша коллега судья слуга".split())
+
+_G_MASK_RE = re.compile(r"\[[^\]\n]*\]|«[^»\n]*»|“[^”\n]*”|„[^“”\n]*[“”]|\"[^\"\n]*\"")
+_G_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+(?:-[A-Za-zА-Яа-яЁё0-9]+)*|[.!?…]+|\n|[,;:()—–]|(?<=\s)-(?=\s)")
+
+
+def _g_base_known(stem):
+    for p in _G_PREFIXES:
+        if stem.startswith(p) and stem[len(p):] in _G_VERB_BASES:
+            return True
+    return False
+
+
+def _g_word_form(word):
+    """Форма говорящего: {"gender", "kind": verb|short|adj, "weak_ok": можно без «я»} или None."""
+    n = _gn(word)
+    if n in _G_SHORT_BY_NORM:
+        g = _G_SHORT_BY_NORM[n][0]
+        return {"gender": g, "kind": "short", "weak_ok": n not in _G_NEEDS_YA}
+    core, refl = n, ""
+    if len(n) > 4 and n[-2:] in ("ся", "сь"):
+        core, refl = n[:-2], n[-2:]
+    if core in _G_NOUN_STOP or n in _G_NOUN_STOP:
+        return None
+    if core in _G_IRREG_BY_NORM:
+        g = _G_IRREG_BY_NORM[core][0]
+        if refl and refl != ("сь" if g == GENDER_FEMALE else "ся"):
+            return None
+        return {"gender": g, "kind": "verb", "weak_ok": n not in _G_NEEDS_YA}
+    if len(core) >= 4 and core.endswith("ла") and core[-3] in _GV:
+        if refl and refl != "сь":
+            return None
+        return {"gender": GENDER_FEMALE, "kind": "verb",
+                "weak_ok": _g_base_known(core[:-2]) and n not in _G_NEEDS_YA}
+    if len(core) >= 3 and core.endswith("л") and core[-2] in _GV:
+        if refl and refl != "ся":
+            return None
+        return {"gender": GENDER_MALE, "kind": "verb",
+                "weak_ok": _g_base_known(core[:-1]) and n not in _G_NEEDS_YA}
+    if refl or n in _G_ADJ_STOP or len(n) < 4:
+        return None
+    if n.endswith(("ая", "яя")):
+        return {"gender": GENDER_FEMALE, "kind": "adj", "weak_ok": False}
+    if n.endswith(("ый", "ий")) or n in _G_LONG_OJ:
+        return {"gender": GENDER_MALE, "kind": "adj", "weak_ok": False}
+    return None
+
+
+def _g_guess_np_gender(word):
+    """Грубый род следующего слова по окончанию: female / male / neuter / other / None (неясно)."""
+    n = _gn(word)
+    if n in _G_ANIMATE_M:
+        return GENDER_MALE
+    if n.endswith(("ть", "ти", "чь", "ться", "тись")):
+        return "other"                       # инфинитив: «Рада сообщить»
+    if n.endswith(("ая", "яя", "ость")) or (n[-1:] in ("а", "я") and len(n) > 2):
+        return GENDER_FEMALE
+    if n.endswith(("ый", "ий", "ой")):
+        return GENDER_MALE
+    if n.endswith(("ое", "ее", "о", "е")):
+        return "neuter"
+    if n[-1:] == "ь":
+        return None
+    if n[-1:] in ("у", "ю", "и", "ы"):
+        return "other"
+    return GENDER_MALE                       # согласная: «год», «тест»
+
+
+def _g_mask(text):
+    """Теги [ ] и чужая речь в кавычках не анализируются: заменяются пробелами той же длины."""
+    return _G_MASK_RE.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def _g_sentences(text):
+    """Предложения: списки токенов (текст, начало, конец, вид: word|end|bound)."""
+    sentences, cur = [], []
+    for m in _G_TOKEN_RE.finditer(_g_mask(text)):
+        t = m.group(0)
+        if t == "\n" or t[0] in ".!?…":
+            if cur:
+                sentences.append(cur)
+            cur = []
+            continue
+        kind = "word" if (t[0].isalnum()) else "bound"
+        cur.append((t, m.start(), m.end(), kind))
+    if cur:
+        sentences.append(cur)
+    return sentences
+
+
+def _g_decide(female, male):
+    total = female + male
+    if total < GENDER_MIN_WORDS:
+        return GENDER_UNKNOWN
+    if male == 0:
+        return GENDER_FEMALE
+    if female == 0:
+        return GENDER_MALE
+    top = max(female, male)
+    if top / total >= GENDER_CLEAR_SHARE and top >= 3:
+        return GENDER_FEMALE if female > male else GENDER_MALE
+    return GENDER_MIXED
+
+
+def analyze_text_gender(text):
+    """Род текста по словам говорящего «я». Возвращает {"gender", "female", "male",
+    "words": [{"word", "start", "end", "gender"}]}. Без сети и без сторонних библиотек."""
+    words = []
+    for sent in _g_sentences(text or ""):
+        state = None                 # None — подлежащего ещё нет; "speaker" — «я»; "other" — кто-то другой
+        seg_clean = True             # от начала сегмента (после запятой, «и», «что»…) только служебные слова
+        ya_word_idx = None           # номер слова «я» и «ничего, кроме служебных слов, после него»
+        ya_clean = False
+        cap_ok = True                # заглавная буква здесь — начало фразы, а не имя
+        pending = None               # «Прошёл короткий тест»: начало неоднозначно, ждём второй глагол
+        word_idx = -1
+        i = 0
+        while i < len(sent):
+            tok, start, end, kind = sent[i]
+            if kind == "bound":
+                seg_clean, ya_clean = True, False
+                cap_ok = tok in (":", "—", "–", "(")
+                i += 1
+                continue
+            word_idx += 1
+            n = _gn(tok)
+            lowers = [_gn(t[0]) for t in sent[i:i + 4] if t[3] == "word"]
+            multi = next((p for p in _G_MULTI_SKIP if tuple(lowers[:len(p)]) == p), None)
+            if multi:
+                i += len(multi)
+                word_idx += len(multi) - 1
+                cap_ok = False
+                continue
+            seg_start = seg_clean and (i == 0 or sent[i - 1][3] == "bound" or
+                                       _gn(sent[i - 1][0]) in _G_BOUNDARY_WORDS)
+            if n == "я":
+                state, ya_word_idx, ya_clean, seg_clean = "speaker", word_idx, True, True
+                cap_ok = False
+                i += 1
+                continue
+            is_name = (tok[0].isupper() and not cap_ok) or bool(re.match(r"[A-Za-z0-9]", tok))
+            if n in _G_OTHER_SUBJ or is_name or (seg_start and n in _G_SEG_START_OTHER):
+                state, seg_clean, ya_clean, pending = "other", False, False, None
+                cap_ok = False
+                i += 1
+                continue
+            cap_ok = False
+            if n in _G_BOUNDARY_WORDS:
+                seg_clean = True
+                ya_clean = False
+                i += 1
+                continue
+            if n in _G_SKIP:                                 # «Сначала», «зимой»: наречия, не глаголы
+                i += 1
+                continue
+            form = _g_word_form(tok)
+            next_words = [t for t in sent[i + 1:] if t[3] == "word"]
+            next_tok = sent[i + 1] if i + 1 < len(sent) else None
+            if form:
+                strong = (state == "speaker" and ya_clean and ya_word_idx is not None
+                          and word_idx - ya_word_idx <= GENDER_YA_WINDOW)
+                inverted = bool(next_tok and next_tok[3] == "word" and _gn(next_tok[0]) == "я")
+                other_after = bool(next_tok and next_tok[3] == "word" and (
+                    _gn(next_tok[0]) in _G_OTHER_SUBJ or next_tok[0][:1].isupper()
+                    or re.match(r"[A-Za-z]", next_tok[0])))
+                counted = False
+                if other_after:
+                    pass                                     # «— сказала она», «решил Иван»
+                elif strong or inverted:
+                    counted = form["kind"] != "adj" or not inverted
+                elif form["kind"] != "adj" and form["weak_ok"] and seg_clean:
+                    if state == "speaker":
+                        counted = True                       # продолжение: «прошла тест, получила расчёт»
+                    elif state is None:
+                        counted = _g_start_ok(n, form, sent, i)
+                        if counted == "pending":
+                            pending, counted = {"word": tok, "start": start, "end": end,
+                                                "gender": form["gender"]}, False
+                            state = "pending"
+                            i += 1
+                            continue
+                    elif state == "pending" and form["gender"] == pending["gender"] \
+                            and _g_core(n) not in _G_EXIST_M:
+                        words.append(pending)                # второй глагол того же рода подтверждает начало
+                        pending, counted = None, True
+                if counted and n in _G_SAM and not (strong or inverted):
+                    nxt = _gn(next_words[0][0]) if next_words else ""
+                    counted = nxt in _G_SAM_NEXT_OK or bool(next_words and _g_word_form(next_words[0][0]))
+                if counted:
+                    words.append({"word": tok, "start": start, "end": end, "gender": form["gender"]})
+                    state = "speaker"
+                elif state is None:
+                    state = "other"                          # «Прошла неделя»: подлежащее после глагола
+                    seg_clean = False
+                i += 1
+                continue
+            if n in _G_SKIP or (ya_word_idx is not None and n in _G_SKIP_AFTER_YA):
+                i += 1
+                continue
+            seg_clean, ya_clean = False, False               # обычное слово: дополнение или подлежащее
+            if state is None:
+                state = "other"
+            i += 1
+    female = sum(1 for w in words if w["gender"] == GENDER_FEMALE)
+    male = len(words) - female
+    return {"gender": _g_decide(female, male), "female": female, "male": male, "words": words}
+
+
+def _g_start_ok(n, form, sent, i):
+    """Безличное начало («Прошла короткий тест»): после глагола не должно стоять его подлежащее."""
+    j = i + 1
+    while j < len(sent) and sent[j][3] == "word" and _gn(sent[j][0]) in _G_SKIP:
+        j += 1
+    if j >= len(sent) or sent[j][3] != "word":
+        return True
+    nxt = sent[j][0]
+    nn = _gn(nxt)
+    if nxt[0].isupper() or re.match(r"[A-Za-z0-9]", nxt):
+        return False                                         # «Пришла Анна», «Начал AI»
+    if nn in _G_PREPOSITIONS or nn in _G_SKIP_AFTER_YA or nn in _G_BOUNDARY_WORDS:
+        return True
+    guess = _g_guess_np_gender(nxt)
+    if form["gender"] == GENDER_FEMALE:
+        return guess not in (GENDER_FEMALE, None)            # «Прошла неделя», «Пришла мысль»
+    core = n[:-2] if n.endswith(("ся", "сь")) else n
+    if nn in _G_ANIMATE_NEXT or nn in _G_ANIMATE_M:
+        return False                                         # «Позвонил брат»
+    if guess in (GENDER_MALE, None) and core in _G_EXIST_M:
+        return "pending"                                     # «Прошёл год» или «Прошёл тест, получил…»
+    return True
+
+
+def _g_core(n):
+    return n[:-2] if n.endswith(("ся", "сь")) else n
+
+
+def text_gender_applicable(text, lang_label):
+    """Индикатор рода — только для русского: язык «Русский» или «Авто» с кириллицей (не украинской)."""
+    if lang_label not in ("Русский", "Авто") or not re.search(r"[А-Яа-яЁё]", text or ""):
+        return False
+    return lang_label == "Русский" or not re.search(r"[іїєґІЇЄҐ]", text)
+
+
+def gender_words_summary(words, limit=4):
+    shown = [w["word"] for w in words[:limit]]
+    more = len(words) - len(shown)
+    return ", ".join(shown) + (f" · ещё {more}" if more > 0 else "")
+
+
+# ── Приведение к роду: локальная замена окончаний ────────────────────────────
+def _g_case_like(src, new):
+    if len(src) > 1 and src.isupper():
+        return new.upper()
+    if src[:1].isupper():
+        return new[:1].upper() + new[1:]
+    return new
+
+
+def regender_word(word, target, use_yo=True):
+    """Слово говорящего в нужном роде. None — не знаем, как заменить (слово остаётся как было)."""
+    n = _gn(word)
+    new = None
+    if n in _G_SHORT_BY_NORM:
+        _, m, f = _G_SHORT_BY_NORM[n]
+        new = m if target == GENDER_MALE else f
+    else:
+        core, refl = word, ""
+        if len(n) > 4 and n[-2:] in ("ся", "сь"):
+            core, refl = word[:-2], word[-2:]
+        cn = _gn(core)
+        if cn in _G_IRREG_BY_NORM:
+            _, m, f = _G_IRREG_BY_NORM[cn]
+            new_core = m if target == GENDER_MALE else f
+        elif cn.endswith("ла") and len(cn) >= 4 and cn[-3] in _GV:
+            new_core = core[:-1] if target == GENDER_MALE else core
+        elif cn.endswith("л") and len(cn) >= 3 and cn[-2] in _GV:
+            new_core = core + "а" if target == GENDER_FEMALE else core
+        elif not refl and cn.endswith(("ая", "яя")):
+            stem = core[:-2]
+            if target == GENDER_FEMALE:
+                new_core = core
+            elif _gn(stem) + "ой" in _G_LONG_OJ:
+                new_core = stem + "ой"
+            elif cn.endswith("яя") or _gn(stem)[-1:] in "гкхжшчщ":
+                new_core = stem + "ий"
+            else:
+                new_core = stem + "ый"
+        elif not refl and (cn.endswith(("ый", "ий")) or cn in _G_LONG_OJ):
+            stem = core[:-2]
+            if target == GENDER_MALE:
+                new_core = core
+            elif cn.endswith("ий") and _gn(stem)[-1:] not in "гкхжшчщ":
+                new_core = stem + "яя"
+            else:
+                new_core = stem + "ая"
+        else:
+            return None
+        if refl:
+            refl = "ся" if target == GENDER_MALE else "сь"
+        new = new_core + refl
+    if not use_yo and "ё" not in word.lower():
+        new = new.replace("ё", "е")
+    return _g_case_like(word, new)
+
+
+def regender_local(text, target, analysis=None):
+    """Детерминированная замена окончаний только у слов говорящего. Текст никуда не отправляется.
+    Возвращает (новый текст, слова, которые заменить не удалось)."""
+    analysis = analysis or analyze_text_gender(text)
+    use_yo = True                 # «пришёл», «лёг»: для озвучки ё важнее, чем стиль исходного текста
+    out, pos, missed = [], 0, []
+    for w in analysis["words"]:
+        if w["gender"] == target:
+            continue
+        new = regender_word(w["word"], target, use_yo)
+        if not new:
+            missed.append(w["word"])
+            continue
+        out.append(text[pos:w["start"]])
+        out.append(new)
+        pos = w["end"]
+    out.append(text[pos:])
+    return "".join(out), missed
+
+
+# ── Проверка правки без доверия к модели ─────────────────────────────────────
+_RG_TAG_RE = re.compile(r"\[[^\]\n]*\]")
+_RG_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+(?:-[A-Za-zА-Яа-яЁё0-9]+)*")
+
+
+def _rg_words(text):
+    """Слова вне тегов [ ] с позициями и «скелет» — всё остальное (знаки, пробелы, переносы, теги)."""
+    masked = _RG_TAG_RE.sub(lambda m: "\x01" * len(m.group(0)), text)
+    words, skel, pos = [], [], 0
+    for m in _RG_WORD_RE.finditer(masked):
+        words.append((m.start(), m.end(), m.group(0)))
+        skel.append(text[pos:m.start()])
+        skel.append("\x00")
+        pos = m.end()
+    skel.append(text[pos:])
+    return words, "".join(skel)
+
+
+def _rg_ending_only(old, new):
+    """Различие только в окончании: общая основа ≥ 60% слова, разница — в последних 1–3 буквах."""
+    a, b = _gn(old), _gn(new)
+    k = 0
+    while k < min(len(a), len(b)) and a[k] == b[k]:
+        k += 1
+    return k >= 0.6 * len(a) and len(a) - k <= 3 and len(b) - k <= 3
+
+
+def validate_regender(original, candidate, target, analysis=None):
+    """(ok, причина, изменения). Изменения: [{"old", "new", "old_start", "old_end", "new_start", "new_end"}]."""
+    analysis = analysis or analyze_text_gender(original)
+    ow, oskel = _rg_words(original)
+    cw, cskel = _rg_words(candidate)
+    if original.count("\n") != candidate.count("\n"):
+        return False, "потерян или добавлен абзац", []
+    if len(ow) != len(cw):
+        return False, "добавлены или удалены слова", []
+    if _RG_TAG_RE.findall(original) != _RG_TAG_RE.findall(candidate):
+        return False, "изменены теги [ ]", []
+    if oskel != cskel:
+        return False, "изменены знаки препинания, пробелы или порядок", []
+    speaker = {w["start"]: w for w in analysis["words"]}
+    changes = []
+    for (os_, oe, old), (ns, ne, new) in zip(ow, cw):
+        if old == new:
+            continue
+        if os_ not in speaker:
+            return False, f"изменено слово не о говорящем: «{old}» → «{new}»", []
+        expected = regender_word(old, target)
+        if not (_rg_ending_only(old, new) or (expected and _gn(expected) == _gn(new))):
+            return False, f"изменено не только окончание: «{old}» → «{new}»", []
+        if old[:1].isupper() != new[:1].isupper():
+            return False, f"изменён регистр: «{old}» → «{new}»", []
+        changes.append({"old": old, "new": new, "old_start": os_, "old_end": oe, "new_start": ns, "new_end": ne})
+    result_gender = analyze_text_gender(candidate)["gender"]
+    if result_gender not in (target, GENDER_UNKNOWN):
+        return False, f"после правки род текста: {GENDER_TEXT_LABELS[result_gender]}", []
+    return True, "", changes
+
+
+# ── Приведение к роду через Groq (как переводчик) ────────────────────────────
+REGENDER_CHUNK_CHARS = 4000
+REGENDER_TIMEOUT_SEC = 60
+REGENDER_RETRIES = 2
+REGENDER_RETRY_PAUSE_MAX_SEC = 10
+
+
+class RegenderGroqError(RuntimeError):
+    """Groq не ответил годным текстом. В сообщении — только вид сбоя и код, без текста пользователя."""
+    TEXTS = {"auth": "ключ Groq не подошёл", "rate_limit": "Groq: превышен лимит запросов (429)",
+             "unavailable": "Groq недоступен", "http": "Groq ответил ошибкой", "bad_response": "ответ Groq не разобран"}
+
+    def __init__(self, kind, code=None):
+        self.kind, self.code = kind, code
+        super().__init__(self.TEXTS.get(kind, kind) + (f" (HTTP {code})" if code and kind != "rate_limit" else ""))
+
+
+def split_regender_chunks(text, limit=REGENDER_CHUNK_CHARS):
+    """Части до limit символов по границам абзацев (длинный абзац — по предложениям). Склейка = исходный текст."""
+    def pieces(t, pattern):
+        parts = re.split(pattern, t)
+        out = []
+        for k in range(0, len(parts), 2):
+            out.append(parts[k] + (parts[k + 1] if k + 1 < len(parts) else ""))
+        return [p for p in out if p]
+
+    units = []
+    for para in pieces(text, r"(\n+)"):
+        if len(para) <= limit:
+            units.append(para)
+            continue
+        for sent in pieces(para, r"(?<=[.!?…])(\s+)"):
+            while len(sent) > limit:
+                cut = sent.rfind(" ", 0, limit) + 1 or limit
+                units.append(sent[:cut])
+                sent = sent[cut:]
+            if sent:
+                units.append(sent)
+    chunks, cur = [], ""
+    for u in units:
+        if cur and len(cur) + len(u) > limit:
+            chunks.append(cur)
+            cur = ""
+        cur += u
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _regender_prompt(target, words):
+    rod = "мужской" if target == GENDER_MALE else "женский"
+    return (f"Ты корректор русского текста. Измени ТОЛЬКО грамматический род форм, которые относятся к "
+            f"говорящему «я» (глаголы прошедшего времени, краткие прилагательные и причастия, «сам/сама», "
+            f"прилагательные при «я»), на {rod} род. Ничего больше не меняй: слова, порядок слов, числа, знаки "
+            f"препинания, регистр букв, теги в квадратных скобках [ ], переносы строк, имена, формы третьего лица и "
+            f"множественного числа остаются как есть. Скорее всего, менять нужно эти слова: {', '.join(words)}. "
+            f"Верни только итоговый текст, без пояснений, кавычек и комментариев.")
+
+
+def regender_groq_chunk(chunk, target, words, api_key, post=None, sleep=time.sleep):
+    post = post or requests.post
+    payload = {
+        "model": GROQ_TRANSLATE_MODEL,
+        "messages": [{"role": "system", "content": _regender_prompt(target, words)},
+                     {"role": "user", "content": chunk.strip()}],
+        "temperature": 0,
+        "max_tokens": 8192,
+    }
+    for attempt in range(REGENDER_RETRIES + 1):
+        try:
+            res = post("https://api.groq.com/openai/v1/chat/completions",
+                       headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                       json=payload, timeout=REGENDER_TIMEOUT_SEC)
+        except Exception:
+            if attempt < REGENDER_RETRIES:
+                sleep(2)
+                continue
+            raise RegenderGroqError("unavailable")
+        code = res.status_code
+        if code in (401, 403):
+            raise RegenderGroqError("auth", code)
+        if code == 429 or code >= 500:
+            if attempt < REGENDER_RETRIES:
+                try:
+                    wait = float(res.headers.get("retry-after", 3))
+                except (TypeError, ValueError):
+                    wait = 3
+                sleep(min(max(wait, 1), REGENDER_RETRY_PAUSE_MAX_SEC))
+                continue
+            raise RegenderGroqError("rate_limit" if code == 429 else "unavailable", code)
+        if code != 200:
+            raise RegenderGroqError("http", code)
+        try:
+            content = res.json()["choices"][0]["message"]["content"]
+        except Exception:
+            raise RegenderGroqError("bad_response", code)
+        if not isinstance(content, str) or not content.strip():
+            raise RegenderGroqError("bad_response", code)
+        content = re.sub(r"^```[^\n]*\n|\n?```\s*$", "", content.strip())
+        lead = chunk[:len(chunk) - len(chunk.lstrip())]
+        trail = chunk[len(chunk.rstrip()):]
+        return lead + content.strip() + trail
+    raise RegenderGroqError("unavailable")
+
+
+def regender_report_where(stage):
+    """Место в отчёте: этап правки рода (код, а не текст пользователя)."""
+    return "app.regender." + (stage if re.fullmatch(r"[a-z_]{1,20}", str(stage)) else "other")
+
+
+def regender_report_message(stage, exc):
+    """Текст отчёта об ошибке правки рода: только этап, тип и код — без текста пользователя и ответа сервиса."""
+    code = getattr(exc, "code", None)
+    return f"regender stage={stage} type={type(exc).__name__}" + (f" code={code}" if code else "")
+
+
+def regender_text(text, target, api_key="", use_groq=True, post=None, sleep=time.sleep, log=None):
+    """Приведение слов говорящего к роду target. Groq (если разрешено и есть ключ) с проверкой ответа;
+    иначе или при сбое/провале проверки — локальная замена. Ничего не применяет — только предлагает.
+    Возвращает {"text", "source": groq|local|none, "changes", "note", "missed"}."""
+    log = log or (lambda *_: None)
+    analysis = analyze_text_gender(text)
+    todo = [w for w in analysis["words"] if w["gender"] != target]
+    if not todo:
+        return {"text": text, "source": "none", "changes": [], "note": "", "missed": [], "groq_tried": False}
+    note, tried = "", False
+    if use_groq and api_key:
+        tried = True
+        try:
+            out, pos = [], 0
+            for chunk in split_regender_chunks(text):
+                lo, hi = pos, pos + len(chunk)
+                pos = hi
+                chunk_words = [w["word"] for w in todo if lo <= w["start"] < hi]
+                out.append(regender_groq_chunk(chunk, target, chunk_words, api_key, post, sleep)
+                           if chunk_words else chunk)
+            candidate = "".join(out)
+            ok, reason, changes = validate_regender(text, candidate, target, analysis)
+            if ok and changes:
+                log(f"Род текста: Groq изменил {len(changes)} слов")
+                return {"text": candidate, "source": "groq", "changes": changes, "note": "", "missed": [],
+                        "groq_tried": True}
+            note = f"ответ Groq не прошёл проверку ({reason or 'ничего не изменено'})"
+            log("Род текста: ответ Groq не прошёл проверку — локальная замена")   # без слов текста
+        except RegenderGroqError as e:
+            note = str(e)
+            log(f"Род текста: {e} — локальная замена")
+    elif use_groq:
+        note = "ключ Groq не задан"
+    local, missed = regender_local(text, target, analysis)
+    # Локальная замена трогает только слова говорящего: изменения — пословное сравнение.
+    changes = [{"old": o[2], "new": c[2], "old_start": o[0], "old_end": o[1], "new_start": c[0], "new_end": c[1]}
+               for o, c in zip(_rg_words(text)[0], _rg_words(local)[0]) if o[2] != c[2]]
+    return {"text": local, "source": "local", "changes": changes, "note": note, "missed": missed,
+            "groq_tried": tried}
+
+
 def fetch_groq_usage(api_key) -> dict | None:
     try:
         import requests
