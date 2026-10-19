@@ -1389,6 +1389,7 @@ AUDIO_EFFECT_FIELDS = {"filter_preset_id": "фильтр", "environment_id": "п
                        "pan": "панорама", "audio_effects": "эффекты"}
 ROLL_QUEUED = "В очереди"
 QUEUE_HISTORY_MAX = 20
+QUEUE_RESUME_SEC = 5 * 60           # добавленное «в последнюю секунду» продолжает партию, если прошло меньше
 
 
 def format_bytes(n):
@@ -5556,6 +5557,9 @@ class LipsyncTwoModeApp(_BaseApp):
         self._queue_last_start = 0.0
         self._queue_failed = []
         self._queue_costing = False      # идёт расчёт стоимости — кнопку не трогаем
+        self._queue_finished_at = 0.0
+        self._queue_resume_dir = None    # продолжить эту папку партии (гонка с завершающимся потоком)
+        self._queue_note = ""            # «Продолжение в новой папке»
         self._queue_history = []         # последние партии (state.json): папка, время, готово, ошибок
         self._history_sizes = {}         # размер папки партии — считается лениво, в фоне
         self._qp_w = {}
@@ -11932,21 +11936,30 @@ class LipsyncTwoModeApp(_BaseApp):
         self.button(btns, "Отмена", win.destroy, color=BTN, hover=BTN_HOVER, width=120).pack(
             side="right", padx=(0, 8))
 
-    def _launch_queue(self, valid, estimates):
-        """Старт очереди или, если она уже идёт, добавление сцен в ту же партию."""
+    def _launch_queue(self, valid, estimates, resume=False):
+        """Старт очереди или, если она уже идёт, добавление сцен в ту же партию.
+        resume — добавленное, пока завершался последний поток: та же папка, нумерация NN_ продолжается,
+        строки хода и ошибки — те же (в истории одна партия), если с конца прошло меньше QUEUE_RESUME_SEC."""
         if self.is_processing:
             self._enqueue_live(valid, estimates)
             return
+        resume = bool(resume and self._queue_batch_dir
+                      and time.time() - self._queue_finished_at < QUEUE_RESUME_SEC)
         with self._queue_lock:
-            with self._progress_lock:
-                self._queue_progress = {}
+            if resume:
+                self._queue_resume_dir = self._queue_batch_dir
+            else:
+                with self._progress_lock:
+                    self._queue_progress = {}
+                self._queue_next_nn, self._queue_next_seq = 1, 1
+                self._queue_failed = []
+                self._queue_resume_dir = None
             self._queue_pending = []
             self._queue_accepting, self._queue_stop = True, False
             self._queue_workers = 0
-            self._queue_next_nn, self._queue_next_seq = 1, 1
             self._queue_last_start = 0.0
-            self._queue_failed = []
             self._queue_batch_dir = None
+            self._queue_note = ""
             self._add_queue_items(valid, estimates)
         self.is_processing = True
         self._qp_on_queue_start()
@@ -11984,13 +11997,13 @@ class LipsyncTwoModeApp(_BaseApp):
             self._refresh_start_btn()
             self._render_queue_panel()
             return
-        self.log("Очередь завершается — добавленные сцены запустятся новой партией сразу после неё")
+        self.log("Очередь завершается — добавленные сцены продолжат эту партию сразу после неё")
 
         def retry():
             if self.is_processing:
                 self.after(200, retry)
             else:
-                self._launch_queue(valid, estimates)
+                self._launch_queue(valid, estimates, resume=True)
         retry()
 
     def _queue_spawn_workers(self):
@@ -12166,22 +12179,39 @@ class LipsyncTwoModeApp(_BaseApp):
     def queue_thread(self):
         """Создаёт папку партии и запускает рабочие потоки; итог подводит последний вышедший поток."""
         try:
-            base_output = str(Path(desktop_dir()) / "Lipsync_Queue_Output")
-            ensure_dir(base_output)
-            batch_name = time.strftime("%d-%m-%Y_%H-%M-%S")
-            batch_dir = str(Path(base_output) / batch_name)
-            suffix = 2
-            while True:
-                try:
-                    # exist_ok=False — атомарно «занимаем» папку, даже если
-                    # параллельно запущен второй экземпляр приложения.
-                    os.makedirs(batch_dir)
-                    break
-                except FileExistsError:
-                    batch_dir = str(Path(base_output) / f"{batch_name}_{suffix}")
-                    suffix += 1
-            self.log("=" * 70)
-            self.log(f"Папка партии: {batch_dir}")
+            resume_dir = self._queue_resume_dir
+            if resume_dir and os.path.isdir(resume_dir) and os.access(resume_dir, os.W_OK):
+                batch_dir = resume_dir
+                self.log("=" * 70)
+                self.log(f"Продолжение партии (та же папка, нумерация продолжается): {batch_dir}")
+            else:
+                base_output = str(Path(desktop_dir()) / "Lipsync_Queue_Output")
+                ensure_dir(base_output)
+                batch_name = time.strftime("%d-%m-%Y_%H-%M-%S")
+                batch_dir = str(Path(base_output) / batch_name)
+                suffix = 2
+                while True:
+                    try:
+                        # exist_ok=False — атомарно «занимаем» папку, даже если
+                        # параллельно запущен второй экземпляр приложения.
+                        os.makedirs(batch_dir)
+                        break
+                    except FileExistsError:
+                        batch_dir = str(Path(base_output) / f"{batch_name}_{suffix}")
+                        suffix += 1
+                self.log("=" * 70)
+                if resume_dir:
+                    with self._queue_lock:
+                        # Прошлые ролики остались в старой папке и в её записи истории — здесь новый счёт.
+                        self._queue_note = "Продолжение в новой папке"
+                        self._queue_failed = []
+                        self._queue_next_nn = 1
+                        with self._progress_lock:
+                            for q in [q for q, p in self._queue_progress.items() if p.get("end")]:
+                                self._queue_progress.pop(q)
+                    self.log(f"Папку прошлой партии использовать нельзя — продолжение в новой папке: {batch_dir}")
+                else:
+                    self.log(f"Папка партии: {batch_dir}")
             with self._queue_lock:
                 self._queue_batch_dir = batch_dir
                 self.log(f"Роликов в очереди: {len(self._queue_pending)}")
@@ -12291,6 +12321,7 @@ class LipsyncTwoModeApp(_BaseApp):
             with self._progress_lock:
                 total = sum(1 for p in self._queue_progress.values() if p.get("end"))
         self.log(f"Очередь завершена: успешно {total - len(failed)} из {total}, ошибок {len(failed)}")
+        self._queue_finished_at = time.time()
         self.is_processing = False
         self.after(0, lambda: self._show_queue_summary(batch_dir, total, failed))
         self.after(0, self._refresh_start_btn)
@@ -12648,7 +12679,8 @@ class LipsyncTwoModeApp(_BaseApp):
         if self.is_processing or (summary is None and self._queue_progress and not self._qp_forced):
             done, total, running, frac, eta = self._qp_progress()
             now_txt = (f" · идёт ролик {', '.join(str(r) for r in running)}" if running else "")
-            w["title"].configure(text=f"Очередь: {done} из {total}{now_txt}", text_color=TEXT)
+            note = f" · {self._queue_note}" if self._queue_note else ""
+            w["title"].configure(text=f"Очередь: {done} из {total}{now_txt}{note}", text_color=TEXT)
             w["bar"].set(frac)
             w["eta"].configure(text=eta)
         elif summary is not None:

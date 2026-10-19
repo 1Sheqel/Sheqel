@@ -155,8 +155,30 @@ def phase1():
     RUN["finish_delay"] = 0.0
     yield lambda: by_id(h["id"])["status"] == "Готово"; yield idle; yield 0.2
     started_h = [x for x in RUN["started"] if x[0] == h["id"]]
-    check("9. гонка: добавлено после выхода последнего потока → не потеряно, запущено новой партией",
-          by_id(g["id"])["status"] == "Готово" and len(started_h) == 1 and started_h[0][2] != batch_g)
+    hist_g = [x for x in w._queue_history if x["batch_dir"] == batch_g]
+    check("9. гонка: добавлено после выхода последнего потока → не потеряно, та же папка, NN 02",
+          by_id(g["id"])["status"] == "Готово" and len(started_h) == 1 and started_h[0][2] == batch_g
+          and started_h[0][1] == 2 and batch_files(batch_g) == ["01_g.mp4", "02_h.mp4"], str(started_h))
+    check("9a. в истории одна партия: готово 2", len(hist_g) == 1 and hist_g[0]["ok"] == 2
+          and w._queue_summary["total"] == 2, str(hist_g))
+    # Папку прошлой партии использовать нельзя → «Продолжение в новой папке»
+    RUN["finish_delay"] = 0.8
+    g2 = new_roll("g2", 0.2)
+    w.start_queue(); yield lambda: w.is_processing
+    batch_g2 = w._queue_batch_dir
+    yield lambda: not w._queue_accepting and w.is_processing
+    shutil.rmtree(batch_g2)
+    h2 = new_roll("h2", 1.0)
+    w.start_queue(); yield 0.1
+    RUN["finish_delay"] = 0.0
+    yield lambda: w.is_processing and w._queue_batch_dir and w._queue_batch_dir != batch_g2; yield 0.3
+    w._render_queue_panel()
+    title = w._qp_w["title"].cget("text")
+    yield lambda: by_id(h2["id"])["status"] == "Готово"; yield idle; yield 0.2
+    new_dir = [x for x in RUN["started"] if x[0] == h2["id"]][0][2]
+    check("9b. папки нет → новая папка, в панели «Продолжение в новой папке», нумерация с 01",
+          new_dir != batch_g2 and "Продолжение в новой папке" in title and batch_files(new_dir) == ["01_h2.mp4"],
+          title)
     # Добавление, когда очередь пуста, но один поток ещё работает
     i_ = new_roll("i", 1.0)
     w.start_queue(); yield lambda: w.is_processing; yield 0.3
