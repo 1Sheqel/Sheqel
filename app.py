@@ -11749,9 +11749,16 @@ class LipsyncTwoModeApp(_BaseApp):
             messagebox.showerror("Ошибка", "\n".join(errors))
             return
         if not valid:
-            messagebox.showerror("Ошибка", "Нет роликов для обработки." + (
-                f"\n\nГотовые сцены ({len(skipped_done)}) не запускаются повторно — чтобы обработать заново, "
-                "нажми «Запустить заново» в карточке сцены." if skipped_done else ""))
+            queued = sum(1 for r in self.rolls if roll_in_queue(r))
+            if skipped_done or queued:
+                messagebox.showinfo(
+                    "Запускать нечего",
+                    "Все сцены готовы. Нажми «Запустить заново» у нужной сцены."
+                    + (f"\n\nГотовых: {len(skipped_done)}." if skipped_done else "")
+                    + (f" Уже в очереди: {queued}." if queued else ""), parent=self)
+            else:
+                messagebox.showinfo("Запускать нечего", "Нет заполненных сцен — выбери голос и видео в сцене.",
+                                    parent=self)
             return
         if not self.sync_key or "ВСТАВЬ" in self.sync_key:
             messagebox.showerror(
@@ -12038,10 +12045,13 @@ class LipsyncTwoModeApp(_BaseApp):
         """Кнопка внизу: «НАЧАТЬ ОЧЕРЕДЬ» или во время работы «ДОБАВИТЬ В ОЧЕРЕДЬ (N)»."""
         if not hasattr(self, "start_btn") or self._queue_costing:
             return
-        if self.is_processing:
+        if self.is_processing and self._queue_stop:
+            self.start_btn.configure(text="ОСТАНАВЛИВАЮ ПОСЛЕ ТЕКУЩЕГО…", state="disabled")
+        elif self.is_processing:
             n = len(self.validate_rolls()[0])
-            self.start_btn.configure(text=f"ДОБАВИТЬ В ОЧЕРЕДЬ ({n})",
-                                     state="normal" if n and not self._queue_stop else "disabled")
+            # Кнопка всегда нажимается: при 0 объясняет, что добавлять нечего, а не молчит.
+            self.start_btn.configure(text=f"ДОБАВИТЬ В ОЧЕРЕДЬ ({n})" if n else "ОЧЕРЕДЬ ИДЁТ · ДОБАВИТЬ СЦЕНУ",
+                                     state="normal")
         else:
             self.start_btn.configure(text="НАЧАТЬ ОЧЕРЕДЬ", state="normal")
 

@@ -88,7 +88,7 @@ def batch_files(d):
 def phase1():
     yield 1.0
     w.rolls = []
-    a, b, c = new_roll("a", 0.8), new_roll("b", 0.8), new_roll("c", 0.8)
+    a, b, c = new_roll("a", 1.5), new_roll("b", 1.5), new_roll("c", 1.5)
     w.rolls = [r for r in w.rolls if r.get("voice_file")]
     w.render_scene_list(); w.update_status()
     w.start_queue(); yield lambda: w.is_processing; yield 0.2
@@ -104,6 +104,13 @@ def phase1():
     w.start_queue(); yield lambda: not w._queue_costing; yield 0.1
     check("3. добавленные — в ту же очередь: строк 5, статусы «В очереди»",
           len(rows()) == 5 and by_id(d["id"])["status"] == app.ROLL_QUEUED)
+    w.update_status(); yield 0.1
+    check("3a. добавлять нечего во время работы: кнопка активна — «ОЧЕРЕДЬ ИДЁТ · ДОБАВИТЬ СЦЕНУ»",
+          w.start_btn.cget("text") == "ОЧЕРЕДЬ ИДЁТ · ДОБАВИТЬ СЦЕНУ" and w.start_btn.cget("state") == "normal",
+          w.start_btn.cget("text"))
+    msgs.clear(); w.start_queue(); yield 0.1
+    check("3b. нажатие → понятное сообщение, а не тишина", any("Все сцены готовы" in m[2] and "Уже в очереди" in m[2]
+                                                                for m in msgs), str(msgs))
     f = new_roll("f", 0.3)
     w.start_queue(); yield lambda: not w._queue_costing; yield 0.05
     removed = w._queue_remove_roll(f["id"])
@@ -129,8 +136,11 @@ def phase1():
           and texts.count("Открыть") == 5, str(texts[:4]))
     msgs.clear()
     w.start_queue(); yield 0.2
-    check("8. повторный запуск: все готовы → не запускаются, подсказка «Запустить заново»",
-          not w.is_processing and any("Готовые сцены (5)" in m[2] for m in msgs))
+    check("8. повторный запуск: все готовы → «Все сцены готовы. Нажми «Запустить заново» у нужной сцены»",
+          not w.is_processing and any(m[2].startswith("Все сцены готовы. Нажми «Запустить заново» у нужной сцены.")
+                                      and "Готовых: 5" in m[2] for m in msgs), str(msgs[-1:]))
+    check("8a. кнопка не выглядит сломанной: «НАЧАТЬ ОЧЕРЕДЬ», нажимается",
+          w.start_btn.cget("text") == "НАЧАТЬ ОЧЕРЕДЬ" and w.start_btn.cget("state") == "normal")
     w.rerun_roll(a["id"]); w.start_queue(); yield lambda: w.is_processing; yield idle; yield 0.2
     check("8b. «Запустить заново» → только эта сцена, новая папка", w._queue_summary["total"] == 1
           and w._queue_batch_dir != batch)
