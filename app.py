@@ -44,6 +44,7 @@ import collections
 import contextlib
 import requests
 import json
+import math
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageTk
@@ -2995,6 +2996,18 @@ def compress_exact_auto_mb(info):
     return round(info["size"] / MB * COMPRESS_EXACT_AUTO_SHARE, 1)
 
 
+COMPRESS_REC_BPP = 0.05              # бит на пиксель для приличного качества — рекомендуемый размер
+COMPRESS_LOW_BPP = 0.03              # ниже — предупреждение «качество будет заметно хуже»
+
+
+def compress_size_for_kbps(info, video_kbps, audio_kbps, strict):
+    """Размер файла (МБ), при котором на видео остаётся video_kbps — обратное к compress_target_kbps."""
+    duration = max(info["duration"], 0.1)
+    share = 1 - COMPRESS_CONTAINER_OVERHEAD - (COMPRESS_LIMIT_MARGIN if strict else 0)
+    bits = (video_kbps + (audio_kbps or 0)) * 1000 * duration
+    return math.ceil(bits / 8 / share / MB * 10) / 10
+
+
 def compress_plan(info, settings, encoders=None, works=None, platform_name=None, sdr_method="auto"):
     """Что и как кодировать для файла: кодировщик, фильтры, звук, битрейт или качество, предупреждения."""
     settings = normalize_compress_settings(settings)
@@ -3099,16 +3112,28 @@ def compress_plan(info, settings, encoders=None, works=None, platform_name=None,
         if capped:
             kbps = source_video_kbps * 0.9
         plan.update(video_kbps=kbps, target_mb=target_mb, strict=strict, capped=capped)
+        pixels = max(out_w * out_h * (out_fps or 25), 1)
         if kbps < COMPRESS_MIN_VIDEO_KBPS:
-            plan["error"] = (f"{target_mb:g} МБ слишком мало для {info['duration'] / 60:.1f} мин: "
-                             f"на видео остаётся {max(kbps, 0):.0f} кбит/с. Увеличь размер или обрежь видео.")
+            # Совет про «Точный размер» — без запаса строгого лимита: там его нет.
+            min_mb = compress_size_for_kbps(info, COMPRESS_MIN_VIDEO_KBPS, audio_kbps, False)
+            plan["min_mb"] = min_mb
+            if strict:
+                plan["error"] = (f"95 МБ мало для {info['duration'] / 60:.1f} мин: на видео остаётся "
+                                 f"{max(kbps, 0):.0f} кбит/с. Выбери 720p, «Точный размер» от {min_mb:g} МБ "
+                                 "или обрежь видео.")
+            else:
+                plan["error"] = (f"{target_mb:g} МБ слишком мало для {info['duration'] / 60:.1f} мин: на видео "
+                                 f"остаётся {max(kbps, 0):.0f} кбит/с. Минимум — {min_mb:g} МБ.")
         else:
-            bpp = kbps * 1000 / max(out_w * out_h * (out_fps or 25), 1)
-            if bpp < 0.03:
-                warnings.append(f"На видео {kbps:.0f} кбит/с — качество будет низким. "
-                                "Попробуй 720p или больший размер.")
-        if info["size"] <= target_mb * MB:
-            warnings.append(f"Файл уже меньше {target_mb:g} МБ — сжатие может быть не нужно.")
+            bpp = kbps * 1000 / pixels
+            if bpp < COMPRESS_LOW_BPP:
+                rec = compress_size_for_kbps(info, COMPRESS_REC_BPP * pixels / 1000, audio_kbps, strict)
+                plan["rec_mb"] = rec
+                warnings.append(f"Мало бит на пиксель ({bpp:.3f}): качество будет заметно хуже. "
+                                f"Рекомендуемый размер — от {rec:g} МБ или 720p.")
+        if not strict and info["size"] <= target_mb * MB:
+            plan["not_needed"] = True
+            warnings.append(f"Файл уже меньше {target_mb:g} МБ — сжатие не нужно.")
     return plan
 
 
@@ -7218,22 +7243,32 @@ class LipsyncTwoModeApp(_BaseApp):
             self._compress_cancel_estimates()   # оценки под старые настройки больше не нужны
             render_compress()
 
+        size_state = {"invalid": False}
+        size_border = size_entry.cget("border_color")
+
         def on_size(_e=None):
             text = size_entry.get().strip().replace(",", ".")
             if not text:
+                size_state["invalid"] = False
+                size_entry.configure(border_color=size_border)
                 on_setting("exact_mb", None)             # пусто — около 50% каждого файла
                 return
             try:
                 value = float(text)
-                if value <= 0:
+                if not value > 0 or value != value or value == float("inf"):
                     raise ValueError
             except ValueError:
-                size_entry.delete(0, "end")
-                current = self._compress_settings().get("exact_mb")
-                if current:
-                    size_entry.insert(0, f"{current:g}")
+                size_state["invalid"] = True             # не число — подсветка, запуск не начнётся
+                size_entry.configure(border_color="#f87171")
                 return
+            size_state["invalid"] = False
+            size_entry.configure(border_color=size_border)
             on_setting("exact_mb", value)
+
+        def set_exact(value):
+            size_entry.delete(0, "end")
+            size_entry.insert(0, f"{value:g}")
+            on_size()
 
         size_entry.bind("<Return>", on_size)
         size_entry.bind("<FocusOut>", on_size)
@@ -7307,6 +7342,7 @@ class LipsyncTwoModeApp(_BaseApp):
             remove.pack(side="right")
             keep = self.button(top, "Оставить оригинал", lambda: None, color=BTN_DANGER,
                                hover=BTN_DANGER_HOVER, width=170)
+            fix = self.button(top, "", lambda: None, color=BTN_OK, hover=BTN_OK_HOVER, width=220)
             open_btn = self.button(top, "Открыть папку", lambda: None, color=BTN, hover=BTN_HOVER, width=130)
             body = ctk.CTkFrame(row, fg_color="transparent")
             body.pack(fill="x", padx=12, pady=(2, 10))
@@ -7317,7 +7353,7 @@ class LipsyncTwoModeApp(_BaseApp):
                 labels[key] = lbl
             bar = ctk.CTkProgressBar(body, height=6)
             bar.set(0)
-            return {"row": row, "remove": remove, "keep": keep, "open": open_btn, "bar": bar, **labels}
+            return {"row": row, "remove": remove, "keep": keep, "open": open_btn, "bar": bar, "fix": fix, **labels}
 
         ROW_ORDER = ("info", "warn", "sync", "status", "bar")
 
@@ -7486,6 +7522,11 @@ class LipsyncTwoModeApp(_BaseApp):
                 show(w["open"], bool(open_dir), side="right", padx=4)
                 w["keep"].configure(command=(lambda i=keep_id: keep_original(i)))
                 show(w["keep"], bool(keep_id), side="right", padx=4)
+                min_mb = (plan or {}).get("min_mb") if settings["preset"] == COMPRESS_EXACT_PRESET else None
+                if min_mb and not task:
+                    w["fix"].configure(text=f"Поставить минимум {min_mb:g} МБ",
+                                       command=lambda v=min_mb: set_exact(v))
+                show(w["fix"], bool(min_mb) and not task, side="right", padx=4)
                 w["remove"].configure(state="disabled" if running else "normal")
             if kind in ("crf", "ad") and est_items and not running:
                 self._compress_request_estimates(est_items)
@@ -7565,14 +7606,26 @@ class LipsyncTwoModeApp(_BaseApp):
                 messagebox.showwarning("Сжать видео", "Нет файлов с прочитанными параметрами.", parent=self)
                 return
             settings = self._compress_settings()
-            errors = []
+            if settings["preset"] == COMPRESS_EXACT_PRESET and size_state["invalid"]:
+                messagebox.showerror("Сжать видео", "Размер: введите число больше 0 (или оставьте поле пустым — "
+                                                    "тогда ≈50% каждого файла).", parent=self)
+                return
+            errors, not_needed = [], []
             for p in ready:
                 plan = compress_plan(self._compress_info[p], settings)
                 if plan.get("error"):
                     errors.append(f"{Path(p).name}: {plan['error']}")
+                elif plan.get("not_needed"):
+                    not_needed.append(p)
             if errors:
                 messagebox.showerror("Сжать видео", "\n\n".join(errors), parent=self)
                 return
+            if not_needed and not messagebox.askyesno(
+                    "Сжать видео", "Эти файлы уже меньше заданного размера — сжатие не нужно:\n"
+                    + "\n".join(Path(p).name for p in not_needed) + "\n\nВсё равно перекодировать?", parent=self):
+                ready = [p for p in ready if p not in not_needed]
+                if not ready:
+                    return
             self._compress_cancel_estimates()
             batch = uuid.uuid4().hex[:8]
             self._panel_state_set("compress", batch=batch)
