@@ -6532,6 +6532,8 @@ class LipsyncTwoModeApp(_BaseApp):
         container.pack(fill="both", expand=True)
         if not created and hasattr(container, "_parent_canvas"):
             self.after(30, lambda c=container._parent_canvas: self._repaint_scroll(c))
+        elif not created and hasattr(container, "_pin"):
+            self.after(30, lambda c=container._pin["scroll"]._parent_canvas: self._repaint_scroll(c))
         return container, created
 
     @staticmethod
@@ -6550,6 +6552,67 @@ class LipsyncTwoModeApp(_BaseApp):
             canvas.after(40, lambda: canvas.winfo_exists() and canvas.yview_moveto(top))
         except Exception:
             pass
+
+    def _start_panel_pinned(self, name):
+        """Панель с закреплёнными полосами: верх (top) и низ (bottom) не прокручиваются, прокручивается
+        только середина (scroll) — основные кнопки видны при любой высоте окна. Создаётся один раз;
+        при повторном показе — None (как _start_panel), содержимое подтягивает рендерер."""
+        def factory():
+            outer = ctk.CTkFrame(self.detail_panel, fg_color=BG, corner_radius=0)
+            # height=1: пустая полоса не занимает места (у CTkFrame по умолчанию 200 px), содержимое растянет её.
+            top = ctk.CTkFrame(outer, fg_color=BG, corner_radius=0, height=1)
+            bottom = ctk.CTkFrame(outer, fg_color=PANEL, corner_radius=0, height=1)
+            scroll = ctk.CTkScrollableFrame(outer, fg_color=BG, scrollbar_button_color="#3d3d6a",
+                                            scrollbar_button_hover_color="#ff7eb6")
+            top.pack(side="top", fill="x")
+            bottom.pack(side="bottom", fill="x")
+            scroll.pack(side="top", fill="both", expand=True)
+            outer._pin = {"top": top, "scroll": scroll, "bottom": bottom}
+            return outer
+        container, created = self._show_container(name, factory)
+        self.update_status()
+        if created:
+            return container._pin
+        self._render_panel(name)
+        return None
+
+    def _file_pick_row(self, parent, button_text, command, empty_text="не выбран", button_width=130):
+        """Строка «путь … [кнопка]»: колонка кнопки фиксированной ширины, сжимается только поле пути —
+        длинное имя сокращается «…» посередине (расширение видно), полный путь — в подсказке.
+        Возвращает (строка, set_value(текст, полный_путь, цвет), кнопка, поле)."""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.grid_columnconfigure(0, weight=1)
+        row.grid_columnconfigure(1, weight=0, minsize=button_width + 8)
+        font = ctk.CTkFont(size=12)
+        field = ctk.CTkLabel(row, text="", width=1, fg_color="#f5f5f5", text_color="#888", anchor="w",
+                             corner_radius=6, font=font, height=32)
+        field.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        button = self.button(row, button_text, command, color=BTN, hover=BTN_HOVER, width=button_width)
+        button.grid(row=0, column=1, sticky="e")
+        state = {"text": f"  {empty_text}", "full": ""}
+
+        def fit(_e=None):
+            text, avail = state["text"], field.winfo_width() - 18
+            if avail > 40 and font.measure(text) > avail:
+                head, tail = text[:len(text) // 2], text[len(text) // 2:]
+                while (head or tail) and font.measure(head + "…" + tail) > avail:
+                    if len(head) >= len(tail):
+                        head = head[:-1]
+                    else:
+                        tail = tail[1:]
+                text = head + "…" + tail
+            if field.cget("text") != text:
+                field.configure(text=text)
+
+        def set_value(text, full="", color="#111"):
+            state.update(text=f"  {text}", full=full)
+            field.configure(text_color=color)
+            fit()
+
+        field.bind("<Configure>", fit, add="+")
+        HoverTip(field, lambda: state["full"] or state["text"].strip())
+        set_value(empty_text, "", "#888")
+        return row, set_value, button, field
 
     def _start_panel(self, name):
         """Панели не уничтожаются: создаются один раз, дальше только скрываются и показываются.
@@ -7142,11 +7205,11 @@ class LipsyncTwoModeApp(_BaseApp):
                 self._compress_est_current = None
 
     def show_compress_panel(self):
-        outer = self._start_panel("compress")
-        if outer is not None:
-            self._build_compress_panel(outer)
+        pin = self._start_panel_pinned("compress")
+        if pin is not None:
+            self._build_compress_panel(pin["scroll"], top=pin["top"], bottom=pin["bottom"])
 
-    def _build_compress_panel(self, outer):
+    def _build_compress_panel(self, outer, top=None, bottom=None):
         tasks = self.background_tasks
         self._compress_warmup()
         self._compress_probe_missing(self._compress_files())
@@ -7157,8 +7220,9 @@ class LipsyncTwoModeApp(_BaseApp):
         self.label(head, "Локально через ffmpeg, бесплатно. Оригинал никогда не перезаписывается: результат "
                          "кладётся в папку «compressed» рядом с ним (или в выбранную) с суффиксом _compressed.",
                    size=12, color=MUTED).pack(anchor="w", fill="x", padx=24, pady=(0, 10))
-        pick_row = ctk.CTkFrame(head, fg_color="transparent")
-        pick_row.pack(fill="x", padx=20, pady=(0, 18))
+        # «Файлы…» и «Папка…» — в закреплённом верху панели: видны при любой прокрутке.
+        pick_row = ctk.CTkFrame(top if top is not None else head, fg_color="transparent")
+        pick_row.pack(fill="x", padx=20, pady=(10, 8) if top is not None else (0, 18))
         recursive_var = ctk.BooleanVar(value=bool(self._panel_state_get("compress", "recursive", False)))
 
         def add_paths(paths=(), folder=None):
@@ -7194,10 +7258,12 @@ class LipsyncTwoModeApp(_BaseApp):
 
         self.button(pick_row, "Файлы…", pick_files, color=BTN, hover=BTN_HOVER, width=110).pack(side="left")
         self.button(pick_row, "Папка…", pick_folder, color=BTN, hover=BTN_HOVER, width=110).pack(side="left", padx=8)
-        ctk.CTkCheckBox(pick_row, text="включая подпапки", variable=recursive_var, text_color=TEXT,
+        sub_row = ctk.CTkFrame(top if top is not None else head, fg_color="transparent")   # вторая строка: узкое окно
+        sub_row.pack(fill="x", padx=20, pady=(0, 8), after=pick_row)
+        ctk.CTkCheckBox(sub_row, text="включая подпапки", variable=recursive_var, text_color=TEXT,
                         command=lambda: self._panel_state_set("compress", recursive=recursive_var.get()),
-                        font=ctk.CTkFont(size=12)).pack(side="left", padx=8)
-        clear_btn = self.button(pick_row, "Очистить список", clear_list, color=BTN, hover=BTN_HOVER, width=140)
+                        font=ctk.CTkFont(size=12)).pack(side="left")
+        clear_btn = self.button(sub_row, "Очистить список", clear_list, color=BTN, hover=BTN_HOVER, width=140)
         clear_btn.pack(side="right")
 
         list_frame = ctk.CTkFrame(outer, fg_color="transparent")
@@ -7330,22 +7396,29 @@ class LipsyncTwoModeApp(_BaseApp):
         size_entry.bind("<FocusOut>", on_size)
 
         # ── Запуск ───────────────────────────────────────────────────────
-        run_card = ctk.CTkFrame(outer, fg_color=PANEL, corner_radius=20)
-        run_card.pack(fill="x", padx=20, pady=(0, 20))
+        # Запуск, отмена и общий прогресс — в закреплённом низу панели.
+        run_card = ctk.CTkFrame(bottom if bottom is not None else outer, fg_color=PANEL,
+                                corner_radius=0 if bottom is not None else 20)
+        run_card.pack(fill="x", padx=0 if bottom is not None else 20, pady=0 if bottom is not None else (0, 20))
         run_row = ctk.CTkFrame(run_card, fg_color="transparent")
-        run_row.pack(fill="x", padx=20, pady=(16, 6))
+        run_row.pack(fill="x", padx=20, pady=(12, 6))
         start_btn = self.button(run_row, "🗜 Сжать", lambda: start(), color=BTN_OK, hover=BTN_OK_HOVER, width=140)
         start_btn.pack(side="left")
         cancel_btn = self.button(run_row, "Отмена", lambda: cancel(), color=BTN_DANGER, hover=BTN_DANGER_HOVER,
                                  width=110)
         cancel_btn.pack(side="left", padx=8)
-        open_out_btn = self.button(run_row, "Открыть папку", lambda: None, color=BTN, hover=BTN_HOVER, width=140)
-        open_out_btn.pack(side="right")
         total_bar = ctk.CTkProgressBar(run_card, height=8)
         total_bar.set(0)
         total_bar.pack(fill="x", padx=20, pady=(4, 4))
-        total_lbl = self.label(run_card, "", size=12, color=MUTED)
-        total_lbl.pack(anchor="w", fill="x", padx=20, pady=(0, 16))
+        info_row = ctk.CTkFrame(run_card, fg_color="transparent")    # итог и «Открыть папку» — второй строкой
+        info_row.pack(fill="x", padx=20, pady=(0, 12))
+        info_row.grid_columnconfigure(0, weight=1)
+        total_lbl = self.label(info_row, "", size=12, color=MUTED)
+        total_lbl.configure(anchor="w", justify="left")
+        total_lbl.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        info_row.bind("<Configure>", lambda e: total_lbl.configure(wraplength=max(160, e.width - 160)), add="+")
+        open_out_btn = self.button(info_row, "Открыть папку", lambda: None, color=BTN, hover=BTN_HOVER, width=140)
+        open_out_btn.grid(row=0, column=1, sticky="e")
 
         rows = {}
         state = {"signature": None, "announced": {t["id"] for t in tasks.list(kind="compress")
@@ -8659,21 +8732,26 @@ class LipsyncTwoModeApp(_BaseApp):
             messagebox.showerror("Ошибка", "Сначала добавь ElevenLabs API key: «Настройки» → «Ключи» → ElevenLabs.", parent=self)
             self.show_api_key_panel()
             return
-        scroll = self._start_panel("voice_clone")
-        if scroll is None:
+        pin = self._start_panel_pinned("voice_clone")
+        if pin is None:
             return
+        scroll, bottom = pin["scroll"], pin["bottom"]
         tasks = self.background_tasks
+        saved = self._panel_state.get("voice_clone", {})
         frame = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="x", padx=20, pady=20)
 
         self.label(frame, "🎙 Клонировать голос", size=22, weight="bold").pack(
             anchor="w", padx=22, pady=(20, 6))
-        self.label(
+        hint = self.label(
             frame,
-            "Загрузи 1-3 минуты чистой речи без шума и музыки. "
+            "Достаточно 10–30 секунд чистой речи без шума и музыки; для лучшего результата 1–3 минуты. "
             "Поддерживаются mp3, wav, m4a, flac.",
             size=13, color=MUTED,
-        ).pack(anchor="w", padx=22, pady=(0, 16))
+        )
+        hint.configure(wraplength=520, justify="left")
+        hint.pack(anchor="w", fill="x", padx=22, pady=(0, 16))
+        frame.bind("<Configure>", lambda e: hint.configure(wraplength=max(240, e.width - 60)), add="+")
 
         # ── Переключатель источника ────────────────────────────────────────
         source_var = ctk.StringVar(value="audio")
@@ -8693,6 +8771,9 @@ class LipsyncTwoModeApp(_BaseApp):
             font=ctk.CTkFont(size=13), height=36, corner_radius=10,
         )
         video_btn.pack(side="left", padx=(4, 8), pady=8, expand=True, fill="x")
+        # Блок выбора файла — сразу под переключателем, выше имени и описания.
+        files_slot = ctk.CTkFrame(frame, fg_color="transparent")
+        files_slot.pack(fill="x")
 
         # ── Имя и описание ─────────────────────────────────────────────────
         self.label(frame, "Имя голоса", size=14, weight="bold").pack(anchor="w", padx=22)
@@ -8724,19 +8805,18 @@ class LipsyncTwoModeApp(_BaseApp):
         extracting = {"active": False}
 
         # ── Аудио блок ─────────────────────────────────────────────────────
-        audio_block = ctk.CTkFrame(frame, fg_color="transparent")
+        audio_block = ctk.CTkFrame(files_slot, fg_color="transparent")
 
         self.label(audio_block, "Аудио-сэмпл", size=14, weight="bold").pack(anchor="w")
-        audio_file_row = ctk.CTkFrame(audio_block, fg_color=PANEL)
-        audio_file_row.pack(fill="x", pady=(6, 0))
 
-        audio_file_label = ctk.CTkLabel(
-            audio_file_row, text="  не выбран",
-            fg_color="#f5f5f5", text_color="#888",
-            anchor="w", corner_radius=6,
-            font=ctk.CTkFont(size=12), height=32,
-        )
-        audio_file_label.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
+        def set_audio(f):
+            selected["path"] = f
+            try:
+                size_mb = os.path.getsize(f) / (1024 * 1024)
+                set_audio_text(f"{Path(f).name}  ({size_mb:.1f} МБ)", f)
+            except OSError:
+                set_audio_text(Path(f).name, f)
+            self._panel_state_set("voice_clone", audio_path=f)
 
         def choose_audio():
             f = filedialog.askopenfilename(
@@ -8744,38 +8824,29 @@ class LipsyncTwoModeApp(_BaseApp):
                 filetypes=[("Аудио", "*.mp3 *.wav *.m4a *.flac *.ogg"), ("Все файлы", "*.*")],
             )
             if f:
-                selected["path"] = f
-                try:
-                    size_mb = os.path.getsize(f) / (1024 * 1024)
-                    audio_file_label.configure(
-                        text=f"  {Path(f).name}  ({size_mb:.1f} МБ)", text_color="#111")
-                except Exception:
-                    audio_file_label.configure(text=f"  {Path(f).name}", text_color="#111")
+                set_audio(f)
 
-        self.button(audio_file_row, "Выбрать файл", choose_audio,
-                    color=BTN, hover=BTN_HOVER, width=130).pack(side="right")
+        audio_file_row, set_audio_text, _audio_pick_btn, audio_file_label = self._file_pick_row(
+            audio_block, "Выбрать файл", choose_audio)
+        audio_file_row.pack(fill="x", pady=(6, 0))
 
         # ── Видео блок ─────────────────────────────────────────────────────
-        video_block = ctk.CTkFrame(frame, fg_color="transparent")
+        video_block = ctk.CTkFrame(files_slot, fg_color="transparent")
 
         self.label(video_block, "Видео файл", size=14, weight="bold").pack(anchor="w")
-        video_file_row = ctk.CTkFrame(video_block, fg_color=PANEL)
+        video_file_row, set_video_text, _video_pick_btn, video_file_label = self._file_pick_row(
+            video_block, "Выбрать файл", lambda: choose_video())
         video_file_row.pack(fill="x", pady=(6, 0))
-
-        video_file_label = ctk.CTkLabel(
-            video_file_row, text="  не выбран",
-            fg_color="#f5f5f5", text_color="#888",
-            anchor="w", corner_radius=6,
-            font=ctk.CTkFont(size=12), height=32,
-        )
-        video_file_label.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
 
         extract_status_label = self.label(
             video_block,
             "Выбери видео — аудио будет извлечено автоматически",
             size=12, color=MUTED,
         )
-        extract_status_label.pack(anchor="w", pady=(8, 0))
+        extract_status_label.pack(anchor="w", fill="x", pady=(8, 0))
+        extract_status_label.configure(justify="left")
+        video_block.bind("<Configure>", lambda e: extract_status_label.configure(wraplength=max(200, e.width - 10)),
+                         add="+")
 
         def _cleanup_extracted():
             if extracting["active"]:
@@ -8802,9 +8873,14 @@ class LipsyncTwoModeApp(_BaseApp):
             )
             if not f or extracting["active"]:
                 return
+            start_extract(f)
+
+        def start_extract(f):
+            """Извлечение звука из видео в фоне — и при выборе, и повторно, если временный файл пропал."""
             _cleanup_extracted()  # прошлое извлечённое аудио больше не нужно
             selected["path"] = ""
-            video_file_label.configure(text=f"  {Path(f).name}", text_color="#111")
+            set_video_text(Path(f).name, f)
+            self._panel_state_set("voice_clone", video_path=f)
             extracting["active"] = True
             task_id = tasks.create("clone_extract", "voice_clone", title=f"Аудио из {Path(f).name}",
                                    meta={"video": f}, status="running")
@@ -8827,10 +8903,24 @@ class LipsyncTwoModeApp(_BaseApp):
             threading.Thread(target=worker, daemon=True).start()
 
         applied = {"task": None}
+        auto = {"task": None}          # повторное извлечение — один раз на задачу
 
         def render_clone():
             render_upload()
             task = tasks.latest("clone_extract")
+            video = ((task or {}).get("meta") or {}).get("video") or saved.get("video_path")
+            missing = task is None or task["status"] == "interrupted" or (
+                task["status"] == "done" and not os.path.exists((task.get("result") or {}).get("path") or ""))
+            if video and missing and not extracting["active"] and source_var.get() == "video" \
+                    and auto["task"] != (task or {}).get("id", "none"):
+                auto["task"] = (task or {}).get("id", "none")
+                if os.path.exists(video):
+                    self.log("Клонирование: извлечённое аудио пропало — извлекаю звук из видео заново")
+                    start_extract(video)       # «Извлекаю звук…» вместо «выбери видео заново»
+                    return
+                set_video_text(f"{Path(video).name} — файл не найден", video, "#fca5a5")
+                extract_status_label.configure(text="Видео не найдено — выбери файл заново", text_color="#fcd34d")
+                return
             busy = bool(task and task["status"] in ("queued", "running"))
             uploading = bool(tasks.active(kind="clone_upload"))
             clone_btn_ref[0].configure(state="disabled" if busy or uploading else "normal",
@@ -8838,13 +8928,16 @@ class LipsyncTwoModeApp(_BaseApp):
             if task is None:
                 return
             if busy:
-                extract_status_label.configure(text="Извлекаю аудио... (можно переключаться на другие вкладки)",
+                extract_status_label.configure(text="Извлекаю звук… (можно переключаться на другие вкладки)",
                                                text_color=MUTED)
             elif task["status"] == "done":
                 res = task.get("result") or {}
                 if not res.get("path") or not os.path.exists(res["path"]):
-                    extract_status_label.configure(text="Извлечённое аудио не найдено — выбери видео заново",
-                                                   text_color="#fcd34d")
+                    if video and os.path.exists(video):
+                        extract_status_label.configure(text="Извлекаю звук…", text_color=MUTED)
+                    else:
+                        extract_status_label.configure(text="Видео не найдено — выбери файл заново",
+                                                       text_color="#fcd34d")
                     return
                 extract_status_label.configure(
                     text=f"✓ Аудио извлечено: {res.get('duration') or 0:.1f} сек · {res.get('size_mb') or 0:.1f} МБ",
@@ -8860,8 +8953,6 @@ class LipsyncTwoModeApp(_BaseApp):
                                                text_color="#fca5a5")
 
 
-        self.button(video_file_row, "Выбрать файл", choose_video,
-                    color=BTN, hover=BTN_HOVER, width=130).pack(side="right")
 
         # ── Переключение блоков ────────────────────────────────────────────
         def switch_source(mode):
@@ -8877,15 +8968,23 @@ class LipsyncTwoModeApp(_BaseApp):
                 video_btn.configure(fg_color=BTN_OK, hover_color=BTN_OK_HOVER)
                 audio_btn.configure(fg_color=BTN, hover_color=BTN_HOVER)
             selected["path"] = ""
+            self._panel_state_set("voice_clone", source=mode)
+            if mode == "audio" and saved.get("audio_path") and os.path.exists(saved["audio_path"]):
+                set_audio(saved["audio_path"])
+            elif mode == "video":
+                applied["task"] = None
+                render_clone()
 
         audio_btn.configure(command=lambda: switch_source("audio"))
         video_btn.configure(command=lambda: switch_source("video"))
 
-        # Показываем аудио блок по умолчанию
-        audio_block.pack(fill="x", padx=22, pady=(0, 14))
-
-        result_label = self.label(frame, "", size=12, color=MUTED)
-        result_label.pack(anchor="w", padx=22, pady=(0, 8))
+        # Низ панели закреплён: статус и «Клонировать» видны при любой высоте окна.
+        bottom_row = ctk.CTkFrame(bottom, fg_color="transparent")
+        bottom_row.pack(fill="x", padx=20, pady=10)
+        bottom_row.grid_columnconfigure(0, weight=1)
+        result_label = self.label(bottom_row, "", size=12, color=MUTED)
+        result_label.configure(wraplength=420, justify="left", anchor="w")
+        result_label.grid(row=0, column=0, sticky="ew", padx=(4, 12))
         self._add_copy_menu(result_label, lambda lbl=result_label: lbl.cget("text"))
 
         def clone():
@@ -8947,10 +9046,11 @@ class LipsyncTwoModeApp(_BaseApp):
                 if st == "error":
                     messagebox.showerror("Ошибка", str(up.get("error")), parent=self)
 
-        clone_btn = self.button(frame, "🎙 Клонировать", clone,
+        clone_btn = self.button(bottom_row, "🎙 Клонировать", clone,
                                 color=BTN_OK, hover=BTN_OK_HOVER, width=200)
-        clone_btn.pack(anchor="e", padx=22, pady=(0, 20))
+        clone_btn.grid(row=0, column=1, sticky="e")
         clone_btn_ref = [clone_btn]
+        switch_source(saved.get("source") if saved.get("source") in ("audio", "video") else "audio")
 
         frame.bind("<Destroy>", lambda e: _cleanup_extracted())
         self._clone_cleanup = _cleanup_extracted
@@ -8963,9 +9063,10 @@ class LipsyncTwoModeApp(_BaseApp):
             messagebox.showerror("yt-dlp не найден", str(e), parent=self)
             return
 
-        outer = self._start_panel("downloader")
-        if outer is None:
+        pin = self._start_panel_pinned("downloader")
+        if pin is None:
             return
+        outer = pin["scroll"]
         tasks = self.background_tasks
 
         # ── Заголовок ──────────────────────────────────────────────────────
@@ -9142,8 +9243,9 @@ class LipsyncTwoModeApp(_BaseApp):
                     color=BTN, hover=BTN_HOVER, width=90).pack(side="left")
 
         # ── Кнопки ────────────────────────────────────────────────────────
-        btn_row = ctk.CTkFrame(outer, fg_color="transparent")
-        btn_row.pack(fill="x", padx=20, pady=(0, 8))
+        # «Скачать» — в закреплённом низу панели: видна при любой высоте окна.
+        btn_row = ctk.CTkFrame(pin["bottom"], fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=10)
 
         def do_download():
             raw = url_box.get("1.0", "end")
@@ -9230,12 +9332,16 @@ class LipsyncTwoModeApp(_BaseApp):
         stop_btn.pack(side="left", padx=8)
         stop_btn.configure(state="disabled")
 
-        status_lbl = self.label(btn_row, "", size=12, color=MUTED)
-        status_lbl.pack(side="left", padx=12)
-
-        self.button(btn_row, "Открыть папку",
+        dl_info = ctk.CTkFrame(pin["bottom"], fg_color="transparent")   # статус и «Открыть папку» — второй строкой
+        dl_info.pack(fill="x", padx=20, pady=(0, 10))
+        dl_info.grid_columnconfigure(0, weight=1)
+        status_lbl = self.label(dl_info, "", size=12, color=MUTED)
+        status_lbl.configure(anchor="w", justify="left")
+        status_lbl.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        dl_info.bind("<Configure>", lambda e: status_lbl.configure(wraplength=max(160, e.width - 150)), add="+")
+        self.button(dl_info, "Открыть папку",
                     lambda: open_folder(folder_var.get()),
-                    color=BTN, hover=BTN_HOVER, width=130).pack(side="right")
+                    color=BTN, hover=BTN_HOVER, width=130).grid(row=0, column=1, sticky="e")
 
         # ── История загрузок (из менеджера задач, переживает перезапуск) ────
         self.label(outer, "История загрузок", size=13, weight="bold", color=MUTED).pack(
@@ -9342,23 +9448,12 @@ class LipsyncTwoModeApp(_BaseApp):
         ).pack(anchor="w", padx=22, pady=(0, 16))
 
         self.label(frame, "Файл", size=14, weight="bold").pack(anchor="w", padx=22)
-        file_row = ctk.CTkFrame(frame, fg_color="transparent")
-        file_row.pack(fill="x", padx=22, pady=(6, 14))
-
-        file_label = ctk.CTkLabel(
-            file_row, text="  не выбран",
-            fg_color="#f5f5f5", text_color="#888",
-            anchor="w", corner_radius=6,
-            font=ctk.CTkFont(size=12), height=32,
-        )
-        file_label.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
-
         selected = {"path": ""}
 
         def show_file(f):
             selected["path"] = f
             size_mb = os.path.getsize(f) / (1024 * 1024)
-            file_label.configure(text=f"  {Path(f).name}  ({size_mb:.1f} МБ)", text_color="#111")
+            set_file_text(f"{Path(f).name}  ({size_mb:.1f} МБ)", f)
 
         def choose_file():
             f = filedialog.askopenfilename(
@@ -9373,11 +9468,12 @@ class LipsyncTwoModeApp(_BaseApp):
                 show_file(f)
                 self._panel_state_set("transcribe", file=f)
 
+        # Кнопка фиксированной ширины, длинное имя сокращается «…» — кнопка не уезжает за край.
+        file_row, set_file_text, _pick_btn, file_label = self._file_pick_row(frame, "Выбрать файл", choose_file,
+                                                                            button_width=140)
+        file_row.pack(fill="x", padx=22, pady=(6, 14))
         if saved.get("file") and os.path.exists(saved["file"]):
             show_file(saved["file"])
-
-        self.button(file_row, "Выбрать файл", choose_file,
-                    color=BTN, hover=BTN_HOVER, width=140).pack(side="right")
 
         status_label = self.label(frame, "", size=12, color=MUTED)
         status_label.pack(anchor="w", padx=22, pady=(0, 8))
@@ -10018,9 +10114,9 @@ class LipsyncTwoModeApp(_BaseApp):
    
 
     def show_voice_gen_panel(self, initial_voice="", initial_text=""):
-        outer = self._start_panel("voice_gen")
-        if outer is not None:
-            self._build_voice_gen_panel(outer)
+        pin = self._start_panel_pinned("voice_gen")
+        if pin is not None:
+            self._build_voice_gen_panel(pin["scroll"], bottom=pin["bottom"])
         self._voice_gen_apply_initial(initial_voice, initial_text)
 
     def _voice_gen_apply_initial(self, initial_voice, initial_text):
@@ -10053,7 +10149,7 @@ class LipsyncTwoModeApp(_BaseApp):
         if initial_voice or initial_text:
             vg["save_fields"]()
 
-    def _build_voice_gen_panel(self, outer):
+    def _build_voice_gen_panel(self, outer, bottom=None):
         saved = self._panel_state.get("voice_gen", {})
         frame = ctk.CTkFrame(outer, fg_color=PANEL, corner_radius=20)
         frame.pack(fill="x", padx=20, pady=20)
@@ -10546,8 +10642,9 @@ class LipsyncTwoModeApp(_BaseApp):
             render_fx()
 
         # ── Кнопка запуска ────────────────────────────────────────────────
-        gen_row = ctk.CTkFrame(frame, fg_color="transparent")
-        gen_row.pack(fill="x", padx=22, pady=(0, 16))
+        # «Сгенерировать A и B» — в закреплённом низу панели: видна при любой высоте окна.
+        gen_row = ctk.CTkFrame(bottom if bottom is not None else frame, fg_color="transparent")
+        gen_row.pack(fill="x", padx=22, pady=(10, 10) if bottom is not None else (0, 16))
 
         gen_btn = self.button(gen_row, "⚡ Сгенерировать A и B",
                               lambda: None,
