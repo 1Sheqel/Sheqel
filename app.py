@@ -59,7 +59,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 # Отчёты об ошибках разработчику. Пустой URL — отправка выключена.
