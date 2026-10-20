@@ -3453,6 +3453,58 @@ def compress_video_file(src, info, plan, final_path, log, progress=None, cancel=
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+COMPRESS_SSIM_SEG_SEC = 10
+COMPRESS_SSIM_SEGMENTS = 3
+COMPRESS_SSIM_LEVELS = ((0.98, "отлично"), (0.95, "хорошо"), (0.0, "заметные потери"))
+
+
+def ssim_rating(value):
+    return next(label for limit, label in COMPRESS_SSIM_LEVELS if value >= limit)
+
+
+def ssim_segments(duration, seg=COMPRESS_SSIM_SEG_SEC, count=COMPRESS_SSIM_SEGMENTS):
+    """Отрезки (начало, длина): короткий файл — целиком, иначе начало, середина и конец по seg секунд."""
+    if duration <= seg * count:
+        return [(0.0, duration)]
+    return [(duration * 0.1, seg), (duration * 0.5 - seg / 2, seg), (max(duration * 0.9 - seg, 0.0), seg)]
+
+
+def measure_ssim(src, dst, duration, width, height, fps=None, cancel=None, register=None):
+    """SSIM сжатого файла против оригинала (оба приводятся к width×height, fps и yuv420p).
+    3 отрезка по 10 с, среднее по длине. Отмена — CompressCancelled."""
+    chain = f"scale={int(width)}:{int(height)}:flags=bicubic,setsar=1" + (f",fps={fps:g}" if fps else "") + \
+            ",format=yuv420p"
+    total = weight = 0.0
+    for start, length in ssim_segments(duration):
+        cmd = [ffmpeg_bin(), "-hide_banner", "-nostdin", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(src),
+               "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(dst),
+               "-lavfi", f"[0:v]{chain}[a];[1:v]{chain}[b];[a][b]ssim", "-f", "null", "-"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **_compress_popen_kwargs())
+        if register:
+            register(proc)
+        try:
+            err_chunks = []
+            reader = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()), daemon=True)
+            reader.start()
+            while proc.poll() is None:
+                if cancel and cancel():
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                    raise CompressCancelled()
+                time.sleep(0.1)
+            reader.join(5)
+            err = b"".join(err_chunks).decode("utf-8", "replace")
+        finally:
+            if register:
+                register(None)
+        m = re.findall(r"All:([0-9.]+)", err)
+        if proc.returncode != 0 or not m:
+            raise RuntimeError("SSIM не посчитан: " + (err.strip().splitlines() or ["ffmpeg"])[-1][:200])
+        total += float(m[-1]) * length
+        weight += length
+    return round(total / max(weight, 1e-6), 4)
+
+
 def estimate_crf_size(src, info, plan, cancel=None, register=None):
     """Примерный размер для CRF: кодируем три отрезка по 4 с (начало, середина, конец)."""
     duration = info["duration"]
@@ -7204,6 +7256,10 @@ class LipsyncTwoModeApp(_BaseApp):
         menu(7, "Кодек", self.COMPRESS_CODEC_LABELS, settings["codec"], "codec", self.COMPRESS_CODEC_LABELS)
         hdr_menu = menu(8, "HDR-файлы", self.COMPRESS_HDR_LABELS, settings["hdr_mode"], "hdr_mode",
                         self.COMPRESS_HDR_LABELS)
+        ssim_var = ctk.BooleanVar(value=bool(settings.get("ssim", True)))
+        ctk.CTkCheckBox(card, text="Проверять качество после сжатия (SSIM: 3 отрезка по 10 с, в фоне)",
+                        variable=ssim_var, text_color=TEXT, font=ctk.CTkFont(size=12),
+                        command=lambda: on_setting("ssim", bool(ssim_var.get()))).pack(anchor="w", padx=20, pady=(8, 2))
         fast_var = ctk.BooleanVar(value=bool(settings["fast"]))
         fast_cb = ctk.CTkCheckBox(card, text="Быстрее (хуже качество) — аппаратный кодировщик", variable=fast_var,
                                   text_color=TEXT, font=ctk.CTkFont(size=12),
@@ -7482,6 +7538,12 @@ class LipsyncTwoModeApp(_BaseApp):
                         saved = 1 - res["size"] / max(res["src_size"], 1)
                         status = (f"✓ {res['src_size'] / MB:.1f} → {res['size'] / MB:.1f} МБ "
                                   f"({'−' if saved >= 0 else '+'}{abs(saved):.0%}) · {Path(res['output']).name}")
+                        if res.get("ssim") is not None:
+                            status += f" · качество: SSIM {res['ssim']:.3f} — {ssim_rating(res['ssim'])}"
+                            if res.get("ssim_hdr"):
+                                status += " (занижен из-за перевода HDR → SDR)"
+                        elif res.get("ssim_note"):
+                            status += f" · {res['ssim_note']}"
                         color = "#86efac"
                         open_dir = os.path.dirname(res["output"])
                         if res.get("bigger"):
@@ -7701,6 +7763,20 @@ class LipsyncTwoModeApp(_BaseApp):
                                              cancel=lambda task_id=task_id: tasks.cancel_requested(task_id)
                                              or self._closing,
                                              register=register, on_tmp=on_tmp)
+                if settings.get("ssim", True) and result.get("output"):
+                    tasks.update(task_id, progress=1.0, message="Проверяю качество (SSIM)…")
+                    result["ssim_hdr"] = bool(info.get("hdr")) and not plan.get("ten_bit")
+                    try:
+                        result["ssim"] = measure_ssim(src, result["output"], info["duration"], result["width"],
+                                                      result["height"], plan.get("out_fps") if plan.get("cfr") else None,
+                                                      cancel=lambda task_id=task_id: tasks.cancel_requested(task_id)
+                                                      or self._closing, register=register)
+                        self.log(f"Сжатие: {Path(src).name} — SSIM {result['ssim']:.4f} ({ssim_rating(result['ssim'])})")
+                    except CompressCancelled:
+                        result["ssim_note"] = "проверка качества отменена"      # файл уже готов — не трогаем
+                    except Exception as e:
+                        result["ssim_note"] = "проверка качества не удалась"
+                        self.log(f"Сжатие: SSIM не посчитан для {Path(src).name}: {e}")
                 tasks.update(task_id, status="done", progress=1.0, result=result,
                              message="больше оригинала" if result["bigger"] else "готово")
                 if result["bigger"]:
