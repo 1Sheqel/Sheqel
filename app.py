@@ -856,6 +856,9 @@ MAX_SAVED_TASKS = 300
 MAX_SYNC_JOURNAL = 500
 MAX_VOICE_FILES = 60
 TASK_FINISHED = ("done", "error", "cancelled", "interrupted")
+# Задачи только на время сессии: в state.json не пишутся и из него не читаются
+# («История загрузок» очищается при закрытии; скачанные файлы остаются на диске).
+SESSION_ONLY_TASK_KINDS = ("download",)
 
 
 class BackgroundTaskManager:
@@ -941,14 +944,16 @@ class BackgroundTaskManager:
                 return changed
 
     def snapshot(self, limit=MAX_SAVED_TASKS):
-        items = self.list()
+        """Задачи для state.json — без задач сессии (SESSION_ONLY_TASK_KINDS)."""
+        items = [t for t in self.list() if t["kind"] not in SESSION_ONLY_TASK_KINDS]
         return [{k: v for k, v in t.items() if k != "cancel"} for t in items[-limit:]]
 
     def restore(self, tasks):
-        """Задачи, которые шли в момент закрытия, восстанавливаются как «прерванные»."""
+        """Задачи, которые шли в момент закрытия, восстанавливаются как «прерванные».
+        Задачи сессии (загрузки) не восстанавливаются — в старых state.json они ещё есть."""
         with self._lock:
             for t in tasks or []:
-                if not isinstance(t, dict) or "id" not in t:
+                if not isinstance(t, dict) or "id" not in t or t.get("kind") in SESSION_ONLY_TASK_KINDS:
                     continue
                 t = dict(t, cancel=False)
                 if t.get("status") not in TASK_FINISHED:
@@ -6919,9 +6924,10 @@ class LipsyncTwoModeApp(_BaseApp):
         journal = data.get("sync_journal")
         self._sync_journal = journal if isinstance(journal, list) else []
         self._state_ready = True
-        if rolls or data.get("tasks"):
+        restored_tasks = len(self.background_tasks.list())
+        if rolls or restored_tasks:
             self.log(f"Восстановлено из прошлой сессии: роликов {len(rolls or [])}, "
-                     f"задач {len(data.get('tasks') or [])}, записей журнала Sync {len(self._sync_journal)}")
+                     f"задач {restored_tasks}, записей журнала Sync {len(self._sync_journal)}")
         history = data.get("queue_history")
         self._queue_history = [h for h in history if isinstance(h, dict) and h.get("batch_dir")][:QUEUE_HISTORY_MAX] \
             if isinstance(history, list) else []
@@ -9529,9 +9535,11 @@ class LipsyncTwoModeApp(_BaseApp):
                     lambda: open_folder(folder_var.get()),
                     color=BTN, hover=BTN_HOVER, width=130).grid(row=0, column=1, sticky="e")
 
-        # ── История загрузок (из менеджера задач, переживает перезапуск) ────
+        # ── История загрузок (из менеджера задач, только текущая сессия) ────
         self.label(outer, "История загрузок", size=13, weight="bold", color=MUTED).pack(
-            anchor="w", padx=20, pady=(4, 4))
+            anchor="w", padx=20, pady=(4, 0))
+        self.label(outer, "Очищается при закрытии программы. Файлы остаются в папке.",
+                   size=11, color=MUTED).pack(anchor="w", padx=20, pady=(0, 4))
 
         history_scroll = ctk.CTkScrollableFrame(outer, fg_color=BG, corner_radius=10)
         history_scroll.pack(fill="both", expand=True, padx=16, pady=(0, 16))
