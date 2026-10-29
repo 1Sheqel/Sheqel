@@ -59,7 +59,7 @@ CLOUDINARY_API_KEY = ""
 CLOUDINARY_API_SECRET = ""
 CONFIG_PATH = str(Path.home() / ".version.json")
 ELEVENLABS_API_KEY = ""
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/1Sheqel/Sheqel/main/version.json"
 
 # Отчёты об ошибках разработчику. Пустой URL — отправка выключена.
@@ -1407,6 +1407,61 @@ def roll_in_queue(roll):
     """Сцена уже в работе очереди: ждёт («В очереди») или обрабатывается («Обработка N»)."""
     status = str((roll or {}).get("status", ""))
     return status == ROLL_QUEUED or status.startswith("Обработка")
+
+
+# ── Папки с озвучкой и видео ─────────────────────────────────────────────────
+FOLDER_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac"}
+FOLDER_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+
+def find_folder_media(folder):
+    """Первое аудио и первое видео в папке (по алфавиту, скрытые файлы пропускаются): (аудио|None, видео|None)."""
+    audio_found = video_found = None
+    for f in sorted(Path(folder).iterdir()):
+        if not f.is_file():
+            continue
+        # Пропускаем скрытые файлы macOS (._filename, .DS_Store и тд)
+        if f.name.startswith("."):
+            continue
+        ext = f.suffix.lower()
+        if ext in FOLDER_AUDIO_EXTS and not audio_found:
+            audio_found = str(f)
+        if ext in FOLDER_VIDEO_EXTS and not video_found:
+            video_found = str(f)
+    return audio_found, video_found
+
+
+def scan_folder_for_roll(folder):
+    """Папка → поля новой сцены. Возвращает (поля, "") или (None, причина пропуска по-русски)."""
+    try:
+        if not os.path.exists(folder):
+            return None, "папка не найдена"
+        if not os.path.isdir(folder):
+            return None, "это не папка"
+        audio, video = find_folder_media(folder)
+    except OSError as e:
+        return None, f"папку не удалось прочитать ({e.strerror or e})"
+    if not audio and not video:
+        return None, "в папке нет ни озвучки, ни видео"
+    if not audio:
+        return None, "в папке нет озвучки (mp3, wav, m4a, aac)"
+    if not video:
+        return None, "в папке нет видео (mp4, mov, avi, mkv, webm)"
+    return {"voice_file": audio, "video_single": video}, ""
+
+
+def parse_folder_list(text):
+    """Текст «один путь на строку» → список путей в том же порядке (кавычки и пустые строки убираются)."""
+    out = []
+    for line in str(text or "").splitlines():
+        line = line.strip().strip('"').strip("'").strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _same_path_key(path):
+    return os.path.normcase(os.path.abspath(str(path or "")))
 
 
 SPLIT_PAUSE_HINT = "шум или реверберация мешают разделению, отключите эффект или разделите вручную"
@@ -5656,6 +5711,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self._browser_checked = False
         self.log_queue = queue.Queue()
         self.is_processing = False
+        self._folder_batch_busy = False     # идёт пакетное добавление папок (только главный поток)
         self.sync_key = SYNC_API_KEY
         self.cloudinary_cloud_name = ""
         self.cloudinary_api_key = ""
@@ -6492,7 +6548,23 @@ class LipsyncTwoModeApp(_BaseApp):
             text_color=TEXT, corner_radius=10, height=38,
             font=ctk.CTkFont(size=13),
         )
-        add_scene_btn.pack(fill="x", padx=10, pady=10)
+        add_scene_btn.pack(fill="x", padx=10, pady=(10, 6))
+
+        # Пакет папок и очистка списка — под «Новая задача» в том же блоке
+        self.batch_folders_btn = ctk.CTkButton(
+            scene_list_frame, text="📁  Добавить папки…", command=self.open_folder_batch_dialog,
+            fg_color=BTN, hover_color=BTN_HOVER,
+            text_color=TEXT, corner_radius=10, height=32,
+            font=ctk.CTkFont(size=12),
+        )
+        self.batch_folders_btn.pack(fill="x", padx=10, pady=(0, 6))
+        self.clear_scene_btn = ctk.CTkButton(
+            scene_list_frame, text="🗑  Очистить список", command=self.clear_rolls_confirm,
+            fg_color=BTN, hover_color=BTN_HOVER,
+            text_color=TEXT, corner_radius=10, height=32,
+            font=ctk.CTkFont(size=12),
+        )
+        self.clear_scene_btn.pack(fill="x", padx=10, pady=(0, 10))
 
         # Divider between scene list and detail
         ctk.CTkFrame(columns_row, width=1, fg_color="#2a2d3e", corner_radius=0).pack(
@@ -6751,7 +6823,7 @@ class LipsyncTwoModeApp(_BaseApp):
         if interrupted:
             titles = ", ".join(self.get_roll_title(self.rolls.index(r), r) for r in interrupted)
             self.log(f"Ролики, которые обрабатывались при закрытии, помечены «Прервано»: {titles}. "
-                     "Повторно они не запускаются; job_id и outputUrl — в журнале Sync.")
+                     "Сами они не запускаются; job_id и outputUrl — в журнале Sync.")
 
     def _on_sync_journal_event(self, event):
         """Вызывается из потока очереди — только запись в список; сохранение — в главном потоке."""
@@ -9260,16 +9332,19 @@ class LipsyncTwoModeApp(_BaseApp):
             denoise = denoise_var.get()
             output_dir = folder_var.get()
 
+            # Переменные Tk читаем здесь, в главном потоке; в потоке скачивания — только готовые значения.
+            use_cookies = use_cookies_var.get()
+            browser_override = browser_override_var.get()
+            cookies_file_text = cookies_file_var.get().strip()
+
             def get_browser_for_download():
                 """Возвращает (browser, cookies_file) для download_from_url."""
-                if not use_cookies_var.get():
+                if not use_cookies:
                     return None, None
-                override = browser_override_var.get()
-                if override == "Файл cookies.txt":
-                    path = cookies_file_var.get().strip()
-                    return (None, path) if path else (None, None)
-                if override != "Авто":
-                    return override.lower(), None
+                if browser_override == "Файл cookies.txt":
+                    return (None, cookies_file_text) if cookies_file_text else (None, None)
+                if browser_override != "Авто":
+                    return browser_override.lower(), None
                 return AUTO_BROWSER, None
 
             batch = uuid.uuid4().hex[:8]
@@ -11281,7 +11356,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self._register_renderer("voice_gen", render_slots)
         if saved.get("text"):
             self.after(100, _update_status)
-    def add_roll(self):
+    def _new_roll(self):
         roll = {
             "id": self.next_roll_id,
             "mode": "1 видео",
@@ -11297,6 +11372,10 @@ class LipsyncTwoModeApp(_BaseApp):
             "face_points": {},
         }
         self.next_roll_id += 1
+        return roll
+
+    def add_roll(self):
+        roll = self._new_roll()
         self.rolls.append(roll)
         self.selected_roll_id = roll["id"]
         self.render_scene_list()
@@ -11316,6 +11395,201 @@ class LipsyncTwoModeApp(_BaseApp):
             self.update_status()
             return
         self.add_roll()
+
+    def clear_rolls_confirm(self):
+        """Кнопка «Очистить список»: с подтверждением, логика удаления — та же, что у «Очистить всё» (clear_rolls)."""
+        removable = [r for r in self.rolls if not roll_in_queue(r)]
+        kept = len(self.rolls) - len(removable)
+        blank = (len(removable) == 1 and self._roll_is_blank(removable[0]))
+        if not removable or blank:
+            if kept:
+                messagebox.showinfo(
+                    "Очищать нечего",
+                    f"Все сцены ({kept}) сейчас в очереди или в обработке — их убрать нельзя. "
+                    "Дождись окончания или останови очередь.", parent=self)
+            else:
+                messagebox.showinfo("Очищать нечего", "Список сцен уже пуст.", parent=self)
+            return
+        done = sum(1 for r in removable if r.get("status") == "Готово")
+        failed = sum(1 for r in removable if r.get("status") == "Ошибка")
+        lines = [f"Будет убрано сцен из списка: {len(removable)}"
+                 + (f" (готовых: {done}, с ошибкой: {failed})" if done or failed else "") + "."]
+        if kept:
+            lines.append(f"Сцены в очереди или в обработке ({kept}) останутся — их убрать нельзя.")
+        lines.append("Готовые видео на диске, история и сохранённые результаты не удаляются.")
+        lines.append("Очистить список?")
+        if not messagebox.askyesno("Очистить список сцен", "\n\n".join(lines), parent=self):
+            return
+        self.clear_rolls()
+
+    @staticmethod
+    def _roll_is_blank(roll):
+        """Сцена, в которую пользователь ещё ничего не внёс."""
+        return not any(roll.get(k) for k in ("voice_file", "text", "video_single", "video_start",
+                                              "video_end", "audio_start", "audio_end")) \
+            and roll.get("status") == "Ожидает"
+
+    def add_folders_batch(self, folders, on_progress=None, on_done=None):
+        """Добавляет по сцене на каждую папку (озвучка + видео), по очереди. Только список — НИЧЕГО не запускает.
+        Папки сканируются в фоне; сцены добавляются в главном потоке. on_progress(добавлено, всего, пропущено),
+        on_done({"added", "total", "skipped": [(папка, причина)]})."""
+        folders = list(folders)
+        if self._folder_batch_busy or not folders:
+            return False
+        self._folder_batch_busy = True
+        total = len(folders)
+        summary = {"added": 0, "total": total, "skipped": []}
+        first_added = []
+
+        def apply(folder, fields, why):                       # главный поток
+            if fields:
+                key = (_same_path_key(fields["voice_file"]), _same_path_key(fields["video_single"]))
+                if any((_same_path_key(r.get("voice_file")), _same_path_key(r.get("video_single"))) == key
+                       for r in self.rolls if r.get("voice_file") and r.get("video_single")):
+                    fields, why = None, "эта папка уже есть в списке сцен"
+            if fields:
+                target = self.rolls[0] if len(self.rolls) == 1 and self._roll_is_blank(self.rolls[0]) else None
+                if target is None:
+                    target = self._new_roll()
+                    self.rolls.append(target)
+                target.update(fields)
+                target["status"] = "Ожидает"
+                summary["added"] += 1
+                first_added.append(target["id"])
+            else:
+                summary["skipped"].append((folder, why))
+            if on_progress:
+                on_progress(summary["added"], total, len(summary["skipped"]))
+
+        def finish():                                         # главный поток
+            self._folder_batch_busy = False
+            if first_added:
+                self.selected_roll_id = first_added[0]
+            self.render_scene_list()
+            self.render_scene_detail()
+            self.update_status()
+            self.log(f"Папки: добавлено сцен {summary['added']} из {total}, пропущено {len(summary['skipped'])}")
+            for folder, why in summary["skipped"]:
+                self.log(f"Папка пропущена: {folder} — {why}")
+            if on_done:
+                on_done(summary)
+
+        def work():                                           # фоновый поток: только файловая система
+            try:
+                for folder in folders:
+                    fields, why = scan_folder_for_roll(folder)
+                    self.after(0, lambda f=folder, fl=fields, w=why: apply(f, fl, w))
+                self.after(0, finish)
+            except RuntimeError as e:
+                write_log_file(f"Пакет папок: окно закрыто посреди сканирования ({e})")
+            except Exception as e:
+                write_log_file(f"Пакет папок: сбой сканирования: {e}")
+                try:
+                    self.after(0, finish)
+                except RuntimeError:
+                    pass
+
+        threading.Thread(target=work, daemon=True, name="FolderBatch").start()
+        return True
+
+    def open_folder_batch_dialog(self):
+        """Окно «Добавить папки»: список путей (по одному на строку), кнопка выбора папки добавляет в список."""
+        win = ctk.CTkToplevel(self)
+        win.title("Добавить папки")
+        win.geometry("720x560")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.after(100, win.grab_set)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
+        frame.pack(fill="both", expand=True, padx=24, pady=24)
+        self.label(frame, "Добавить папки", size=22, weight="bold").pack(anchor="w", padx=22, pady=(18, 4))
+        self.label(frame, "В каждой папке нужны озвучка (mp3, wav, m4a, aac) и видео. Из каждой папки получится "
+                          "одна сцена. Выбирай папки по одной кнопкой ниже или вставь список путей — "
+                          "по одному на строку. Ничего не запускается и не оплачивается: сцены только "
+                          "появятся в списке слева.",
+                   size=12, color=MUTED).pack(anchor="w", padx=22, pady=(0, 10))
+        box = ctk.CTkTextbox(frame, fg_color="#ffffff", text_color="#111111", border_width=1,
+                             border_color="#737373", corner_radius=10, font=ctk.CTkFont(size=13), wrap="none")
+        box.pack(fill="both", expand=True, padx=22, pady=(0, 8))
+        self._fix_paste(box)
+        count_lbl = self.label(frame, "Папок в списке: 0", size=12, color=MUTED)
+        count_lbl.pack(anchor="w", padx=22)
+
+        def current():
+            return parse_folder_list(box.get("1.0", "end"))
+
+        def refresh_count(event=None):
+            if count_lbl.winfo_exists():
+                count_lbl.configure(text=f"Папок в списке: {len(current())}")
+
+        box.bind("<KeyRelease>", refresh_count)
+
+        def pick():
+            d = filedialog.askdirectory(parent=win, title="Выбери папку с аудио и видео")
+            if not d:
+                return
+            if _same_path_key(d) in {_same_path_key(x) for x in current()}:
+                messagebox.showinfo("Уже в списке", "Эта папка уже есть в списке.", parent=win)
+                return
+            if box.get("1.0", "end").strip():
+                box.insert("end", d + "\n")
+            else:
+                box.delete("1.0", "end")
+                box.insert("1.0", d + "\n")
+            refresh_count()
+
+        def clear_list():
+            box.delete("1.0", "end")
+            refresh_count()
+
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.pack(fill="x", padx=22, pady=(8, 6))
+        self.button(row, "Выбрать папку…", pick, color=BTN, hover=BTN_HOVER, width=150).pack(side="left")
+        self.button(row, "Очистить список", clear_list, color=BTN, hover=BTN_HOVER, width=150).pack(side="left", padx=8)
+        progress_lbl = self.label(frame, "", size=12, color=MUTED)
+        progress_lbl.pack(anchor="w", padx=22, pady=(0, 4))
+        bottom = ctk.CTkFrame(frame, fg_color="transparent")
+        bottom.pack(fill="x", padx=22, pady=(0, 18))
+        add_btn = self.button(bottom, "Добавить сцены", lambda: go(), width=170)
+        add_btn.pack(side="left")
+        self.button(bottom, "Закрыть", win.destroy, color=BTN, hover=BTN_HOVER, width=110).pack(side="right")
+
+        def on_progress(added, total, skipped):
+            if progress_lbl.winfo_exists():
+                progress_lbl.configure(text=f"Добавлено {added} из {total}"
+                                            + (f", пропущено {skipped}" if skipped else ""))
+
+        def on_done(summary):
+            if add_btn.winfo_exists():
+                add_btn.configure(state="normal")
+            if win.winfo_exists():
+                box.delete("1.0", "end")
+                refresh_count()
+            lines = [f"Добавлено сцен: {summary['added']} из {summary['total']}."]
+            skipped = summary["skipped"]
+            if skipped:
+                lines.append(f"Пропущено: {len(skipped)}")
+                for f, why in skipped[:15]:
+                    name = os.path.basename(str(f).rstrip("/\\")) or f
+                    lines.append(f"• {name}: {why}")
+                if len(skipped) > 15:
+                    lines.append(f"… и ещё {len(skipped) - 15} (полный список — в журнале)")
+            parent = win if win.winfo_exists() else self
+            (messagebox.showinfo if summary["added"] else messagebox.showwarning)(
+                "Папки добавлены" if summary["added"] else "Ничего не добавлено", "\n".join(lines), parent=parent)
+
+        def go():
+            folders = current()
+            if not folders:
+                messagebox.showinfo("Список пуст", "Выбери хотя бы одну папку.", parent=win)
+                return
+            if self._folder_batch_busy:
+                return
+            add_btn.configure(state="disabled")
+            on_progress(0, len(folders), 0)
+            if not self.add_folders_batch(folders, on_progress=on_progress, on_done=on_done):
+                add_btn.configure(state="normal")
 
     def render_rolls(self):
         self.render_scene_list()
@@ -11440,7 +11714,7 @@ class LipsyncTwoModeApp(_BaseApp):
                     lambda rid=roll["id"]: self.remove_roll_by_id(rid),
                     color=BTN_DANGER, hover=BTN_DANGER_HOVER, width=100).pack(
             side="right", padx=(0, 10))
-        if roll["status"] == "Готово":
+        if roll["status"] in ("Готово", "Прервано"):
             self.button(title_row, "Запустить заново", lambda rid=roll["id"]: self.rerun_roll(rid),
                         color=BTN, hover=BTN_HOVER, width=150).pack(side="right", padx=(0, 10))
         elif roll["status"] == ROLL_QUEUED:
@@ -11883,7 +12157,7 @@ class LipsyncTwoModeApp(_BaseApp):
     def rerun_roll(self, roll_id):
         """«Запустить заново»: готовая сцена снова попадёт в очередь (статус «Ожидает»)."""
         roll = next((r for r in self.rolls if r["id"] == roll_id), None)
-        if roll is None or roll.get("status") != "Готово":
+        if roll is None or roll.get("status") not in ("Готово", "Прервано"):
             return
         roll["status"] = "Ожидает"
         self.log(f"{self.get_roll_title(self.rolls.index(roll), roll)}: снова «Ожидает» — запустится со следующей очередью")
@@ -11923,22 +12197,11 @@ class LipsyncTwoModeApp(_BaseApp):
         if not folder or self._roll_is_locked(self.rolls[idx]):
             return
 
-        audio_exts = {".mp3", ".wav", ".m4a", ".aac"}
-        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".MOV"}
-
-        audio_found = None
-        video_found = None
-
-        for f in sorted(Path(folder).iterdir()):
-            if not f.is_file():
-                continue
-            # Пропускаем скрытые файлы macOS (._filename, .DS_Store и тд)
-            if f.name.startswith(".") or f.name.startswith("._"):
-                continue
-            if f.suffix.lower() in audio_exts and not audio_found:
-                audio_found = str(f)
-            if f.suffix.lower() in video_exts and not video_found:
-                video_found = str(f)
+        try:
+            audio_found, video_found = find_folder_media(folder)
+        except OSError as e:
+            messagebox.showerror("Папка не читается", f"Не удалось открыть папку: {e}", parent=self)
+            return
 
         messages = []
         if audio_found:
@@ -12042,7 +12305,8 @@ class LipsyncTwoModeApp(_BaseApp):
 
     def queue_candidates(self):
         """(к запуску, ошибки, пропущенные готовые). «Готово» снова запускается только кнопкой
-        «Запустить заново» в карточке сцены; «В очереди» и «Обработка» уже в работе."""
+        «Запустить заново» в карточке сцены; «Прервано» тоже ждёт ручного решения (можно забрать результат
+        из Sync без новой оплаты); «В очереди» и «Обработка» уже в работе."""
         valid, errors, skipped_done = [], [], []
         for i, roll in enumerate(self.rolls):
             has_any = any([roll["voice_file"], roll["text"], roll["video_single"], roll["video_start"], roll["video_end"]])
@@ -12051,8 +12315,8 @@ class LipsyncTwoModeApp(_BaseApp):
             if roll.get("status") == "Готово":
                 skipped_done.append((i, roll))
                 continue
-            if roll_in_queue(roll):
-                continue
+            if roll_in_queue(roll) or roll.get("status") == "Прервано":
+                continue                 # «Прервано» — только вручную: «Запустить заново» или «Забрать из Sync»
             if not roll["voice_file"]:
                 errors.append(f"Ролик {i + 1}: не выбран full_voice.mp3.")
             if roll["mode"] == "1 видео":

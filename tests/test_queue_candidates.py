@@ -19,11 +19,11 @@ fake = types.SimpleNamespace(rolls=[roll(1, "Готово"), roll(2, "Ожида
                                      "video_start": "", "video_end": "", "status": "Ожидает"}])
 fake.queue_candidates = types.MethodType(App.queue_candidates, fake)
 valid, errors, skipped = App.queue_candidates(fake)
-check("1. к запуску — «Ожидает», «Ошибка», «Прервано»; пустая сцена не считается",
-      [r["id"] for _, r in valid] == [2, 3, 6] and not errors, str([r["id"] for _, r in valid]))
+check("1. к запуску — «Ожидает», «Ошибка»; «Прервано» сама не запускается; пустая сцена не считается",
+      [r["id"] for _, r in valid] == [2, 3] and not errors, str([r["id"] for _, r in valid]))
 check("2. готовая сцена пропущена и посчитана", [r["id"] for _, r in skipped] == [1])
 check("3. «В очереди» и «Обработка N» не берутся повторно", not any(r["id"] in (4, 5) for _, r in valid))
-check("4. validate_rolls — те же к запуску", [r["id"] for _, r in App.validate_rolls(fake)[0]] == [2, 3, 6])
+check("4. validate_rolls — те же к запуску", [r["id"] for _, r in App.validate_rolls(fake)[0]] == [2, 3])
 check("5. блокировка правки: «В очереди» и «Обработка N» — да, «Готово» и «Ожидает» — нет",
       app.roll_in_queue(roll(0, "В очереди")) and app.roll_in_queue(roll(0, "Обработка 3"))
       and not app.roll_in_queue(roll(0, "Готово")) and not app.roll_in_queue(roll(0, "Ожидает")))
@@ -33,5 +33,8 @@ fake.log = lambda m: None
 fake.get_roll_title = lambda i, r: f"Сцена {i + 1}"
 App.rerun_roll(fake, 1)
 check("6. «Запустить заново» → «Ожидает», сцена снова к запуску",
-      fake.rolls[0]["status"] == "Ожидает" and [r["id"] for _, r in App.validate_rolls(fake)[0]] == [1, 2, 3, 6])
+      fake.rolls[0]["status"] == "Ожидает" and [r["id"] for _, r in App.validate_rolls(fake)[0]] == [1, 2, 3])
+App.rerun_roll(fake, 6)
+check("7. «Прервано» → «Запустить заново» вручную возвращает сцену в «Ожидает»",
+      fake.rolls[5]["status"] == "Ожидает" and 6 in [r["id"] for _, r in App.validate_rolls(fake)[0]])
 print("=" * 50); print(f"Итого: {sum(results)}/{len(results)}"); sys.exit(0 if all(results) else 1)
