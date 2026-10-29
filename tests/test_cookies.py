@@ -97,12 +97,13 @@ h = fake_home(["chrome", "safari"])            # как на этом Mac: Chrom
 res, err, used, seen, lines = run(h, {"chrome": raw["bot"], "safari": None})
 check("3a. «Авто»: только установленные (Chrome → Safari), Chromium не трогается; Chrome «войдите» → Safari успех",
       seen == ["chrome", "safari"] and res and used == ["Safari"] and "chromium" not in seen, f"{seen} → {used}")
-res, err, used, seen, lines = run(h, {"chrome": raw["nodb"].replace("chromium", "chrome"), "safari": raw["safari"]})
-check("3b. все браузеры с ошибкой куки → понятная сводка: Chrome — профиль, Safari — Полный доступ к диску",
+res, err, used, seen, lines = run(h, {"chrome": raw["nodb"].replace("chromium", "chrome"), "safari": raw["safari"],
+                                     "none": raw["bot"]})
+check("3b. все браузеры с ошибкой куки (и без куки не вышло) → понятная сводка: Chrome — профиль, Safari — Полный доступ к диску",
       err and "Chrome — профиль не найден" in err and "Safari — нужен Полный доступ к диску" in err
       and "Системные настройки" in err and "Errno" not in err, err)
 check("3c. сырой текст ошибок yt-dlp — в логе", all(s in open(LOG, encoding="utf-8").read() for s in ("Operation not permitted", "cookies database")))
-res, err, used, seen, lines = run(h, {"chrome": raw["bot"], "safari": raw["bot_curly"]})
+res, err, used, seen, lines = run(h, {"chrome": raw["bot"], "safari": raw["bot_curly"], "none": raw["bot"]})
 check("3d. все «войдите» → сообщение про вход в YouTube и VPN", err and err.startswith("YouTube просит войти"), err)
 res, err, used, seen, lines = run(h, {"chrome": raw["video"]})
 check("3e. видео недоступно → перебор останавливается (Safari не пробуется)", seen == ["chrome"] and "Video unavailable" in err, err)
@@ -118,4 +119,16 @@ check("3i. файл cookies.txt: --cookies (cookiefile), использован�
 res, err, used, seen, lines = run(h, {"file": raw["bot"]}, browser=None, cookies_file="/tmp/cookies.txt")
 check("3j. cookies.txt устарел (YouTube просит войти) → понятное сообщение", err and err.startswith("YouTube просит войти"))
 check("3k. в журнале попыток — какой браузер пробуется", any("Пробую куки из браузера: Chrome (1/2)" in l for l in run(h, {"chrome": None})[4]))
+# ── 4. запасная попытка без куки и JS-рантайм ──
+fmt = "ERROR: [youtube] LblE3n_safc: Requested format is not available. Use --list-formats for a list of available formats"
+res, err, used, seen, lines = run(h, {"chrome": fmt, "safari": fmt, "none": None})
+check("4a. «Авто»: все браузеры «Requested format is not available» → последняя попытка без куки успешна",
+      seen == ["chrome", "safari", "none"] and res and used == ["без куки"]
+      and any("последняя попытка: скачиваю без куки" in l for l in lines), f"{seen} → {used}")
+res, err, used, seen, lines = run(h, {"chrome": fmt, "safari": fmt, "none": raw["video"]})
+check("4b. без куки «видео недоступно» → понятная ошибка про видео", seen[-1] == "none" and err and "Video unavailable" in err, err)
+res, err, used, seen, lines = run(h, {"chrome": raw["video"], "none": None})
+check("4c. видео недоступно уже с куки → без куки не пробуется", seen == ["chrome"] and not res, f"{seen}")
+res, err, used, seen, lines = run(h, {"chrome": fmt, "safari": fmt, "none": fmt})
+check("4d. без куки тоже не вышло → сводка по браузерам, без «Errno»", err and err.startswith("Не удалось взять куки") and used == [], err)
 print("=" * 50); print(f"Итого: {sum(results)}/{len(results)}"); sys.exit(0 if all(results) else 1)

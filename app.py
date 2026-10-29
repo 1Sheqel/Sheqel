@@ -25,6 +25,41 @@ def _ensure_deps():
                 [sys.executable, "-m", "pip", "install", "--quiet", pkg],
                 check=True,
             )
+    _ensure_optional_deps()
+
+
+# Необязательные пакеты: без них программа работает, просто хуже. Ошибка установки (нет сети,
+# сбой pip) запуск не прерывает. yt-dlp-ejs (скрипт решения JS-челленджей YouTube) и deno
+# (JS-рантайм) ставятся через группы yt-dlp, чтобы версия ejs всегда совпадала с yt-dlp.
+YTDLP_PIP_SPEC = "yt-dlp[default,deno]"
+OPTIONAL_PIP_TIMEOUT_SEC = 600
+
+
+def _ensure_optional_deps():
+    if getattr(sys, "frozen", False):
+        return    # сборка PyInstaller: sys.executable — сама программа, pip в ней нет
+    missing = []
+    for module in ("yt_dlp_ejs", "deno"):
+        try:
+            __import__(module)
+        except Exception:
+            missing.append(module)
+    if not missing:
+        return
+    print(f"Устанавливаю {YTDLP_PIP_SPEC} (для скачивания с YouTube)...", flush=True)
+    try:
+        res = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--retries", "1", "--timeout", "20",
+             YTDLP_PIP_SPEC],
+            timeout=OPTIONAL_PIP_TIMEOUT_SEC,
+            creationflags=0x08000000 if sys.platform == "win32" else 0,   # CREATE_NO_WINDOW
+        )
+        if res.returncode != 0:
+            print("Не удалось установить дополнения yt-dlp — скачивание с YouTube может не работать "
+                  "с куки браузера. Программа продолжит работу.", flush=True)
+    except Exception as e:
+        print(f"Не удалось установить дополнения yt-dlp ({type(e).__name__}) — программа продолжит работу.",
+              flush=True)
 
 _ensure_deps()
 
@@ -4106,6 +4141,52 @@ def _ensure_ytdlp():
         return yt_dlp
 
 
+# ── JS-рантайм для yt-dlp: YouTube требует решать JS-челлендж (n/sig) ─────────────────────
+# Без рантайма и скрипта yt-dlp-ejs у клиентов YouTube, которые yt-dlp берёт с куки, форматов нет
+# («Requested format is not available»). Сверено с wiki yt-dlp «EJS» и README 2026-10-29:
+# deno — рекомендуемый, node ≥ 22 — запасной; по умолчанию yt-dlp включает только deno из PATH,
+# а pip-пакет deno кладёт бинарник в папку скриптов окружения, которой в PATH может не быть.
+# remote_components (скачивание ejs с GitHub/npm во время работы) не включаем: ejs ставится pip.
+YTDLP_NODE_DIRS = ["/opt/homebrew/bin", "/usr/local/bin"]
+
+
+def find_deno_binary():
+    """Путь к deno: из pip-пакета deno, иначе из PATH. None — не найден (тогда без него)."""
+    try:
+        from deno import find_deno_bin
+        path = find_deno_bin()
+        if path and os.path.isfile(path):
+            return path
+    except Exception:
+        pass
+    return shutil.which("deno")
+
+
+def find_node_binary():
+    """Путь к node из PATH или Homebrew (программу с Dock на Mac запускают без Homebrew в PATH)."""
+    found = shutil.which("node")
+    if found:
+        return found
+    if sys.platform != "win32":
+        for d in YTDLP_NODE_DIRS:
+            path = os.path.join(d, "node")
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    return None
+
+
+def ytdlp_js_runtimes():
+    """Опция js_runtimes для yt-dlp: deno (первым), node — запасной. {} — ничего не нашлось."""
+    runtimes = {}
+    deno = find_deno_binary()
+    if deno:
+        runtimes["deno"] = {"path": deno}
+    node = find_node_binary()
+    if node:
+        runtimes["node"] = {"path": node}
+    return runtimes
+
+
 def _ytdlp_ffmpeg_opts():
     def _test_ffmpeg(path):
         try:
@@ -4402,6 +4483,11 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None, cookies
     }
     if ffmpeg_dir:
         base_common["ffmpeg_location"] = ffmpeg_dir
+    js_runtimes = ytdlp_js_runtimes()
+    if js_runtimes:
+        base_common["js_runtimes"] = js_runtimes
+    else:
+        write_log_file("yt-dlp: JS-рантайм (deno/node) не найден — часть форматов YouTube может быть недоступна")
 
     def _attempt(common):
         if mode == "video":
@@ -4540,6 +4626,17 @@ def download_from_url(url, output_dir, mode, denoise, log, browser=None, cookies
                 if kind == "video":          # видео недоступно — другой браузер не поможет
                     raise RuntimeError(friendly_download_error(kind, b, raw)) from e
                 log(f"⚠ {name}: {friendly_download_error(kind, b, raw)[:120]} — пробую следующий браузер")
+        # С куки YouTube отдаёт другие клиенты, и форматов может не быть, а без куки видео качается.
+        log("Куки из браузеров не помогли — последняя попытка: скачиваю без куки...")
+        dpapi_seen["v"] = False
+        try:
+            result = _attempt(base_common)
+            on_cookies("без куки")
+            return result
+        except Exception as e:
+            kind, raw = _fail(e, None)
+            if kind == "video":
+                raise RuntimeError(friendly_download_error(kind, None, raw)) from e
         raise RuntimeError(summarize_cookie_failures(failures))
 
     # ── Конкретный браузер, выбранный вручную ────────────────────────────────
@@ -6339,6 +6436,8 @@ class LipsyncTwoModeApp(_BaseApp):
         threading.Thread(target=run, daemon=True).start()
 
     def _check_ytdlp_update(self):
+        if getattr(sys, "frozen", False):
+            return    # сборка PyInstaller: sys.executable — сама программа, pip запустил бы её копию
         def run():
             try:
                 import yt_dlp
@@ -6352,19 +6451,31 @@ class LipsyncTwoModeApp(_BaseApp):
                     return
 
                 latest = res.json()["info"]["version"]
+                try:
+                    import yt_dlp_ejs  # noqa: F401 — скрипт решения челленджей YouTube
+                    has_ejs = True
+                except Exception:
+                    has_ejs = False
 
-                if current == latest:
+                if current == latest and has_ejs:
                     self.log(f"yt-dlp актуален: {current}")
                     return
 
-                self.log(f"yt-dlp устарел: {current} → {latest}. Обновляю...")
+                if current == latest:
+                    self.log("yt-dlp: доустанавливаю yt-dlp-ejs и deno для YouTube...")
+                else:
+                    self.log(f"yt-dlp устарел: {current} → {latest}. Обновляю...")
 
+                # Обновляем вместе с группами default и deno: версия yt-dlp-ejs закреплена в yt-dlp
+                # и должна обновляться с ним, иначе YouTube перестанет отдавать форматы.
                 result = subprocess.run(
                     [sys.executable, "-m", "pip", "install",
-                     "-U", "yt-dlp", "--quiet"],
+                     "-U", YTDLP_PIP_SPEC, "--quiet"],
                     capture_output=True,
                     encoding="utf-8",
-                    timeout=120,
+                    errors="replace",
+                    timeout=300,
+                    **_no_window_kwargs(),
                 )
 
                 if result.returncode == 0:

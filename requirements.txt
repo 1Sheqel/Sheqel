@@ -1,6 +1,6 @@
 customtkinter==5.2.2
 requests==2.34.2
 pillow==12.2.0
-yt-dlp>=2024.1.1
+yt-dlp[default,deno]>=2026.10.26
 audio-separator[cpu]
 cloudinary==1.44.2
