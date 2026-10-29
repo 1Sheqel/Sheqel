@@ -1490,14 +1490,164 @@ def scan_folder_for_roll(folder):
     return {"voice_file": audio, "video_single": video}, ""
 
 
-def parse_folder_list(text):
-    """Текст «один путь на строку» → список путей в том же порядке (кавычки и пустые строки убираются)."""
-    out = []
-    for line in str(text or "").splitlines():
-        line = line.strip().strip('"').strip("'").strip()
-        if line:
+FOLDER_PICK_TITLE = "Выбери папки с озвучкой и видео"
+
+
+class FolderPickError(Exception):
+    """Системное окно выбора папок не удалось открыть: нужно перейти на запасной вариант."""
+
+
+def parse_osascript_paths(stdout):
+    """Вывод osascript (по пути на строке, UTF-8) → список путей без хвостового «/», без пустых и повторов."""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    out, seen = [], set()
+    for line in str(stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if len(line) > 1:
+            line = line.rstrip("/") or "/"
+        if line not in seen:
+            seen.add(line)
             out.append(line)
     return out
+
+
+def _pick_folders_macos():
+    """Системное окно Finder с выбором нескольких папок через osascript. Не трогает tkinter — можно вызывать
+    из фонового потока. Отмена пользователем (код -128) → []. Любой другой сбой → FolderPickError."""
+    prompt = f"{FOLDER_PICK_TITLE} (несколько: Cmd или Shift)"
+    script = [
+        f'set theFolders to choose folder with prompt "{prompt}" with multiple selections allowed',
+        'set out to ""',
+        'repeat with i from 1 to count of theFolders',
+        'set out to out & POSIX path of (item i of theFolders) & linefeed',
+        'end repeat',
+        'return out',
+    ]
+    cmd = ["osascript"]
+    for line in script:
+        cmd += ["-e", line]
+    try:
+        r = subprocess.run(cmd, capture_output=True, **_no_window_kwargs())
+    except (OSError, ValueError) as e:
+        raise FolderPickError(f"osascript не запустился: {e}")
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", errors="replace")
+        if "-128" in err:
+            return []
+        raise FolderPickError(f"osascript: {err.strip()[:300]}")
+    return parse_osascript_paths(r.stdout)
+
+
+def _pick_folders_windows(parent=None):
+    """Системное окно проводника (IFileOpenDialog, FOS_PICKFOLDERS | FOS_ALLOWMULTISELECT) через ctypes.
+    Отмена → []. Любой сбой → FolderPickError. Только главный поток."""
+    import ctypes
+    from ctypes import wintypes
+    try:
+        ole32 = ctypes.WinDLL("ole32")
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        ole32.CoInitializeEx.restype = ctypes.c_long
+        ole32.CLSIDFromString.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p]
+        ole32.CLSIDFromString.restype = ctypes.c_long
+        ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                                           ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        ole32.CoCreateInstance.restype = ctypes.c_long
+        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+        ole32.CoTaskMemFree.restype = None
+    except (OSError, AttributeError) as e:
+        raise FolderPickError(f"ole32 недоступна: {e}")
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("a", wintypes.DWORD), ("b", wintypes.WORD), ("c", wintypes.WORD), ("d", ctypes.c_ubyte * 8)]
+
+    def guid(text):
+        g = GUID()
+        if ole32.CLSIDFromString(text, ctypes.byref(g)) != 0:
+            raise FolderPickError("не разобран GUID")
+        return g
+
+    def method(obj, index, *argtypes):
+        """Метод COM-объекта по номеру в таблице виртуальных методов."""
+        vtbl = ctypes.cast(ctypes.c_void_p(obj), ctypes.POINTER(ctypes.c_void_p))[0]
+        addr = ctypes.cast(ctypes.c_void_p(vtbl), ctypes.POINTER(ctypes.c_void_p))[index]
+        fn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(addr)
+        return lambda *a: fn(obj, *a)
+
+    def check(hr, what):
+        if hr != 0:
+            raise FolderPickError(f"{what}: код 0x{hr & 0xFFFFFFFF:08X}")
+
+    hr_init = ole32.CoInitializeEx(None, 2)            # COINIT_APARTMENTTHREADED; 0/1 — надо парный Uninitialize
+    release_list = []
+    try:
+        dlg = ctypes.c_void_p()
+        check(ole32.CoCreateInstance(ctypes.byref(guid("{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}")), None, 1,
+                                     ctypes.byref(guid("{D57C7288-D4AD-4768-BE02-9D969532D960}")),
+                                     ctypes.byref(dlg)), "CoCreateInstance")
+        release_list.append(dlg.value)
+        d = dlg.value
+        opts = wintypes.DWORD()
+        check(method(d, 10, ctypes.POINTER(wintypes.DWORD))(ctypes.byref(opts)), "GetOptions")
+        # FOS_PICKFOLDERS 0x20 | FOS_FORCEFILESYSTEM 0x40 | FOS_ALLOWMULTISELECT 0x200
+        check(method(d, 9, wintypes.DWORD)(opts.value | 0x20 | 0x40 | 0x200), "SetOptions")
+        method(d, 17, ctypes.c_wchar_p)(FOLDER_PICK_TITLE)                      # SetTitle (не критично)
+        hwnd = None
+        try:
+            if parent is not None:
+                hwnd = ctypes.windll.user32.GetParent(parent.winfo_id()) or None
+        except Exception:
+            hwnd = None
+        hr = method(d, 3, ctypes.c_void_p)(hwnd)                                  # Show
+        if (hr & 0xFFFFFFFF) == 0x800704C7:                                       # ERROR_CANCELLED
+            return []
+        check(hr, "Show")
+        arr = ctypes.c_void_p()
+        check(method(d, 27, ctypes.POINTER(ctypes.c_void_p))(ctypes.byref(arr)), "GetResults")
+        release_list.append(arr.value)
+        count = wintypes.DWORD()
+        check(method(arr.value, 7, ctypes.POINTER(wintypes.DWORD))(ctypes.byref(count)), "GetCount")
+        paths = []
+        for i in range(count.value):
+            item = ctypes.c_void_p()
+            check(method(arr.value, 8, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p))(i, ctypes.byref(item)),
+                  "GetItemAt")
+            try:
+                name = ctypes.c_void_p()
+                # IShellItem::GetDisplayName(SIGDN_FILESYSPATH = 0x80058000)
+                check(method(item.value, 5, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p))(
+                    0x80058000, ctypes.byref(name)), "GetDisplayName")
+                try:
+                    paths.append(ctypes.wstring_at(name.value))
+                finally:
+                    ole32.CoTaskMemFree(name)
+            finally:
+                method(item.value, 2)()                                           # Release
+        return paths
+    finally:
+        for obj in reversed(release_list):
+            try:
+                method(obj, 2)()
+            except Exception:
+                pass
+        if hr_init in (0, 1):
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass
+
+
+def pick_folders(parent=None):
+    """Системное окно выбора НЕСКОЛЬКИХ папок. Возвращает список путей ([] — пользователь отменил).
+    Если системное окно недоступно — FolderPickError (вызывающий переходит на запасной вариант).
+    На macOS не использует tkinter (можно из фонового потока), на Windows — только главный поток."""
+    if sys.platform == "darwin":
+        return _pick_folders_macos()
+    if platform_is_windows():
+        return _pick_folders_windows(parent)
+    raise FolderPickError("системный выбор нескольких папок на этой системе не поддерживается")
 
 
 def _same_path_key(path):
@@ -5814,6 +5964,7 @@ class LipsyncTwoModeApp(_BaseApp):
         self.log_queue = queue.Queue()
         self.is_processing = False
         self._folder_batch_busy = False     # идёт пакетное добавление папок (только главный поток)
+        self._folder_pick_busy = False      # открыто системное окно выбора папок (только главный поток)
         self.sync_key = SYNC_API_KEY
         self.cloudinary_cloud_name = ""
         self.cloudinary_api_key = ""
@@ -11612,103 +11763,74 @@ class LipsyncTwoModeApp(_BaseApp):
         return True
 
     def open_folder_batch_dialog(self):
-        """Окно «Добавить папки»: список путей (по одному на строку), кнопка выбора папки добавляет в список."""
-        win = ctk.CTkToplevel(self)
-        win.title("Добавить папки")
-        win.geometry("720x560")
-        win.configure(fg_color=BG)
-        win.transient(self)
-        win.after(100, win.grab_set)
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
-        frame = ctk.CTkFrame(win, fg_color=PANEL, corner_radius=20)
-        frame.pack(fill="both", expand=True, padx=24, pady=24)
-        self.label(frame, "Добавить папки", size=22, weight="bold").pack(anchor="w", padx=22, pady=(18, 4))
-        self.label(frame, "В каждой папке нужны озвучка (mp3, wav, m4a, aac) и видео. Из каждой папки получится "
-                          "одна сцена. Выбирай папки по одной кнопкой ниже или вставь список путей — "
-                          "по одному на строку. Ничего не запускается и не оплачивается: сцены только "
-                          "появятся в списке слева.",
-                   size=12, color=MUTED).pack(anchor="w", padx=22, pady=(0, 10))
-        box = ctk.CTkTextbox(frame, fg_color="#ffffff", text_color="#111111", border_width=1,
-                             border_color="#737373", corner_radius=10, font=ctk.CTkFont(size=13), wrap="none")
-        box.pack(fill="both", expand=True, padx=22, pady=(0, 8))
-        self._fix_paste(box)
-        count_lbl = self.label(frame, "Папок в списке: 0", size=12, color=MUTED)
-        count_lbl.pack(anchor="w", padx=22)
+        """«Добавить папки…»: сразу системное окно выбора нескольких папок; выбранные становятся сценами."""
+        if self._folder_pick_busy:
+            self.log("Окно выбора папок уже открыто — возможно, оно за окном программы: сдвинь или сверни окно программы.")
+            return
+        if self._folder_batch_busy:
+            return
+        self._folder_pick_busy = True
 
-        def current():
-            return parse_folder_list(box.get("1.0", "end"))
-
-        def refresh_count(event=None):
-            if count_lbl.winfo_exists():
-                count_lbl.configure(text=f"Папок в списке: {len(current())}")
-
-        box.bind("<KeyRelease>", refresh_count)
-
-        def pick():
-            d = filedialog.askdirectory(parent=win, title="Выбери папку с аудио и видео")
-            if not d:
-                return
-            if _same_path_key(d) in {_same_path_key(x) for x in current()}:
-                messagebox.showinfo("Уже в списке", "Эта папка уже есть в списке.", parent=win)
-                return
-            if box.get("1.0", "end").strip():
-                box.insert("end", d + "\n")
-            else:
-                box.delete("1.0", "end")
-                box.insert("1.0", d + "\n")
-            refresh_count()
-
-        def clear_list():
-            box.delete("1.0", "end")
-            refresh_count()
-
-        row = ctk.CTkFrame(frame, fg_color="transparent")
-        row.pack(fill="x", padx=22, pady=(8, 6))
-        self.button(row, "Выбрать папку…", pick, color=BTN, hover=BTN_HOVER, width=150).pack(side="left")
-        self.button(row, "Очистить список", clear_list, color=BTN, hover=BTN_HOVER, width=150).pack(side="left", padx=8)
-        progress_lbl = self.label(frame, "", size=12, color=MUTED)
-        progress_lbl.pack(anchor="w", padx=22, pady=(0, 4))
-        bottom = ctk.CTkFrame(frame, fg_color="transparent")
-        bottom.pack(fill="x", padx=22, pady=(0, 18))
-        add_btn = self.button(bottom, "Добавить сцены", lambda: go(), width=170)
-        add_btn.pack(side="left")
-        self.button(bottom, "Закрыть", win.destroy, color=BTN, hover=BTN_HOVER, width=110).pack(side="right")
-
-        def on_progress(added, total, skipped):
-            if progress_lbl.winfo_exists():
-                progress_lbl.configure(text=f"Добавлено {added} из {total}"
-                                            + (f", пропущено {skipped}" if skipped else ""))
-
-        def on_done(summary):
-            if add_btn.winfo_exists():
-                add_btn.configure(state="normal")
-            if win.winfo_exists():
-                box.delete("1.0", "end")
-                refresh_count()
-            lines = [f"Добавлено сцен: {summary['added']} из {summary['total']}."]
-            skipped = summary["skipped"]
-            if skipped:
-                lines.append(f"Пропущено: {len(skipped)}")
-                for f, why in skipped[:15]:
-                    name = os.path.basename(str(f).rstrip("/\\")) or f
-                    lines.append(f"• {name}: {why}")
-                if len(skipped) > 15:
-                    lines.append(f"… и ещё {len(skipped) - 15} (полный список — в журнале)")
-            parent = win if win.winfo_exists() else self
-            (messagebox.showinfo if summary["added"] else messagebox.showwarning)(
-                "Папки добавлены" if summary["added"] else "Ничего не добавлено", "\n".join(lines), parent=parent)
-
-        def go():
-            folders = current()
+        def deliver(folders, failed):                         # главный поток
+            self._folder_pick_busy = False
+            if failed:
+                write_log_file(f"Выбор папок: системное окно недоступно ({failed}), запасной вариант")
+                folders = self._pick_folders_fallback()
             if not folders:
-                messagebox.showinfo("Список пуст", "Выбери хотя бы одну папку.", parent=win)
                 return
-            if self._folder_batch_busy:
-                return
-            add_btn.configure(state="disabled")
-            on_progress(0, len(folders), 0)
-            if not self.add_folders_batch(folders, on_progress=on_progress, on_done=on_done):
-                add_btn.configure(state="normal")
+            self.log(f"Папки: выбрано {len(folders)}, сканирую…")
+            self.add_folders_batch(folders, on_done=self._show_folder_batch_result)
+
+        def work():                                           # фоновый поток (macOS): окно osascript ждёт пользователя
+            try:
+                folders, failed = pick_folders(self), ""
+            except FolderPickError as e:
+                folders, failed = [], str(e)
+            except Exception as e:
+                folders, failed = [], f"{type(e).__name__}: {e}"
+            try:
+                self.after(0, lambda: deliver(folders, failed))
+            except RuntimeError:
+                pass                                          # окно закрыли, пока шёл выбор
+
+        if sys.platform == "darwin":
+            threading.Thread(target=work, daemon=True, name="FolderPick").start()
+        else:
+            try:
+                folders, failed = pick_folders(self), ""
+            except FolderPickError as e:
+                folders, failed = [], str(e)
+            except Exception as e:
+                folders, failed = [], f"{type(e).__name__}: {e}"
+            deliver(folders, failed)
+
+    def _pick_folders_fallback(self):
+        """Запасной вариант: обычное окно одной папки, после каждой вопрос «Добавить ещё папку?»."""
+        folders = []
+        while True:
+            d = filedialog.askdirectory(parent=self, title=FOLDER_PICK_TITLE)
+            if not d:
+                break
+            if _same_path_key(d) not in {_same_path_key(x) for x in folders}:
+                folders.append(d)
+            if not messagebox.askyesno("Добавить папки", f"Выбрано папок: {len(folders)}.\nДобавить ещё папку?",
+                                       parent=self):
+                break
+        return folders
+
+    def _show_folder_batch_result(self, summary):
+        """Итоговое окно после добавления папок: сколько добавлено и какие пропущены (с причиной)."""
+        lines = [f"Добавлено сцен: {summary['added']} из {summary['total']}."]
+        skipped = summary["skipped"]
+        if skipped:
+            lines.append(f"Пропущено: {len(skipped)}")
+            for f, why in skipped[:15]:
+                name = os.path.basename(str(f).rstrip("/\\")) or f
+                lines.append(f"• {name}: {why}")
+            if len(skipped) > 15:
+                lines.append(f"… и ещё {len(skipped) - 15} (полный список — в журнале)")
+        (messagebox.showinfo if summary["added"] else messagebox.showwarning)(
+            "Папки добавлены" if summary["added"] else "Ничего не добавлено", "\n".join(lines), parent=self)
 
     def render_rolls(self):
         self.render_scene_list()

@@ -47,7 +47,8 @@ f_not_dir = os.path.join(base, "file.txt"); open(f_not_dir, "w").write("x")
 # ── чистые функции ──
 check("API: find_folder_media есть", hasattr(app, "find_folder_media"))
 check("API: scan_folder_for_roll есть", hasattr(app, "scan_folder_for_roll"))
-check("API: parse_folder_list есть", hasattr(app, "parse_folder_list"))
+check("API: pick_folders и parse_osascript_paths есть", hasattr(app, "pick_folders") and hasattr(app, "parse_osascript_paths"))
+check("старого окна со списком нет", not hasattr(app, "parse_folder_list"))
 if hasattr(app, "scan_folder_for_roll"):
     f, why = app.scan_folder_for_roll(d1)
     check("папка с парой → поля ролика", f and f["voice_file"].endswith("voice.mp3") and f["video_single"].endswith("clip.mp4") and not why, str(why))
@@ -57,9 +58,38 @@ if hasattr(app, "scan_folder_for_roll"):
                         ("скрытые файлы не считаются", d_hidden, ""), ("нет папки", d_missing, "не найден"), ("файл вместо папки", f_not_dir, "не папка")):
         f, why = app.scan_folder_for_roll(d)
         check(f"пропуск: {nm}", f is None and bool(why) and word in why, why)
-if hasattr(app, "parse_folder_list"):
-    got = app.parse_folder_list(f'  "{d1}"\n\n{d2}\n{d1}\n')
-    check("parse_folder_list: кавычки, пустые строки, порядок", got == [d1, d2, d1], str(got))
+# разбор вывода osascript (реальный диалог не открываем)
+P = app.parse_osascript_paths
+check("osascript: несколько путей по порядку", P("/Users/a/one/\n/Users/a/two/\n") == ["/Users/a/one", "/Users/a/two"])
+check("osascript: кириллица и пробелы (bytes UTF-8)", P("/Users/a/Ролик 1/Новая папка/\n".encode("utf-8")) == ["/Users/a/Ролик 1/Новая папка"])
+check("osascript: пустой вывод и пустые строки", P("") == [] and P(b"") == [] and P("\n \n") == [] and P(None) == [])
+check("osascript: повторы убираются, корень «/» цел", P("/a/\n/a\n/\n") == ["/a", "/"])
+check("osascript: CRLF не мешает", P("/a/\r\n/b/\r\n") == ["/a", "/b"])
+
+class FakeRun:
+    def __init__(self, code, out=b"", err=b""):
+        self.returncode, self.stdout, self.stderr = code, out, err
+real_run = app.subprocess.run
+def with_run(res):
+    seen = []
+    def fake(cmd, **k):
+        seen.append((cmd, k)); return res
+    app.subprocess.run = fake
+    try:
+        try:
+            return app._pick_folders_macos(), seen
+        except app.FolderPickError as e:
+            return e, seen
+    finally:
+        app.subprocess.run = real_run
+got, seen = with_run(FakeRun(0, "/x/Ролик 1/\n/y/two words/\n".encode("utf-8")))
+check("macOS: два пути из вывода", got == ["/x/Ролик 1", "/y/two words"], str(got))
+check("macOS: команда — список, есть multiple selections, не shell",
+      seen and seen[0][0][0] == "osascript" and any("with multiple selections allowed" in a for a in seen[0][0]) and not seen[0][1].get("shell"))
+got, _ = with_run(FakeRun(1, b"", "execution error: User canceled. (-128)".encode("utf-8")))
+check("macOS: отмена (-128) → пустой список, не ошибка", got == [], str(got))
+got, _ = with_run(FakeRun(1, b"", b"execution error: boom (-1700)"))
+check("macOS: другая ошибка → FolderPickError", isinstance(got, app.FolderPickError), str(got))
 
 # ── окно ──
 w = app.LipsyncTwoModeApp()
@@ -94,6 +124,56 @@ def scenario():
         w.add_folders_batch(folders, on_progress=lambda a, t, s: state.setdefault("prog", []).append((a, t, s)),
                             on_done=lambda summ: state.update(done=summ))
         return pump(lambda: "done" in state)
+
+    # --- кнопка «Добавить папки…»: сразу системный выбор, без промежуточного окна ---
+    calls = []
+    toplevels_before = len([x for x in w.winfo_children() if isinstance(x, ctk.CTkToplevel)])
+    def fake_pick(parent=None):
+        calls.append(parent); return list(picked[0])
+    app.pick_folders = fake_pick
+    picked = [[d_empty]]
+    shown.clear()
+    w.batch_folders_btn.invoke()
+    check("кнопка сразу вызывает выбор папок", pump(lambda: calls) and len(calls) == 1)
+    pump(lambda: shown)
+    check("итог показан, окон-списков нет", shown and len([x for x in w.winfo_children() if isinstance(x, ctk.CTkToplevel)]) == toplevels_before, str(shown)[:200])
+    check("пустая папка: ничего не добавлено, сцена пустая", len(w.rolls) == 1 and not w.rolls[0]["voice_file"])
+    # отмена
+    calls.clear(); shown.clear(); picked[0] = []
+    w.batch_folders_btn.invoke(); pump(lambda: calls); pump(lambda: False, 0.3)
+    check("отмена: ничего не добавлено и нет окон", len(w.rolls) == 1 and not w.rolls[0]["voice_file"] and not shown and not w._folder_pick_busy)
+    # несколько папок по порядку
+    calls.clear(); shown.clear(); picked[0] = [d2, d1, d3]
+    w.batch_folders_btn.invoke()
+    check("несколько папок: итоговое окно", pump(lambda: shown))
+    order0 = [os.path.basename(os.path.dirname(r["voice_file"])) for r in w.rolls]
+    check("добавлены по порядку выбора", order0 == ["two", "Ролик 1 кириллица", "three"], str(order0))
+    check("итог: 3 из 3", shown and "3 из 3" in str(shown[-1]), str(shown)[:200])
+    # сбой системного окна → запасной вариант
+    def boom(parent=None):
+        raise app.FolderPickError("тест")
+    app.pick_folders = boom
+    fb = []
+    w._pick_folders_fallback = lambda: (fb.append(1), [d_audio])[1]
+    shown.clear()
+    w.batch_folders_btn.invoke()
+    check("сбой окна → запасной вариант", pump(lambda: fb and shown) and len(fb) == 1)
+    del w._pick_folders_fallback
+    # окно выбора уже открыто (на macOS могло спрятаться) → второго окна нет, в журнале подсказка
+    logged, calls[:] = [], []
+    orig_log = w.log
+    w.log = lambda msg, *a, **k: logged.append(str(msg))
+    app.pick_folders = fake_pick
+    w._folder_pick_busy = True
+    w.batch_folders_btn.invoke(); pump(lambda: False, 0.3)
+    w._folder_pick_busy = False
+    w.log = orig_log
+    check("повторное нажатие при открытом окне: без второго окна, с подсказкой",
+          not calls and any("уже открыто" in m for m in logged), str(logged)[:200])
+    check("ошибок UI нет (кнопка)", not errors, str(errors)[:300])
+    w.rolls = []
+    w.add_roll()
+    shown.clear()
 
     before_ids = [r["id"] for r in w.rolls]
     st_before = json.dumps(w.rolls, sort_keys=True)
